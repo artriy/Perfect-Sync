@@ -31,6 +31,8 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
 
   const runDecode = (value: string) => {
     setMode("decoding");
+    // TODO(phase 2): pass the active profile's real installed [id, version] pairs
+    // and surface Preview.name as the profile name, once profile data is wired in.
     previewCode(value, [
       ["AU-Avengers/TOU-Mira", "1.6.2"],
       ["Dolfannn/LevelImposter", "0.7.2"],
@@ -39,7 +41,10 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
         setRows(p.items);
         setMode("diff");
       })
-      .catch(() => setMode("diff"));
+      .catch((err) => {
+        console.error("lobby code decode failed", err);
+        setMode("diff");
+      });
   };
 
   // Reset + auto-decode whenever the modal is (re)opened.
