@@ -1,0 +1,75 @@
+import { useState } from "react";
+import { GearSix, MagnifyingGlass, Plus } from "@phosphor-icons/react";
+import type { GameStatus } from "../lib/types";
+
+interface TopBarProps {
+  game: GameStatus;
+  onAddMod: () => void;
+  onPasteCode: (code: string) => void;
+}
+
+export function TopBar({ game, onAddMod, onPasteCode }: TopBarProps) {
+  const [q, setQ] = useState("");
+
+  const submit = () => {
+    if (q.trim().toUpperCase().startsWith("PERFECT-")) {
+      onPasteCode(q.trim());
+      setQ("");
+    }
+  };
+
+  return (
+    <header className="glass-2 flex items-center gap-4 px-4 py-3">
+      <div className="flex items-center gap-2.5 font-semibold tracking-tight">
+        <span
+          className="h-[22px] w-[22px] rounded-[7px] accent-grad"
+          style={{ boxShadow: "0 0 14px rgba(123,150,255,0.6)" }}
+        />
+        Perfect-Sync
+      </div>
+
+      <label className="glass relative flex max-w-[380px] flex-1 items-center gap-2 rounded-xl px-3 py-2 text-ink-dim focus-within:text-ink">
+        <MagnifyingGlass size={16} className="opacity-70" />
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder="Search mods, or paste a PERFECT- code…"
+          className="w-full bg-transparent text-[13.5px] text-ink placeholder:text-ink-faint focus:outline-none"
+          aria-label="Search mods or paste a lobby code"
+        />
+      </label>
+
+      <div className="flex-1" />
+
+      <span
+        className="flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[12px]"
+        style={{
+          color: "#aef3d8",
+          background: "rgba(91,227,176,0.14)",
+          borderColor: "rgba(91,227,176,0.3)",
+        }}
+        title="Detected game install"
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-[#5be3b0]" />
+        {game.store[0].toUpperCase() + game.store.slice(1)} · {game.arch}
+      </span>
+
+      <button
+        type="button"
+        onClick={onAddMod}
+        className="ring-focus accent-grad flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-[13px] font-semibold text-[#0d0820] transition-transform active:scale-[0.97]"
+      >
+        <Plus size={15} weight="bold" /> Add mod
+      </button>
+
+      <button
+        type="button"
+        aria-label="Settings"
+        className="ring-focus glass grid h-[34px] w-[34px] place-items-center rounded-[10px] text-ink-dim transition-colors hover:text-ink"
+      >
+        <GearSix size={17} />
+      </button>
+    </header>
+  );
+}

@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+/* ----- Aurora Glass design tokens ----- */
+@theme {
+  --font-sans: "Outfit Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "Cascadia Code", monospace;
+
+  --color-ink: #f1ecff;
+  --color-ink-dim: #c8c0e8;
+  --color-ink-faint: #8d86b4;
+
+  --color-accent: #9b7bff;
+  --color-accent-2: #5bc0ff;
+
+  /* crew spectrum (functional identity colors) */
+  --color-crew-violet: #9b7bff;
+  --color-crew-cyan: #5bc0ff;
+  --color-crew-mint: #5be3b0;
+  --color-crew-red: #ff5b5b;
+  --color-crew-gold: #ffd23f;
+  --color-crew-blue: #7aa2ff;
+  --color-crew-purple: #b66bff;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* layered aurora, fixed so panels float over a stable field */
+  background:
+    radial-gradient(55% 70% at 12% 6%, #3a1d6e 0%, transparent 58%),
+    radial-gradient(60% 80% at 98% 102%, #0e4a8a 0%, transparent 52%),
+    radial-gradient(42% 52% at 82% -2%, #6b2db8 0%, transparent 55%),
+    linear-gradient(135deg, #150a2c, #0a1430);
+  background-attachment: fixed;
+  overflow: hidden; /* desktop-app shell: inner regions scroll, not the page */
+}
+
+/* ----- glass surfaces (real refraction, not just blur) ----- */
+.glass {
+  background: rgba(255, 255, 255, 0.055);
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.glass-2 {
+  background: rgba(255, 255, 255, 0.07);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.glass-strong {
+  background: rgba(255, 255, 255, 0.085);
+  backdrop-filter: blur(24px) saturate(150%);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 24px 70px rgba(0, 0, 0, 0.5);
+}
+
+.accent-grad {
+  background-image: linear-gradient(90deg, var(--color-accent), var(--color-accent-2));
+}
+
+.hairline {
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* focus ring consistent across interactive elements */
+.ring-focus:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(10, 8, 30, 0.9), 0 0 0 4px var(--color-accent-2);
+}
+
+/* tidy scrollbars inside scroll regions */
+.scroll-region {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+.scroll-region::-webkit-scrollbar {
+  width: 10px;
+}
+.scroll-region::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 99px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+
+/* ----- accessibility fallbacks ----- */
+@media (prefers-reduced-transparency: reduce) {
+  .glass,
+  .glass-2 {
+    background: rgba(20, 14, 42, 0.94);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  .glass-strong {
+    background: rgba(24, 16, 50, 0.97);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
