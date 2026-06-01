@@ -137,6 +137,29 @@ pub fn fetch_latest_release(http: &dyn Http, repo: &str) -> Result<Release, Reso
     parse_release(&http.get_text(&url)?)
 }
 
+pub fn fetch_release_by_tag(http: &dyn Http, repo: &str, tag: &str) -> Result<Release, ResolveError> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
+    parse_release(&http.get_text(&url)?)
+}
+
+/// Resolve an exact release `tag` to a concrete download for `arch`.
+pub fn resolve_tag(
+    http: &dyn Http,
+    repo: &str,
+    tag: &str,
+    rules: &AssetRules,
+    arch: &str,
+) -> Result<ResolvedDownload, ResolveError> {
+    let rel = fetch_release_by_tag(http, repo, tag)?;
+    let asset = pick_asset(&rel, rules, arch).ok_or_else(|| ResolveError::NoAsset(arch.into()))?;
+    Ok(ResolvedDownload {
+        url: asset.url.clone(),
+        asset_name: asset.name.clone(),
+        version: rel.tag.clone(),
+        size: asset.size,
+    })
+}
+
 /// Resolve the latest release of `repo` to a concrete download for `arch`.
 pub fn resolve_latest(
     http: &dyn Http,

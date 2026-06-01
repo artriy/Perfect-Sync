@@ -7,7 +7,7 @@
 //! (`packageId`, `crewColor`, `gameBuild`).
 
 use crate::loader;
-use crate::types::{ModSource, ModTag};
+use crate::types::{LobbyManifest, ManifestMod, ModSource, ModTag};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Cursor};
@@ -30,6 +30,9 @@ pub struct InstalledMod {
     pub managed: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub update: Option<String>,
+    /// installed plugin file name, used to enable/disable/remove the mod
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,6 +103,29 @@ impl ProfileStore {
     }
 }
 
+/// Encode a profile's enabled mods into a shareable lobby manifest. Versions are
+/// preserved exactly so a recipient reproduces a handshake-compatible set.
+pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
+    LobbyManifest {
+        v: 1,
+        name: Some(profile.name.clone()),
+        platform: None,
+        game_build: profile.game_build.clone(),
+        mods: profile
+            .mods
+            .iter()
+            .filter(|m| m.enabled)
+            .map(|m| ManifestMod {
+                id: m.package_id.clone(),
+                v: m.version.clone(),
+                src: m.source,
+                r#ref: m.repo.as_ref().map(|r| format!("https://github.com/{r}")),
+            })
+            .collect(),
+        loader: None,
+    }
+}
+
 /// Copy a bare mod DLL into a profile's plugins directory. Returns the path.
 pub fn install_plugin_dll(profiles_root: &Path, id: &str, dll_src: &Path) -> io::Result<PathBuf> {
     let plugins = loader::profile_plugins_dir(profiles_root, id);
@@ -110,6 +136,31 @@ pub fn install_plugin_dll(profiles_root: &Path, id: &str, dll_src: &Path) -> io:
     let dest = plugins.join(file_name);
     fs::copy(dll_src, &dest)?;
     Ok(dest)
+}
+
+/// Write downloaded plugin bytes straight into a profile's plugins dir.
+pub fn install_plugin_bytes(
+    profiles_root: &Path,
+    id: &str,
+    file_name: &str,
+    bytes: &[u8],
+) -> io::Result<PathBuf> {
+    let plugins = loader::profile_plugins_dir(profiles_root, id);
+    fs::create_dir_all(&plugins)?;
+    let dest = plugins.join(file_name);
+    fs::write(&dest, bytes)?;
+    Ok(dest)
+}
+
+/// Remove a plugin file (enabled or `.disabled`) from a profile.
+pub fn remove_plugin(profiles_root: &Path, id: &str, file_name: &str) -> io::Result<()> {
+    let plugins = loader::profile_plugins_dir(profiles_root, id);
+    for candidate in [plugins.join(file_name), plugins.join(format!("{file_name}.disabled"))] {
+        if candidate.exists() {
+            fs::remove_file(candidate)?;
+        }
+    }
+    Ok(())
 }
 
 /// Extract every plugin `.dll` from a release zip into the profile's plugins
@@ -186,6 +237,7 @@ mod tests {
                 tags: vec![ModTag::Role, ModTag::AllClient],
                 managed: false,
                 update: None,
+                file: Some("TownOfUsMira.dll".into()),
             }],
         }
     }
@@ -212,6 +264,32 @@ mod tests {
 
         store.delete("tou-night").unwrap();
         assert!(store.load("tou-night").is_none());
+    }
+
+    #[test]
+    fn to_manifest_keeps_enabled_mods_and_round_trips() {
+        let mut p = sample_profile();
+        p.mods.push(InstalledMod {
+            package_id: "Disabled/Mod".into(),
+            name: "Disabled".into(),
+            repo: None,
+            version: "0.1".into(),
+            versions: vec!["0.1".into()],
+            enabled: false,
+            source: ModSource::Github,
+            tags: vec![],
+            managed: false,
+            update: None,
+            file: None,
+        });
+        let manifest = to_manifest(&p);
+        // disabled mod is excluded
+        assert_eq!(manifest.mods.len(), 1);
+        assert_eq!(manifest.mods[0].id, "AU-Avengers/TOU-Mira");
+        assert_eq!(manifest.mods[0].v, "1.6.3");
+        // survives a codec round-trip
+        let code = crate::codec::encode(&manifest);
+        assert_eq!(crate::codec::decode(&code).unwrap(), manifest);
     }
 
     #[test]
