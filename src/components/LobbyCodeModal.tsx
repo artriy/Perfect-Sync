@@ -11,6 +11,7 @@ import {
 } from "@phosphor-icons/react";
 import { Pill, primaryTag } from "./Pill";
 import type { DiffItem } from "../lib/types";
+import { previewCode } from "../lib/bridge";
 
 type Mode = "input" | "decoding" | "diff";
 
@@ -26,18 +27,31 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
   const reduce = useReducedMotion();
   const [mode, setMode] = useState<Mode>("input");
   const [code, setCode] = useState("");
+  const [rows, setRows] = useState<DiffItem[]>(diff);
+
+  const runDecode = (value: string) => {
+    setMode("decoding");
+    previewCode(value, [
+      ["AU-Avengers/TOU-Mira", "1.6.2"],
+      ["Dolfannn/LevelImposter", "0.7.2"],
+    ])
+      .then((p) => {
+        setRows(p.items);
+        setMode("diff");
+      })
+      .catch(() => setMode("diff"));
+  };
 
   // Reset + auto-decode whenever the modal is (re)opened.
   useEffect(() => {
     if (!open) return;
     setCode(initialCode ?? "");
     if (initialCode) {
-      setMode("decoding");
-      const t = setTimeout(() => setMode("diff"), reduce ? 0 : 650);
-      return () => clearTimeout(t);
+      runDecode(initialCode);
+      return;
     }
     setMode("input");
-  }, [open, initialCode, reduce]);
+  }, [open, initialCode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!open) return;
@@ -48,8 +62,7 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
 
   const decode = () => {
     if (!code.trim()) return;
-    setMode("decoding");
-    setTimeout(() => setMode("diff"), reduce ? 0 : 650);
+    runDecode(code);
   };
 
   return (
@@ -98,7 +111,7 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
               {mode === "input" ? (
                 <InputStep code={code} setCode={setCode} onDecode={decode} />
               ) : (
-                <ResultStep mode={mode} diff={diff} onApply={onApply} />
+                <ResultStep mode={mode} diff={rows} onApply={onApply} />
               )}
             </div>
           </motion.div>
