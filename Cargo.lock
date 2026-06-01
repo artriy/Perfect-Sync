@@ -80,6 +80,7 @@ name = "app"
 version = "0.1.0"
 dependencies = [
  "log",
+ "perfect-sync-core",
  "serde",
  "serde_json",
  "tauri",
