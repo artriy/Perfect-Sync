@@ -1,25 +1,32 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { TopBar } from "./components/TopBar";
 import { Sidebar } from "./components/Sidebar";
 import { MainPanel } from "./components/MainPanel";
 import { LobbyCodeModal } from "./components/LobbyCodeModal";
 import { AddModPanel } from "./components/AddModPanel";
+import { SettingsModal } from "./components/SettingsModal";
 import { Toast, type ToastState } from "./components/Toast";
-import { CATALOG, GAME, PROFILES, SAMPLE_CODE, SAMPLE_DIFF } from "./data/mock";
+import * as bridge from "./lib/bridge";
+import { CATALOG, SAMPLE_DIFF } from "./data/mock";
 import { CREW } from "./lib/palette";
-import type { CatalogItem, Profile, ProfileMod } from "./lib/types";
+import type { Arch, CatalogItem, GameInstall, Profile, ProfileMod, Settings } from "./lib/types";
 
 const CREW_CYCLE = Object.values(CREW);
 
 export function App() {
-  const [profiles, setProfiles] = useState<Profile[]>(PROFILES);
-  const [activeId, setActiveId] = useState(PROFILES[0].id);
-  const [running, setRunning] = useState(GAME.running);
+  const [loaded, setLoaded] = useState(false);
+  const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [activeId, setActiveId] = useState<string>("");
+  const [running, setRunning] = useState(false);
   const [busyModId, setBusyModId] = useState<string | null>(null);
+
+  const [game, setGame] = useState<GameInstall | null>(null);
+  const [settings, setSettings] = useState<Settings>({});
 
   const [addOpen, setAddOpen] = useState(false);
   const [lobbyOpen, setLobbyOpen] = useState(false);
   const [lobbyCode, setLobbyCode] = useState<string | undefined>(undefined);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [toast, setToast] = useState<ToastState | null>(null);
   const toastId = useRef(0);
@@ -30,47 +37,102 @@ export function App() {
     setTimeout(() => setToast((t) => (t?.id === id ? null : t)), 2600);
   };
 
+  // Load settings, detect the game, and read persisted profiles on startup.
+  useEffect(() => {
+    (async () => {
+      const [st, games, profs] = await Promise.all([
+        bridge.getSettings(),
+        bridge.detectGames(),
+        bridge.loadProfiles(),
+      ]);
+      setSettings(st);
+      setGame(games[0] ?? null);
+      let list = profs;
+      if (list.length === 0) {
+        const starter: Profile = { id: "my-mods", name: "My mods", crewColor: CREW.violet, mods: [] };
+        await bridge.saveProfile(starter);
+        list = [starter];
+      }
+      setProfiles(list);
+      setActiveId(list[0].id);
+      setLoaded(true);
+    })().catch((e) => {
+      notify(String(e));
+      setLoaded(true);
+    });
+  }, []);
+
+  const arch: Arch = game?.arch ?? settings.arch ?? "x86";
+  const gameStatus = { store: game?.store ?? "steam", arch, running };
+  const firstRun = loaded && !game && !settings.gamePath;
+
   const active = profiles.find((p) => p.id === activeId) ?? profiles[0];
 
-  const patchActive = (fn: (mods: ProfileMod[]) => ProfileMod[]) =>
-    setProfiles((ps) => ps.map((p) => (p.id === active.id ? { ...p, mods: fn(p.mods) } : p)));
+  if (!loaded || !active) {
+    return (
+      <div className="grid h-[100dvh] place-items-center">
+        <p className="subtitle text-ink-dim">Loading Perfect-Sync…</p>
+      </div>
+    );
+  }
 
-  const toggleMod = (modId: string) =>
-    patchActive((mods) => mods.map((m) => (m.packageId === modId ? { ...m, enabled: !m.enabled } : m)));
+  const patchProfile = (updated: Profile) =>
+    setProfiles((ps) => ps.map((p) => (p.id === updated.id ? updated : p)));
 
-  const changeVersion = (modId: string, v: string) => {
+  const hasRoleMod = (mods: ProfileMod[]) => mods.some((m) => !m.managed && m.tags.includes("role"));
+
+  const toggleMod = async (modId: string) => {
+    const mod = active.mods.find((m) => m.packageId === modId);
+    if (!mod) return;
+    try {
+      patchProfile(await bridge.setModEnabled(active, modId, !mod.enabled));
+    } catch (e) {
+      notify(String(e));
+    }
+  };
+
+  const changeVersion = async (modId: string, v: string) => {
     setBusyModId(modId);
-    // simulate fetching + swapping the release
-    setTimeout(() => {
-      patchActive((mods) =>
-        mods.map((m) =>
-          m.packageId === modId ? { ...m, version: v, update: m.update === v ? undefined : m.update } : m,
-        ),
-      );
-      setBusyModId(null);
-      const name = active.mods.find((m) => m.packageId === modId)?.name ?? "mod";
-      notify(`${name} set to ${v}`);
-    }, 700);
-  };
-
-  const removeMod = (modId: string) => {
     const name = active.mods.find((m) => m.packageId === modId)?.name ?? "mod";
-    patchActive((mods) => mods.filter((m) => m.packageId !== modId));
-    notify(`Removed ${name}`);
+    try {
+      patchProfile(await bridge.setModVersion(active, modId, v, arch));
+      notify(`${name} set to ${v}`);
+    } catch (e) {
+      notify(String(e));
+    } finally {
+      setBusyModId(null);
+    }
   };
 
-  const newProfile = () => {
+  const removeMod = async (modId: string) => {
+    const name = active.mods.find((m) => m.packageId === modId)?.name ?? "mod";
+    try {
+      patchProfile(await bridge.removeMod(active, modId));
+      notify(`Removed ${name}`);
+    } catch (e) {
+      notify(String(e));
+    }
+  };
+
+  const newProfile = async () => {
     const n = profiles.filter((p) => p.name.startsWith("New profile")).length + 1;
     const id = `new-${Date.now()}`;
-    const color = CREW_CYCLE[profiles.length % CREW_CYCLE.length];
-    setProfiles((ps) => [...ps, { id, name: `New profile ${n}`, crewColor: color, mods: [] }]);
+    const profile: Profile = {
+      id,
+      name: `New profile ${n}`,
+      crewColor: CREW_CYCLE[profiles.length % CREW_CYCLE.length],
+      mods: [],
+    };
+    setProfiles((ps) => [...ps, profile]);
     setActiveId(id);
+    try {
+      await bridge.saveProfile(profile);
+    } catch (e) {
+      notify(String(e));
+    }
   };
 
-  const hasRoleMod = (mods: ProfileMod[]) =>
-    mods.some((m) => !m.managed && m.tags.includes("role"));
-
-  const addCatalog = (item: CatalogItem) => {
+  const addCatalog = async (item: CatalogItem) => {
     if (active.mods.some((m) => m.packageId === item.id)) {
       notify(`${item.name} is already in this profile`);
       return;
@@ -79,24 +141,27 @@ export function App() {
       notify("Only one role mod per profile. Remove the current one first.");
       return;
     }
-    patchActive((mods) => [
-      {
-        packageId: item.id,
-        name: item.name,
-        repo: item.repo,
-        version: item.latest,
-        versions: [item.latest],
-        enabled: true,
-        source: "catalog",
-        tags: item.tags,
-      },
-      ...mods,
-    ]);
     setAddOpen(false);
-    notify(`Added ${item.name} to ${active.name}`);
+    const browserMod: ProfileMod = {
+      packageId: item.id,
+      name: item.name,
+      repo: item.repo,
+      version: item.latest,
+      versions: [item.latest],
+      enabled: true,
+      source: "catalog",
+      tags: item.tags,
+    };
+    notify(`Adding ${item.name}…`);
+    try {
+      patchProfile(await bridge.addMod(active, item.repo, arch, browserMod));
+      notify(`Added ${item.name} to ${active.name}`);
+    } catch (e) {
+      notify(String(e));
+    }
   };
 
-  const addUrl = (url: string) => {
+  const addUrl = async (url: string) => {
     const m = url.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
     const repo = m ? `${m[1]}/${m[2]}` : url;
     const name = m ? m[2] : "Mod";
@@ -104,33 +169,51 @@ export function App() {
       notify(`${name} is already in this profile`);
       return;
     }
-    patchActive((mods) => [
-      {
-        packageId: repo,
-        name,
-        repo,
-        version: "latest",
-        versions: ["latest"],
-        enabled: true,
-        source: "github",
-        tags: [],
-      },
-      ...mods,
-    ]);
     setAddOpen(false);
-    notify(`Added ${name} from GitHub`);
+    const browserMod: ProfileMod = {
+      packageId: repo,
+      name,
+      repo,
+      version: "latest",
+      versions: ["latest"],
+      enabled: true,
+      source: "github",
+      tags: [],
+    };
+    notify(`Adding ${name}…`);
+    try {
+      patchProfile(await bridge.addMod(active, url, arch, browserMod));
+      notify(`Added ${name} from GitHub`);
+    } catch (e) {
+      notify(String(e));
+    }
   };
 
-  const copyCode = () => {
-    navigator.clipboard?.writeText(SAMPLE_CODE).catch(() => {});
-    notify("Lobby code copied to clipboard");
+  const copyCode = async () => {
+    try {
+      const code = await bridge.encodeLobbyCode(active);
+      await navigator.clipboard?.writeText(code);
+      notify("Lobby code copied to clipboard");
+    } catch (e) {
+      notify(String(e));
+    }
   };
 
-  const launch = () => {
-    if (running) return;
-    setRunning(true);
-    notify(`Launching ${active.name}`);
-    setTimeout(() => setRunning(false), 2800);
+  const doLaunchProfile = async (p: Profile) => {
+    const gamePath = game?.path ?? settings.gamePath;
+    if (bridge.inTauri && !gamePath) {
+      notify("No game detected. Set the game path in Settings.");
+      return;
+    }
+    try {
+      setRunning(true);
+      await bridge.launchProfile(gamePath ?? "", p.id);
+      notify(`Launching ${p.name}`);
+      if (!bridge.inTauri) setTimeout(() => setRunning(false), 2800);
+    } catch (e) {
+      setRunning(false);
+      notify(String(e));
+    }
   };
 
   const openLobbyFromSidebar = () => {
@@ -142,26 +225,49 @@ export function App() {
     setLobbyOpen(true);
   };
 
-  const applyLobby = (doLaunch: boolean) => {
-    const built = buildLobbyProfile();
-    setProfiles((ps) => {
-      const without = ps.filter((p) => p.id !== built.id);
-      return [...without, built];
-    });
-    setActiveId(built.id);
+  const applyLobby = async (doLaunch: boolean, code: string) => {
     setLobbyOpen(false);
-    if (doLaunch) {
-      setRunning(true);
-      notify(`Applied lobby and launching ${built.name}`);
-      setTimeout(() => setRunning(false), 2800);
-    } else {
-      notify(`Lobby profile ready: ${built.name}`);
+    notify("Setting up lobby…");
+    try {
+      const built = await bridge.applyLobbyCode(code, arch, buildLobbyProfile());
+      setProfiles((ps) => [...ps.filter((p) => p.id !== built.id), built]);
+      setActiveId(built.id);
+      if (doLaunch) await doLaunchProfile(built);
+      else notify(`Lobby profile ready: ${built.name}`);
+    } catch (e) {
+      notify(String(e));
+    }
+  };
+
+  const saveSettings = async (s: Settings) => {
+    setSettings(s);
+    setSettingsOpen(false);
+    try {
+      await bridge.saveSettings(s);
+      notify("Settings saved");
+    } catch (e) {
+      notify(String(e));
     }
   };
 
   return (
     <div className="flex h-[100dvh] flex-col">
-      <TopBar game={{ ...GAME, running }} onAddMod={() => setAddOpen(true)} onPasteCode={openLobbyFromCode} />
+      <TopBar
+        game={gameStatus}
+        onAddMod={() => setAddOpen(true)}
+        onPasteCode={openLobbyFromCode}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
+
+      {firstRun && (
+        <button
+          type="button"
+          onClick={() => setSettingsOpen(true)}
+          className="ring-focus mx-3 mt-2 rounded-xl border border-[rgba(255,210,63,0.35)] bg-[rgba(255,210,63,0.12)] px-4 py-2 text-left text-[13px] text-[#ffe49a]"
+        >
+          No Among Us install detected. Click to open Settings and point Perfect-Sync at your game.
+        </button>
+      )}
 
       <div className="flex min-h-0 flex-1 p-3 pt-2.5">
         <div className="glass flex min-h-0 flex-1 overflow-hidden rounded-3xl">
@@ -174,13 +280,13 @@ export function App() {
           />
           <MainPanel
             profile={active}
-            game={{ ...GAME, running }}
+            game={gameStatus}
             busyModId={busyModId}
             onToggle={toggleMod}
             onVersion={changeVersion}
             onRemove={removeMod}
             onCopyCode={copyCode}
-            onLaunch={launch}
+            onLaunch={() => doLaunchProfile(active)}
             onAddMod={() => setAddOpen(true)}
           />
         </div>
@@ -199,6 +305,13 @@ export function App() {
         diff={SAMPLE_DIFF}
         onClose={() => setLobbyOpen(false)}
         onApply={applyLobby}
+      />
+      <SettingsModal
+        open={settingsOpen}
+        settings={settings}
+        game={game}
+        onClose={() => setSettingsOpen(false)}
+        onSave={saveSettings}
       />
       <Toast toast={toast} />
     </div>

@@ -26,6 +26,7 @@ pub fn run() {
       commands::encode_lobby_code,
       commands::add_mod,
       commands::set_mod_enabled,
+      commands::set_mod_version,
       commands::remove_mod,
       commands::apply_lobby_code,
       commands::launch_profile

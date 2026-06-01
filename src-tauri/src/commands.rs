@@ -169,6 +169,50 @@ pub fn set_mod_enabled(
 }
 
 #[tauri::command]
+pub fn set_mod_version(
+    profile_id: String,
+    package_id: String,
+    version: String,
+    arch: String,
+) -> Result<ProfileRecord, String> {
+    let root = settings::profiles_root();
+    let store = ProfileStore::new(&root);
+    let mut rec = store.load(&profile_id).ok_or("profile not found")?;
+    let pos = rec
+        .mods
+        .iter()
+        .position(|m| m.package_id == package_id)
+        .ok_or("mod not found")?;
+    let repo = rec.mods[pos]
+        .repo
+        .clone()
+        .and_then(|r| resolver::parse_repo(&r))
+        .or_else(|| resolver::parse_repo(&package_id))
+        .ok_or("cannot resolve source")?;
+    let cat = catalog();
+    let rules = cat
+        .get(&package_id)
+        .or_else(|| cat.get(&repo))
+        .map(|e| e.asset_rules.clone())
+        .unwrap_or_else(default_rules);
+    let http = http();
+    let resolved =
+        resolver::resolve_tag(&http, &repo, &version, &rules, &arch).map_err(|e| e.to_string())?;
+    if let Some(old) = rec.mods[pos].file.clone() {
+        let _ = profile::remove_plugin(&root, &profile_id, &old);
+    }
+    let file = install_resolved(&root, &profile_id, &http, &resolved)?;
+    rec.mods[pos].version = resolved.version.clone();
+    rec.mods[pos].file = file;
+    if !rec.mods[pos].versions.contains(&resolved.version) {
+        rec.mods[pos].versions.push(resolved.version.clone());
+    }
+    rec.mods[pos].update = None;
+    store.save(&rec).map_err(|e| e.to_string())?;
+    Ok(rec)
+}
+
+#[tauri::command]
 pub fn remove_mod(profile_id: String, package_id: String) -> Result<ProfileRecord, String> {
     let root = settings::profiles_root();
     let store = ProfileStore::new(&root);

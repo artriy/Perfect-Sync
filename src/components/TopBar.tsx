@@ -6,9 +6,10 @@ interface TopBarProps {
   game: GameStatus;
   onAddMod: () => void;
   onPasteCode: (code: string) => void;
+  onOpenSettings: () => void;
 }
 
-export function TopBar({ game, onAddMod, onPasteCode }: TopBarProps) {
+export function TopBar({ game, onAddMod, onPasteCode, onOpenSettings }: TopBarProps) {
   const [q, setQ] = useState("");
 
   const submit = () => {
@@ -66,6 +67,7 @@ export function TopBar({ game, onAddMod, onPasteCode }: TopBarProps) {
       <button
         type="button"
         aria-label="Settings"
+        onClick={onOpenSettings}
         className="ring-focus glass grid h-[34px] w-[34px] place-items-center rounded-[10px] text-ink-dim transition-colors hover:text-ink"
       >
         <GearSix size={17} />

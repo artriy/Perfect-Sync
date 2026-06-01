@@ -20,7 +20,7 @@ interface LobbyCodeModalProps {
   initialCode?: string;
   diff: DiffItem[];
   onClose: () => void;
-  onApply: (launch: boolean) => void;
+  onApply: (launch: boolean, code: string) => void;
 }
 
 export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: LobbyCodeModalProps) {
@@ -116,7 +116,11 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
               {mode === "input" ? (
                 <InputStep code={code} setCode={setCode} onDecode={decode} />
               ) : (
-                <ResultStep mode={mode} diff={rows} onApply={onApply} />
+                <ResultStep
+                  mode={mode}
+                  diff={rows}
+                  onApply={(launch) => onApply(launch, code || initialCode || "")}
+                />
               )}
             </div>
           </motion.div>

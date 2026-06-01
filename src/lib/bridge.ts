@@ -1,20 +1,105 @@
-import type { DiffItem } from "./types";
-import { SAMPLE_DIFF } from "../data/mock";
+import type { DiffItem, GameInstall, Profile, ProfileMod, Settings } from "./types";
+import { PROFILES, SAMPLE_CODE, SAMPLE_DIFF } from "../data/mock";
+
+/** True when running inside the Tauri shell (vs a plain browser via `pnpm dev`). */
+export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(cmd, args);
+}
 
 export interface Preview {
   name: string;
   items: DiffItem[];
 }
 
-const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+// ---------------------------------------------------------------- detection
+export async function detectGames(): Promise<GameInstall[]> {
+  if (inTauri) return invoke<GameInstall[]>("detect_games");
+  return [
+    { path: "C:/Program Files (x86)/Steam/steamapps/common/Among Us", store: "steam", arch: "x86" },
+  ];
+}
 
-/** Decode a PERFECT- code into an apply-preview. Real codec under Tauri; mock in the browser. */
+export async function getSettings(): Promise<Settings> {
+  if (inTauri) return invoke<Settings>("get_settings");
+  return {};
+}
+
+export async function saveSettings(settings: Settings): Promise<void> {
+  if (inTauri) await invoke("save_settings", { settings });
+}
+
+export async function gameRunning(): Promise<boolean> {
+  if (inTauri) return invoke<boolean>("game_running");
+  return false;
+}
+
+// ------------------------------------------------------------------ profiles
+export async function loadProfiles(): Promise<Profile[]> {
+  if (inTauri) return invoke<Profile[]>("list_profiles");
+  return structuredClone(PROFILES);
+}
+
+export async function saveProfile(profile: Profile): Promise<void> {
+  if (inTauri) await invoke("save_profile", { profile });
+}
+
+export async function deleteProfile(id: string): Promise<void> {
+  if (inTauri) await invoke("delete_profile", { id });
+}
+
+// ------------------------------------------------------- mod mutations
+// Each returns the updated profile. Under Tauri the backend is authoritative;
+// in the browser we apply the same change to a local copy for the demo.
+
+export async function setModEnabled(profile: Profile, packageId: string, enabled: boolean): Promise<Profile> {
+  if (inTauri) return invoke<Profile>("set_mod_enabled", { profileId: profile.id, packageId, enabled });
+  return { ...profile, mods: profile.mods.map((m) => (m.packageId === packageId ? { ...m, enabled } : m)) };
+}
+
+export async function setModVersion(profile: Profile, packageId: string, version: string, arch: string): Promise<Profile> {
+  if (inTauri) return invoke<Profile>("set_mod_version", { profileId: profile.id, packageId, version, arch });
+  return {
+    ...profile,
+    mods: profile.mods.map((m) =>
+      m.packageId === packageId ? { ...m, version, update: m.update === version ? undefined : m.update } : m,
+    ),
+  };
+}
+
+export async function removeMod(profile: Profile, packageId: string): Promise<Profile> {
+  if (inTauri) return invoke<Profile>("remove_mod", { profileId: profile.id, packageId });
+  return { ...profile, mods: profile.mods.filter((m) => m.packageId !== packageId) };
+}
+
+/** Add a mod by repo/URL. `browserMod` is the locally-constructed entry used in the browser demo. */
+export async function addMod(profile: Profile, repo: string, arch: string, browserMod: ProfileMod): Promise<Profile> {
+  if (inTauri) return invoke<Profile>("add_mod", { profileId: profile.id, repo, arch });
+  if (profile.mods.some((m) => m.packageId === browserMod.packageId)) return profile;
+  return { ...profile, mods: [browserMod, ...profile.mods] };
+}
+
+// --------------------------------------------------------------- lobby codes
+export async function encodeLobbyCode(profile: Profile): Promise<string> {
+  if (inTauri) return invoke<string>("encode_lobby_code", { profile });
+  return SAMPLE_CODE;
+}
+
 export async function previewCode(code: string, installed: [string, string][]): Promise<Preview> {
-  if (inTauri) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return invoke<Preview>("preview_code", { code, installed });
-  }
-  // browser fallback so `pnpm dev` still demos the flow
+  if (inTauri) return invoke<Preview>("preview_code", { code, installed });
   await new Promise((r) => setTimeout(r, 500));
   return { name: "Lobby - TownOfUs Night", items: SAMPLE_DIFF };
+}
+
+/** Apply a code into a new/refreshed profile. `browserProfile` is the demo fallback. */
+export async function applyLobbyCode(code: string, arch: string, browserProfile: Profile): Promise<Profile> {
+  if (inTauri) return invoke<Profile>("apply_lobby_code", { code, arch });
+  return browserProfile;
+}
+
+// -------------------------------------------------------------------- launch
+export async function launchProfile(gamePath: string, profileId: string): Promise<void> {
+  if (inTauri) await invoke("launch_profile", { gamePath, profileId });
 }

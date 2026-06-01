@@ -27,6 +27,8 @@ export interface ProfileMod {
   managed?: boolean;
   /** a newer release exists; value is the newer version */
   update?: string;
+  /** installed plugin file name (backend-tracked) */
+  file?: string;
 }
 
 export interface Profile {
@@ -62,4 +64,17 @@ export interface GameStatus {
   store: Store;
   arch: Arch;
   running: boolean;
+}
+
+/** A detected Among Us install (from the backend `detect_games`). */
+export interface GameInstall {
+  path: string;
+  store: Store;
+  arch: Arch;
+}
+
+export interface Settings {
+  githubToken?: string;
+  gamePath?: string;
+  arch?: Arch;
 }
