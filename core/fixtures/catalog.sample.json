@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "updated": "2026-06-02",
+  "mods": [
+    {
+      "id": "AU-Avengers/TOU-Mira",
+      "name": "Town of Us - Mira",
+      "summary": "The Mira-API rebuild of Town of Us.",
+      "repo": "AU-Avengers/TOU-Mira",
+      "tags": ["role", "all-client"],
+      "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor"],
+      "assetRules": {
+        "perArch": {
+          "x86": { "match": "(?i)x86.*(steam|itch)", "prefer": "zip" },
+          "x64": { "match": "(?i)x64.*(epic|msstore)", "prefer": "zip" }
+        },
+        "dllName": "TownOfUsMira.dll",
+        "bundlesLoader": true
+      }
+    },
+    {
+      "id": "All-Of-Us-Mods/MiraAPI",
+      "name": "MiraAPI",
+      "summary": "Shared API layer.",
+      "repo": "All-Of-Us-Mods/MiraAPI",
+      "tags": ["library"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "assetRules": { "perArch": {}, "dllName": "MiraAPI.dll" }
+    },
+    {
+      "id": "NuclearPowered/Reactor",
+      "name": "Reactor",
+      "summary": "The modding API and handshake.",
+      "repo": "NuclearPowered/Reactor",
+      "tags": ["library"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "Reactor.dll" }
+    },
+    {
+      "id": "EnhancedNetwork/TownofHost-Enhanced",
+      "name": "Town of Host - Enhanced",
+      "summary": "Host-only chaos. No Reactor (fat DLL).",
+      "repo": "EnhancedNetwork/TownofHost-Enhanced",
+      "tags": ["role", "host-only"],
+      "dependencies": [],
+      "assetRules": {
+        "perArch": {
+          "x86": { "match": "(?i)SteamItchio" },
+          "x64": { "match": "(?i)EpicMsStore" }
+        },
+        "dllName": "TOHE.dll"
+      }
+    }
+  ]
+}
