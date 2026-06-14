@@ -1,29 +1,64 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { FolderOpen, GameController, GithubLogo, X } from "@phosphor-icons/react";
-import { pickFolder } from "../lib/bridge";
+import {
+  ArrowsClockwise,
+  CheckCircle,
+  FolderOpen,
+  GameController,
+  GithubLogo,
+  X,
+  XCircle,
+} from "@phosphor-icons/react";
+import { ensureLoader, loaderStatus, pickFolder, type LoaderStatus } from "../lib/bridge";
 import type { Arch, GameInstall, Settings } from "../lib/types";
 
 interface SettingsModalProps {
   open: boolean;
   settings: Settings;
   game: GameInstall | null;
+  profileId: string;
   onClose: () => void;
   onSave: (s: Settings) => void;
 }
 
-export function SettingsModal({ open, settings, game, onClose, onSave }: SettingsModalProps) {
+export function SettingsModal({ open, settings, game, profileId, onClose, onSave }: SettingsModalProps) {
   const reduce = useReducedMotion();
   const [token, setToken] = useState(settings.githubToken ?? "");
   const [gamePath, setGamePath] = useState(settings.gamePath ?? "");
   const [arch, setArch] = useState<Arch>(settings.arch ?? "x86");
+  const [status, setStatus] = useState<LoaderStatus | null>(null);
+  const [working, setWorking] = useState(false);
+
+  const refreshStatus = (path: string) => {
+    if (!path.trim()) {
+      setStatus(null);
+      return;
+    }
+    loaderStatus(path.trim(), profileId)
+      .then(setStatus)
+      .catch(() => setStatus(null));
+  };
 
   useEffect(() => {
     if (!open) return;
     setToken(settings.githubToken ?? "");
     setGamePath(settings.gamePath ?? game?.path ?? "");
     setArch(settings.arch ?? game?.arch ?? "x86");
-  }, [open, settings.githubToken, settings.gamePath, settings.arch, game]);
+    refreshStatus(settings.gamePath ?? game?.path ?? "");
+  }, [open, settings.githubToken, settings.gamePath, settings.arch, game, profileId]);
+
+  const reinstall = async () => {
+    if (!gamePath.trim()) return;
+    setWorking(true);
+    try {
+      await ensureLoader(gamePath.trim(), profileId, arch);
+    } catch {
+      // failure shows up in the refreshed status below
+    } finally {
+      setWorking(false);
+      refreshStatus(gamePath);
+    }
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -155,6 +190,34 @@ export function SettingsModal({ open, settings, game, onClose, onSave }: Setting
               anonymous GitHub limit.
             </p>
 
+            <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
+              BepInEx loader
+            </span>
+            <div className="glass rounded-xl px-3.5 py-3 text-[12.5px]">
+              {status ? (
+                <div className="flex flex-col gap-1">
+                  <StatusRow ok={status.winhttp} label="Doorstop (winhttp.dll)" />
+                  <StatusRow ok={status.preloader} label="BepInEx core" />
+                  <StatusRow ok={status.dotnet} label=".NET runtime" />
+                  <StatusRow ok={status.steamAppid} label="Steam launch fix" />
+                  <div className="mt-1 text-ink-faint">
+                    plugins: {status.profilePlugins} in profile · {status.gamePlugins} synced to game
+                  </div>
+                </div>
+              ) : (
+                <div className="text-ink-faint">Set your game folder above to check the loader.</div>
+              )}
+              <button
+                type="button"
+                onClick={reinstall}
+                disabled={working || !gamePath.trim()}
+                className="ring-focus glass-2 mt-3 flex items-center gap-1.5 rounded-lg px-3 py-2 text-[12.5px] text-ink-dim hover:text-ink disabled:opacity-50"
+              >
+                <ArrowsClockwise size={14} className={working ? "animate-spin" : ""} />
+                {working ? "Installing BepInEx…" : "Reinstall BepInEx now"}
+              </button>
+            </div>
+
             <div className="mt-6 flex justify-end gap-2.5">
               <button
                 type="button"
@@ -175,5 +238,18 @@ export function SettingsModal({ open, settings, game, onClose, onSave }: Setting
         </motion.div>
       )}
     </AnimatePresence>
+  );
+}
+
+function StatusRow({ ok, label }: { ok: boolean; label: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      {ok ? (
+        <CheckCircle size={14} weight="fill" className="text-[#5be3b0]" />
+      ) : (
+        <XCircle size={14} weight="fill" className="text-[#ff8a8a]" />
+      )}
+      <span className={ok ? "text-ink-dim" : "text-[#ffb4b4]"}>{label}</span>
+    </div>
   );
 }

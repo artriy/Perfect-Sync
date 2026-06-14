@@ -4,7 +4,6 @@
 //! All file mutations must be gated on the game NOT running (file locks), so
 //! callers check `is_running()` before installing/launching.
 
-use crate::loader;
 use std::path::{Path, PathBuf};
 
 pub const GAME_EXE: &str = "Among Us.exe";
@@ -17,11 +16,12 @@ pub struct LaunchSpec {
     pub env: Vec<(String, String)>,
 }
 
-/// Build the launch spec for `game_dir` against `profile_dir` (pure).
-pub fn build_launch(game_dir: &Path, profile_dir: &Path) -> LaunchSpec {
+/// Build the launch spec. BepInEx/Doorstop is driven by the game dir's
+/// `doorstop_config.ini`, so no extra environment is needed.
+pub fn build_launch(game_dir: &Path) -> LaunchSpec {
     LaunchSpec {
         program: game_dir.join(GAME_EXE),
-        env: loader::launch_env(game_dir, profile_dir),
+        env: Vec::new(),
     }
 }
 
@@ -61,14 +61,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_launch_targets_exe_and_profile() {
-        let spec = build_launch(Path::new("/games/Among Us"), Path::new("/profiles/p1"));
+    fn build_launch_targets_exe() {
+        let spec = build_launch(Path::new("/games/Among Us"));
         assert!(spec.program.ends_with("Among Us.exe"));
         assert!(spec.program.starts_with("/games/Among Us"));
-        assert!(spec
-            .env
-            .iter()
-            .any(|(k, v)| k == "DOORSTOP_TARGET_ASSEMBLY" && v.contains("p1")));
-        assert!(spec.env.iter().any(|(k, _)| k == "DOORSTOP_ENABLED"));
     }
 }

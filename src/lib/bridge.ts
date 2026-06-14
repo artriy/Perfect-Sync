@@ -152,6 +152,21 @@ export async function applyLobbyCode(code: string, arch: string, browserProfile:
 }
 
 // ------------------------------------------------------------ loader + launch
+export interface LoaderStatus {
+  gameFound: boolean;
+  winhttp: boolean;
+  preloader: boolean;
+  dotnet: boolean;
+  steamAppid: boolean;
+  profilePlugins: number;
+  gamePlugins: number;
+}
+
+export async function loaderStatus(gamePath: string, profileId: string): Promise<LoaderStatus | null> {
+  if (!inTauri) return null;
+  return invoke<LoaderStatus>("loader_status", { gamePath, profileId });
+}
+
 export async function ensureLoader(gamePath: string, profileId: string, arch: string): Promise<void> {
   if (inTauri) await invoke("ensure_loader", { gamePath, profileId, arch });
 }

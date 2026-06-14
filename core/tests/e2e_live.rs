@@ -39,18 +39,16 @@ fn live_install_bepinex_loader_from_github() {
     std::fs::create_dir_all(&game).unwrap();
     std::fs::create_dir_all(&profile).unwrap();
 
-    loader::install_pack_from_zip(&bytes, &game, &profile, &cache).unwrap();
+    loader::install_pack_from_zip(&bytes, &game, &cache).unwrap();
+    let _ = &profile; // profile dir unused in game-dir install model
 
     assert!(game.join("winhttp.dll").exists(), "winhttp installed to game dir");
     assert!(game.join("dotnet").join("coreclr.dll").exists(), "dotnet runtime installed");
     assert!(
-        profile
-            .join("BepInEx")
-            .join("core")
-            .join("BepInEx.Unity.IL2CPP.dll")
-            .exists(),
-        "preloader installed to profile"
+        game.join("BepInEx").join("core").join("BepInEx.Unity.IL2CPP.dll").exists(),
+        "preloader installed to game BepInEx/core"
     );
+    assert!(loader::is_installed(&game));
 }
 
 #[test]
@@ -114,11 +112,7 @@ fn live_end_to_end_reactor_install() {
         .unwrap();
     assert!(store.load("live").is_some());
 
-    let spec = process::build_launch(Path::new("C:/Games/Among Us"), &profiles_root.join("live"));
+    let spec = process::build_launch(Path::new("C:/Games/Among Us"));
     assert!(spec.program.ends_with("Among Us.exe"));
-    assert!(spec
-        .env
-        .iter()
-        .any(|(k, v)| k == "DOORSTOP_TARGET_ASSEMBLY" && v.contains("live")));
-    println!("launch: {:?} env={:?}", spec.program, spec.env);
+    println!("launch: {:?}", spec.program);
 }

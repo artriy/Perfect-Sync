@@ -104,25 +104,22 @@ fn resolve_pack(http: &dyn Http, arch: &str) -> Result<ResolvedDownload, String>
 /// caches the GitHub pack once per arch.
 fn ensure_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(), String> {
     let game_dir = Path::new(game_path);
+    if !game_dir.is_dir() {
+        return Err(format!("game folder not found: {game_path}"));
+    }
     let root = settings::profiles_root();
-    let profile_dir = root.join(profile_id);
-    let preloader = profile_dir
-        .join("BepInEx")
-        .join("core")
-        .join(loader::IL2CPP_PRELOADER);
-    if loader::is_bootstrapped(game_dir) && preloader.exists() {
+    loader::ensure_profile_layout(&root, profile_id).map_err(|e| e.to_string())?;
+    if loader::is_installed(game_dir) {
         return Ok(());
     }
-    loader::ensure_profile_layout(&root, profile_id).map_err(|e| e.to_string())?;
     let cache = settings::cache_dir().join("bepinex").join(arch);
     if let Some(pack_root) = loader::locate_pack_root(&cache) {
-        loader::install_pack(&pack_root, game_dir, &profile_dir).map_err(|e| e.to_string())?;
+        loader::install_pack(&pack_root, game_dir).map_err(|e| e.to_string())?;
     } else {
         let h = http();
         let resolved = resolve_pack(&h, arch)?;
         let bytes = h.get_bytes(&resolved.url).map_err(|e| e.to_string())?;
-        loader::install_pack_from_zip(&bytes, game_dir, &profile_dir, &cache)
-            .map_err(|e| e.to_string())?;
+        loader::install_pack_from_zip(&bytes, game_dir, &cache).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -544,6 +541,42 @@ pub async fn ensure_loader(
     blocking(move || ensure_loader_impl(&game_path, &profile_id, &arch)).await
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoaderStatus {
+    pub game_found: bool,
+    pub winhttp: bool,
+    pub preloader: bool,
+    pub dotnet: bool,
+    pub steam_appid: bool,
+    pub profile_plugins: usize,
+    pub game_plugins: usize,
+}
+
+#[tauri::command]
+pub fn loader_status(game_path: String, profile_id: String) -> LoaderStatus {
+    let game = Path::new(&game_path);
+    let root = settings::profiles_root();
+    let count_dll = |dir: std::path::PathBuf| {
+        fs::read_dir(dir)
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("dll"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    LoaderStatus {
+        game_found: game.is_dir(),
+        winhttp: game.join("winhttp.dll").exists(),
+        preloader: game.join("BepInEx").join("core").join(loader::IL2CPP_PRELOADER).exists(),
+        dotnet: game.join("dotnet").join("coreclr.dll").exists(),
+        steam_appid: game.join("steam_appid.txt").exists(),
+        profile_plugins: count_dll(loader::profile_plugins_dir(&root, &profile_id)),
+        game_plugins: count_dll(game.join("BepInEx").join("plugins")),
+    }
+}
+
 #[tauri::command]
 pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(), String> {
     blocking(move || {
@@ -553,8 +586,10 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
         let arch = settings::load().arch.unwrap_or_else(|| "x86".to_string());
         ensure_loader_impl(&game_path, &profile_id, &arch)?;
         let _ = loader::ensure_steam_appid(Path::new(&game_path));
-        let root = settings::profiles_root();
-        let spec = process::build_launch(Path::new(&game_path), &root.join(&profile_id));
+        // copy this profile's enabled plugins into the game's BepInEx/plugins
+        loader::sync_profile_plugins(&settings::profiles_root(), &profile_id, Path::new(&game_path))
+            .map_err(|e| e.to_string())?;
+        let spec = process::build_launch(Path::new(&game_path));
         process::launch(&spec).map_err(|e| e.to_string())?;
         Ok(())
     })

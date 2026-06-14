@@ -362,6 +362,7 @@ export function App() {
         open={settingsOpen}
         settings={settings}
         game={game}
+        profileId={active.id}
         onClose={() => setSettingsOpen(false)}
         onSave={saveSettings}
       />
