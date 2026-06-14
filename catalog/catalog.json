@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-06-14",
   "loader": {
-    "packUrl": "https://builds.bepinex.dev/projects/bepinex_be/764/BepInEx-Unity.IL2CPP-win-x86-6.0.0-be.764%2B5f39645.zip",
+    "buildsUrl": "https://builds.bepinex.dev/projects/bepinex_be",
     "thunderstoreApi": "https://thunderstore.io/api/experimental/package/BepInEx/BepInExPack_AmongUs/"
   },
   "mods": [

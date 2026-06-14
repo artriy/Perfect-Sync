@@ -8,6 +8,7 @@
 //! `<game>/BepInEx`. Profiles are kept outside the game dir and their plugins
 //! are copied in on launch (instant switch, vanilla stays clean when removed).
 
+use regex::Regex;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,20 +22,41 @@ pub const IL2CPP_PRELOADER: &str = "BepInEx.Unity.IL2CPP.dll";
 /// Among Us Steam app id, written so the game inits Steamworks on a direct launch.
 pub const STEAM_APP_ID: &str = "945360";
 
-/// Identifier for the loader pack this build installs. Bumping it invalidates an
-/// older installed loader (and its cache) so the app auto-reinstalls the current
-/// one. (be.764: supports metadata 31 AND satisfies modern mods that require
-/// be.738+, e.g. Town of Us - Mira.)
-pub const LOADER_VERSION: &str = "bepinex-be.764";
-
 const LOADER_MARKER: &str = ".perfectsync_loader";
 
-/// True only if the CURRENT loader version is installed in the game dir.
-pub fn is_current(game_dir: &Path) -> bool {
-    is_installed(game_dir)
-        && fs::read_to_string(game_dir.join("BepInEx").join(LOADER_MARKER))
-            .map(|s| s.trim() == LOADER_VERSION)
-            .unwrap_or(false)
+/// True if a BepInEx loader installed by THIS app is present (winhttp + preloader
+/// + our marker). A foreign/old install lacking the marker reads false, so the
+/// app reinstalls the current build (auto-heals stale loaders like be.697).
+pub fn has_loader(game_dir: &Path) -> bool {
+    is_installed(game_dir) && game_dir.join("BepInEx").join(LOADER_MARKER).exists()
+}
+
+/// The loader build id this app recorded (e.g. "be.764"), if any.
+pub fn installed_version(game_dir: &Path) -> Option<String> {
+    fs::read_to_string(game_dir.join("BepInEx").join(LOADER_MARKER))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Scrape the builds.bepinex.dev listing HTML for the NEWEST IL2CPP win-<arch>
+/// build. Returns (build id like "be.764", absolute download url). This keeps the
+/// app on the latest BepInEx forever without hardcoding a version.
+pub fn parse_latest_build(html: &str, arch: &str) -> Option<(String, String)> {
+    let pat = format!(
+        r#"projects/bepinex_be/(\d+)/(BepInEx-Unity\.IL2CPP-win-{}[^"'<> ]+\.zip)"#,
+        regex::escape(arch)
+    );
+    let re = Regex::new(&pat).ok()?;
+    let mut best: Option<(u64, String)> = None;
+    for c in re.captures_iter(html) {
+        let n: u64 = c[1].parse().unwrap_or(0);
+        let path = format!("projects/bepinex_be/{}/{}", &c[1], &c[2]);
+        if best.as_ref().map_or(true, |(bn, _)| n > *bn) {
+            best = Some((n, path));
+        }
+    }
+    best.map(|(n, path)| (format!("be.{n}"), format!("https://builds.bepinex.dev/{path}")))
 }
 
 pub fn profile_bepinex_dir(profiles_root: &Path, profile_id: &str) -> PathBuf {
@@ -71,7 +93,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Install the loader from an extracted `BepInExPack` directory entirely INTO the
 /// game dir: Doorstop bootstrap, bundled `dotnet/` runtime, and `BepInEx/{core,config}`.
-pub fn install_pack(pack_dir: &Path, game_dir: &Path) -> io::Result<()> {
+pub fn install_pack(pack_dir: &Path, game_dir: &Path, version: &str) -> io::Result<()> {
     for file in BOOTSTRAP_FILES {
         let src = pack_dir.join(file);
         if src.exists() {
@@ -89,7 +111,7 @@ pub fn install_pack(pack_dir: &Path, game_dir: &Path) -> io::Result<()> {
         }
     }
     fs::create_dir_all(game_dir.join("BepInEx").join("plugins"))?;
-    fs::write(game_dir.join("BepInEx").join(LOADER_MARKER), LOADER_VERSION)?;
+    fs::write(game_dir.join("BepInEx").join(LOADER_MARKER), version)?;
     ensure_steam_appid(game_dir)?;
     Ok(())
 }
@@ -141,13 +163,18 @@ pub fn locate_pack_root(dir: &Path) -> Option<PathBuf> {
 
 /// Extract a downloaded BepInEx pack into `cache_dir` (once) and install it into
 /// the game dir. Idempotent: re-extraction is skipped if cached.
-pub fn install_pack_from_zip(bytes: &[u8], game_dir: &Path, cache_dir: &Path) -> io::Result<()> {
+pub fn install_pack_from_zip(
+    bytes: &[u8],
+    game_dir: &Path,
+    cache_dir: &Path,
+    version: &str,
+) -> io::Result<()> {
     if locate_pack_root(cache_dir).is_none() {
         extract_all(bytes, cache_dir)?;
     }
     let root = locate_pack_root(cache_dir)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "winhttp.dll not found in pack"))?;
-    install_pack(&root, game_dir)
+    install_pack(&root, game_dir, version)
 }
 
 /// True if the loader is installed in the game dir (proxy + preloader present).
@@ -217,7 +244,7 @@ mod tests {
         make_pack(&pack);
         fs::create_dir_all(&game).unwrap();
 
-        install_pack(&pack, &game).unwrap();
+        install_pack(&pack, &game, "be.999").unwrap();
 
         assert!(game.join("winhttp.dll").exists());
         assert!(game.join("dotnet").join("coreclr.dll").exists());
@@ -226,7 +253,25 @@ mod tests {
         assert!(game.join("BepInEx").join("plugins").is_dir());
         assert!(game.join("steam_appid.txt").exists());
         assert!(is_installed(&game));
-        assert!(is_current(&game), "marker written so current loader is detected");
+        assert!(has_loader(&game), "marker written so our loader is detected");
+        assert_eq!(installed_version(&game).as_deref(), Some("be.999"));
+    }
+
+    #[test]
+    fn parses_latest_build_from_listing_html() {
+        let html = r#"
+          <a href="projects/bepinex_be/762/BepInEx-Unity.IL2CPP-win-x86-6.0.0-be.762%2Bbd467c9.zip">x</a>
+          <a href="projects/bepinex_be/764/BepInEx-Unity.IL2CPP-win-x86-6.0.0-be.764%2B5f39645.zip">x</a>
+          <a href="projects/bepinex_be/763/BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.763%2Bda64b22.zip">x</a>
+        "#;
+        let (id, url) = parse_latest_build(html, "x86").unwrap();
+        assert_eq!(id, "be.764");
+        assert_eq!(
+            url,
+            "https://builds.bepinex.dev/projects/bepinex_be/764/BepInEx-Unity.IL2CPP-win-x86-6.0.0-be.764%2B5f39645.zip"
+        );
+        // x64 picks the x64 asset
+        assert_eq!(parse_latest_build(html, "x64").unwrap().0, "be.763");
     }
 
     #[test]
@@ -259,8 +304,8 @@ mod tests {
         let cache = tmp.path().join("cache");
         let profiles = tmp.path().join("profiles");
         fs::create_dir_all(&game).unwrap();
-        install_pack_from_zip(&buf, &game, &cache).unwrap();
-        assert!(is_installed(&game));
+        install_pack_from_zip(&buf, &game, &cache, "be.test").unwrap();
+        assert!(has_loader(&game));
 
         // profile has a mod + a disabled mod
         let plugins = profile_plugins_dir(&profiles, "p1");

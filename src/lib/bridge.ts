@@ -157,6 +157,7 @@ export interface LoaderStatus {
   winhttp: boolean;
   preloader: boolean;
   current: boolean;
+  installedVersion?: string | null;
   dotnet: boolean;
   steamAppid: boolean;
   profilePlugins: number;

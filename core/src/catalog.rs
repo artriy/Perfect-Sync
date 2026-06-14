@@ -38,8 +38,13 @@ pub struct CatalogEntry {
 /// (This is only the BepInEx engine, never a mod.)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoaderInfo {
+    /// builds.bepinex.dev listing page; the app scrapes the newest build (preferred).
+    #[serde(rename = "buildsUrl", default)]
+    pub builds_url: Option<String>,
+    /// fallback: BepInEx Among Us pack experimental API (latest download_url).
     #[serde(rename = "thunderstoreApi", default)]
     pub thunderstore_api: Option<String>,
+    /// last-resort fixed pack url.
     #[serde(rename = "packUrl", default)]
     pub pack_url: Option<String>,
 }

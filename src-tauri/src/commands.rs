@@ -97,21 +97,36 @@ fn install_resolved(
     }
 }
 
-/// Resolve the BepInEx Among Us pack download URL (direct, else latest via API).
-fn pack_url(http: &dyn Http) -> Result<String, String> {
+/// Resolve the newest BepInEx loader (id + download url) for `arch`.
+/// Preferred: scrape the latest build from builds.bepinex.dev (always current,
+/// never hardcoded). Fallbacks: BepInEx Among Us pack API, then a fixed url.
+fn resolve_loader(http: &dyn Http, arch: &str) -> Result<(String, String), String> {
     let loader = bundled_catalog().loader.ok_or("catalog has no loader entry")?;
-    if let Some(u) = loader.pack_url {
-        if !u.is_empty() {
-            return Ok(u);
+    if let Some(builds) = &loader.builds_url {
+        if let Ok(html) = http.get_text(builds) {
+            if let Some(pair) = loader::parse_latest_build(&html, arch) {
+                return Ok(pair);
+            }
         }
     }
-    let api = loader.thunderstore_api.ok_or("no BepInEx loader source configured")?;
-    let text = http.get_text(&api).map_err(|e| e.to_string())?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    v["latest"]["download_url"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "could not find BepInEx pack url".to_string())
+    if let Some(api) = &loader.thunderstore_api {
+        if let Ok(text) = http.get_text(api) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let (Some(ver), Some(url)) = (
+                    v["latest"]["version_number"].as_str(),
+                    v["latest"]["download_url"].as_str(),
+                ) {
+                    return Ok((format!("au-{ver}"), url.to_string()));
+                }
+            }
+        }
+    }
+    if let Some(u) = &loader.pack_url {
+        if !u.is_empty() {
+            return Ok(("pinned".to_string(), u.clone()));
+        }
+    }
+    Err("could not resolve a BepInEx loader source (check your internet)".to_string())
 }
 
 /// Install the Doorstop/BepInEx loader for a profile (idempotent). Downloads +
@@ -123,27 +138,25 @@ fn ensure_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(
     }
     let root = settings::profiles_root();
     loader::ensure_profile_layout(&root, profile_id).map_err(|e| e.to_string())?;
-    // already the current loader version? nothing to do.
-    if loader::is_current(game_dir) {
+    // a loader we installed is already present? leave it (no per-launch network).
+    if loader::has_loader(game_dir) {
         return Ok(());
     }
-    // stale or missing loader: remove old loader bits (keep plugins) then install current
+    // resolve newest BEFORE wiping, so an offline failure doesn't break a working install
+    let h = http();
+    let (id, url) = resolve_loader(&h, arch)?;
+    // remove any old/foreign loader bits (keep plugins) then install the current build
     let bep = game_dir.join("BepInEx");
     let _ = fs::remove_file(game_dir.join("winhttp.dll"));
     for d in ["core", "interop", "cache"] {
         let _ = fs::remove_dir_all(bep.join(d));
     }
-    let cache = settings::cache_dir()
-        .join("bepinex")
-        .join(loader::LOADER_VERSION)
-        .join(arch);
+    let cache = settings::cache_dir().join("bepinex").join(&id).join(arch);
     if let Some(pack_root) = loader::locate_pack_root(&cache) {
-        loader::install_pack(&pack_root, game_dir).map_err(|e| e.to_string())?;
+        loader::install_pack(&pack_root, game_dir, &id).map_err(|e| e.to_string())?;
     } else {
-        let h = http();
-        let url = pack_url(&h)?;
         let bytes = h.get_bytes(&url).map_err(|e| e.to_string())?;
-        loader::install_pack_from_zip(&bytes, game_dir, &cache).map_err(|e| e.to_string())?;
+        loader::install_pack_from_zip(&bytes, game_dir, &cache, &id).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -155,6 +168,7 @@ fn reinstall_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Resul
     let game = Path::new(game_path);
     let _ = fs::remove_dir_all(settings::cache_dir().join("bepinex"));
     let _ = fs::remove_file(game.join("winhttp.dll"));
+    let _ = fs::remove_file(game.join("BepInEx").join(".perfectsync_loader"));
     let _ = fs::remove_dir_all(game.join("BepInEx").join("core"));
     let _ = fs::remove_dir_all(game.join("BepInEx").join("interop"));
     let _ = fs::remove_dir_all(game.join("BepInEx").join("cache"));
@@ -594,6 +608,7 @@ pub struct LoaderStatus {
     pub winhttp: bool,
     pub preloader: bool,
     pub current: bool,
+    pub installed_version: Option<String>,
     pub dotnet: bool,
     pub steam_appid: bool,
     pub profile_plugins: usize,
@@ -617,7 +632,8 @@ pub fn loader_status(game_path: String, profile_id: String) -> LoaderStatus {
         game_found: game.is_dir(),
         winhttp: game.join("winhttp.dll").exists(),
         preloader: game.join("BepInEx").join("core").join(loader::IL2CPP_PRELOADER).exists(),
-        current: loader::is_current(game),
+        current: loader::has_loader(game),
+        installed_version: loader::installed_version(game),
         dotnet: game.join("dotnet").join("coreclr.dll").exists(),
         steam_appid: game.join("steam_appid.txt").exists(),
         profile_plugins: count_dll(loader::profile_plugins_dir(&root, &profile_id)),
