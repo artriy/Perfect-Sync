@@ -570,11 +570,7 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
 
     let mut mods = Vec::new();
     for mm in &manifest.mods {
-        let repo = mm
-            .r#ref
-            .as_deref()
-            .and_then(resolver::parse_repo)
-            .or_else(|| resolver::parse_repo(&mm.id))
+        let repo = resolver::parse_repo(&mm.id)
             .ok_or_else(|| format!("cannot resolve source for {}", mm.id))?;
         let entry = cat.get(&mm.id).or_else(|| cat.get(&repo));
         let rules = entry.map(|e| e.asset_rules.clone()).unwrap_or_else(default_rules);
@@ -595,6 +591,39 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
             source: ModSource::Github,
             tags,
             managed,
+            update: None,
+            file,
+        });
+    }
+
+    // re-resolve dependencies (kept out of the code to keep it short)
+    let chosen: Vec<String> = manifest.mods.iter().map(|m| m.id.clone()).collect();
+    for dep in deps::resolve(&cat, &chosen).ordered {
+        if mods.iter().any(|m| m.package_id == dep) {
+            continue;
+        }
+        let dentry = cat.get(&dep);
+        let dep_repo = dentry
+            .and_then(|e| e.repo.clone())
+            .or_else(|| resolver::parse_repo(&dep))
+            .unwrap_or_else(|| dep.clone());
+        let rules = dentry.map(|e| e.asset_rules.clone()).unwrap_or_else(default_rules);
+        let tags = dentry.map(|e| e.tags.clone()).unwrap_or_default();
+        let dname = dentry.map(|e| e.name.clone()).unwrap_or_else(|| dep.clone());
+        let Ok(resolved) = resolver::resolve_latest(&http, &dep_repo, &rules, &arch) else {
+            continue;
+        };
+        let file = install_resolved(&root, &id, &http, &resolved)?;
+        mods.push(InstalledMod {
+            package_id: dep,
+            name: dname,
+            repo: Some(dep_repo),
+            version: resolved.version.clone(),
+            versions: vec![resolved.version],
+            enabled: true,
+            source: ModSource::Github,
+            tags,
+            managed: true,
             update: None,
             file,
         });
@@ -637,7 +666,7 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
 
     let record = ProfileRecord {
         id: id.clone(),
-        name: format!("Lobby - {display}"),
+        name: display.clone(),
         crew_color: "#ffd23f".to_string(),
         game_build: manifest.game_build.clone(),
         mods,

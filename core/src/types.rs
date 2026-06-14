@@ -43,13 +43,12 @@ pub struct Platform {
     pub arch: Arch,
 }
 
+/// One mod in a share code. Kept minimal to keep codes short: `id` is
+/// `owner/repo` (source is always GitHub, derivable from it), `v` is the tag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestMod {
     pub id: String,
     pub v: String,
-    pub src: ModSource,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub r#ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

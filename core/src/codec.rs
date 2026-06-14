@@ -47,7 +47,7 @@ pub fn decode(code: &str) -> Result<LobbyManifest, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ManifestMod, ModSource};
+    use crate::types::ManifestMod;
 
     fn sample() -> LobbyManifest {
         LobbyManifest {
@@ -58,8 +58,6 @@ mod tests {
             mods: vec![ManifestMod {
                 id: "AU-Avengers/TOU-Mira".into(),
                 v: "1.6.3".into(),
-                src: ModSource::Github,
-                r#ref: None,
             }],
             loader: None,
         }

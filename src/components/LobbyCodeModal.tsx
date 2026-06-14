@@ -28,17 +28,18 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
   const [mode, setMode] = useState<Mode>("input");
   const [code, setCode] = useState("");
   const [rows, setRows] = useState<DiffItem[]>(diff);
+  const [name, setName] = useState("");
 
   const runDecode = (value: string) => {
     setMode("decoding");
-    // TODO(phase 2): pass the active profile's real installed [id, version] pairs
-    // and surface Preview.name as the profile name, once profile data is wired in.
+    // TODO(phase 2): pass the active profile's real installed [id, version] pairs.
     previewCode(value, [
       ["AU-Avengers/TOU-Mira", "1.6.2"],
       ["Dolfannn/LevelImposter", "0.7.2"],
     ])
       .then((p) => {
         setRows(p.items);
+        setName(p.name);
         setMode("diff");
       })
       .catch((err) => {
@@ -119,6 +120,8 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
                 <ResultStep
                   mode={mode}
                   diff={rows}
+                  name={name}
+                  code={code || initialCode || ""}
                   onApply={(launch) => onApply(launch, code || initialCode || "")}
                 />
               )}
@@ -167,10 +170,14 @@ function InputStep({
 function ResultStep({
   mode,
   diff,
+  name,
+  code,
   onApply,
 }: {
   mode: Mode;
   diff: DiffItem[];
+  name: string;
+  code: string;
   onApply: (launch: boolean) => void;
 }) {
   return (
@@ -178,8 +185,8 @@ function ResultStep({
       <div className="scroll-region -mr-2 min-h-0 flex-1 overflow-y-auto pr-2">
       <div className="glass mb-4 flex items-center gap-2 rounded-xl px-3 py-2.5 font-mono text-[12.5px] text-[#bfe0ff]">
         <LinkSimple size={14} />
-        <span className="truncate">PERFECT-eyJ2IjoxLCJtb2RzIjpb…</span>
-        <span className="ml-auto rounded-full bg-[rgba(91,227,176,0.2)] px-2 py-0.5 font-sans text-[11px] text-[#aef3d8]">
+        <span className="truncate">{code || "PERFECT-…"}</span>
+        <span className="ml-auto shrink-0 rounded-full bg-[rgba(91,227,176,0.2)] px-2 py-0.5 font-sans text-[11px] text-[#aef3d8]">
           valid
         </span>
       </div>
@@ -190,7 +197,7 @@ function ResultStep({
         </span>
       </div>
       <div className="glass mb-4 rounded-xl px-3.5 py-2.5 text-[14px] text-ink">
-        Lobby - TownOfUs Night
+        {name || "Imported lobby"}
       </div>
 
       <span className="mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">

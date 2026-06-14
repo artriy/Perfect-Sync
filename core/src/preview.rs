@@ -50,7 +50,7 @@ mod tests {
     use super::*;
     use crate::catalog::parse;
     use crate::codec::encode;
-    use crate::types::{LobbyManifest, ManifestMod, ModSource};
+    use crate::types::{LobbyManifest, ManifestMod};
 
     const SAMPLE: &str = include_str!("../fixtures/catalog.sample.json");
 
@@ -65,8 +65,6 @@ mod tests {
             mods: vec![ManifestMod {
                 id: "AU-Avengers/TOU-Mira".into(),
                 v: "1.6.3".into(),
-                src: ModSource::Github,
-                r#ref: None,
             }],
             loader: None,
         };

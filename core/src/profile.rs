@@ -114,12 +114,12 @@ pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
         mods: profile
             .mods
             .iter()
-            .filter(|m| m.enabled)
+            // only the user's chosen mods; dependencies are re-resolved on apply,
+            // which keeps the share code short
+            .filter(|m| m.enabled && !m.managed)
             .map(|m| ManifestMod {
                 id: m.package_id.clone(),
                 v: m.version.clone(),
-                src: m.source,
-                r#ref: m.repo.as_ref().map(|r| format!("https://github.com/{r}")),
             })
             .collect(),
         loader: None,
@@ -315,15 +315,13 @@ mod tests {
             }],
         };
         let m = to_manifest(&p);
-        // the code carries an explicit GitHub ref so a recipient without the
-        // catalog can still resolve + download it at the exact version
-        assert_eq!(
-            m.mods[0].r#ref.as_deref(),
-            Some("https://github.com/SomeUser/CoolMod")
-        );
+        // id is owner/repo; the recipient derives the GitHub repo from it (no ref needed)
+        assert_eq!(m.mods[0].id, "SomeUser/CoolMod");
         assert_eq!(m.mods[0].v, "1.2.3");
-        let repo = crate::resolver::parse_repo(m.mods[0].r#ref.as_ref().unwrap());
-        assert_eq!(repo.as_deref(), Some("SomeUser/CoolMod"));
+        assert_eq!(
+            crate::resolver::parse_repo(&m.mods[0].id).as_deref(),
+            Some("SomeUser/CoolMod")
+        );
     }
 
     #[test]

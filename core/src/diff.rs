@@ -45,7 +45,7 @@ pub fn diff(manifest: &LobbyManifest, installed: &[(String, String)]) -> Vec<Dif
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ManifestMod, ModSource};
+    use crate::types::ManifestMod;
 
     fn man(mods: &[(&str, &str)]) -> LobbyManifest {
         LobbyManifest {
@@ -58,8 +58,6 @@ mod tests {
                 .map(|(id, v)| ManifestMod {
                     id: (*id).into(),
                     v: (*v).into(),
-                    src: ModSource::Github,
-                    r#ref: None,
                 })
                 .collect(),
             loader: None,
