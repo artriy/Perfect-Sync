@@ -58,6 +58,7 @@ mod tests {
             mods: vec![ManifestMod {
                 id: "AU-Avengers/TOU-Mira".into(),
                 v: "1.6.3".into(),
+                asset: None,
             }],
             loader: None,
         }

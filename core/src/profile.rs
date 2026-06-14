@@ -120,6 +120,7 @@ pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
             .map(|m| ManifestMod {
                 id: m.package_id.clone(),
                 v: m.version.clone(),
+                asset: m.file.clone(),
             })
             .collect(),
         loader: None,

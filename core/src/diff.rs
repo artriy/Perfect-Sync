@@ -58,6 +58,7 @@ mod tests {
                 .map(|(id, v)| ManifestMod {
                     id: (*id).into(),
                     v: (*v).into(),
+                    asset: None,
                 })
                 .collect(),
             loader: None,

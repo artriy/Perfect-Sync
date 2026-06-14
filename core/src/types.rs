@@ -49,6 +49,10 @@ pub struct Platform {
 pub struct ManifestMod {
     pub id: String,
     pub v: String,
+    /// exact asset file the host installed, so a custom/multi-asset repo
+    /// resolves to the same file (omitted when there's nothing special to pin).
+    #[serde(rename = "a", skip_serializing_if = "Option::is_none", default)]
+    pub asset: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

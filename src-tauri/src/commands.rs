@@ -577,8 +577,23 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
         let tags = entry.map(|e| e.tags.clone()).unwrap_or_default();
         let name = entry.map(|e| e.name.clone()).unwrap_or_else(|| repo.clone());
 
-        let resolved =
-            resolver::resolve_tag(&http, &repo, &mm.v, &rules, &arch).map_err(|e| e.to_string())?;
+        // use the host's exact file if the code pinned one, else auto-pick by rules
+        let resolved = if let Some(asset_name) = &mm.asset {
+            let rel = resolver::fetch_release_by_tag(&http, &repo, &mm.v).map_err(|e| e.to_string())?;
+            let asset = rel
+                .assets
+                .iter()
+                .find(|x| &x.name == asset_name)
+                .ok_or_else(|| format!("file {asset_name} not found in {repo} {}", mm.v))?;
+            ResolvedDownload {
+                url: asset.url.clone(),
+                asset_name: asset.name.clone(),
+                version: rel.tag.clone(),
+                size: asset.size,
+            }
+        } else {
+            resolver::resolve_tag(&http, &repo, &mm.v, &rules, &arch).map_err(|e| e.to_string())?
+        };
         let file = install_resolved(&root, &id, &http, &resolved)?;
         let managed = tags.iter().any(|t| matches!(t, ModTag::Library | ModTag::Loader));
         mods.push(InstalledMod {
