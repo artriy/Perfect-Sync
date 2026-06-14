@@ -4,6 +4,17 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// A mod the user always wants merged into any lobby code they apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonalMod {
+    pub repo: String,
+    pub tag: String,
+    pub asset: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -15,6 +26,8 @@ pub struct Settings {
     pub arch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub catalog_url: Option<String>,
+    #[serde(default)]
+    pub personal_mods: Vec<PersonalMod>,
 }
 
 pub fn cache_dir() -> PathBuf {

@@ -6,6 +6,8 @@ import {
   FolderOpen,
   GameController,
   GithubLogo,
+  Plus,
+  TrashSimple,
   X,
   XCircle,
 } from "@phosphor-icons/react";
@@ -19,9 +21,20 @@ interface SettingsModalProps {
   profileId: string;
   onClose: () => void;
   onSave: (s: Settings) => void;
+  onAddPersonal: (repo: string, name: string) => void;
+  onRemovePersonal: (repo: string) => void;
 }
 
-export function SettingsModal({ open, settings, game, profileId, onClose, onSave }: SettingsModalProps) {
+export function SettingsModal({
+  open,
+  settings,
+  game,
+  profileId,
+  onClose,
+  onSave,
+  onAddPersonal,
+  onRemovePersonal,
+}: SettingsModalProps) {
   const reduce = useReducedMotion();
   const [token, setToken] = useState(settings.githubToken ?? "");
   const [gamePath, setGamePath] = useState(settings.gamePath ?? "");
@@ -29,6 +42,15 @@ export function SettingsModal({ open, settings, game, profileId, onClose, onSave
   const [status, setStatus] = useState<LoaderStatus | null>(null);
   const [working, setWorking] = useState(false);
   const [msg, setMsg] = useState("");
+  const [personalUrl, setPersonalUrl] = useState("");
+
+  const submitPersonal = () => {
+    const m = personalUrl.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
+    const repo = m ? `${m[1]}/${m[2]}` : personalUrl.trim();
+    if (!repo) return;
+    setPersonalUrl("");
+    onAddPersonal(repo, m ? m[2] : repo);
+  };
 
   const refreshStatus = (path: string) => {
     if (!path.trim()) {
@@ -101,7 +123,7 @@ export function SettingsModal({ open, settings, game, profileId, onClose, onSave
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.97, y: 8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="glass-strong relative w-[520px] max-w-full rounded-3xl p-6"
+            className="glass-strong relative flex max-h-[90vh] w-[520px] max-w-full flex-col rounded-3xl p-6"
           >
             <button
               type="button"
@@ -114,7 +136,8 @@ export function SettingsModal({ open, settings, game, profileId, onClose, onSave
 
             <h2 className="text-[20px] font-semibold text-ink">Settings</h2>
 
-            <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
+            <div className="scroll-region -mr-2 min-h-0 flex-1 overflow-y-auto pr-2">
+            <span className="mt-3 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
               Detected game
             </span>
             <div className="glass flex items-center gap-3 rounded-xl px-3.5 py-3">
@@ -194,6 +217,53 @@ export function SettingsModal({ open, settings, game, profileId, onClose, onSave
             </p>
 
             <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
+              Always add to lobbies
+            </span>
+            <p className="mb-2 px-1 text-[12px] text-ink-faint">
+              Your personal must-haves. Added to every lobby code you apply.
+            </p>
+            <div className="flex flex-col gap-1.5">
+              {(settings.personalMods ?? []).map((pm) => (
+                <div
+                  key={pm.repo}
+                  className="glass flex items-center gap-2 rounded-lg px-3 py-2 text-[12.5px]"
+                >
+                  <span className="min-w-0 flex-1 truncate text-ink">{pm.name ?? pm.repo}</span>
+                  <span className="font-mono text-[11.5px] text-ink-faint">{pm.tag}</span>
+                  <button
+                    type="button"
+                    onClick={() => onRemovePersonal(pm.repo)}
+                    aria-label={`Remove ${pm.repo}`}
+                    className="ring-focus grid h-7 w-7 place-items-center rounded-md text-ink-faint hover:bg-white/10 hover:text-[#ff8a8a]"
+                  >
+                    <TrashSimple size={14} />
+                  </button>
+                </div>
+              ))}
+              {(settings.personalMods ?? []).length === 0 && (
+                <p className="px-1 text-[12px] text-ink-faint">None yet.</p>
+              )}
+            </div>
+            <label className="glass mt-2 flex items-center gap-2 rounded-xl px-3 py-2 text-ink-dim focus-within:text-ink">
+              <GithubLogo size={15} className="opacity-75" />
+              <input
+                value={personalUrl}
+                onChange={(e) => setPersonalUrl(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submitPersonal()}
+                placeholder="Paste a GitHub repo to always include"
+                aria-label="Always-include repo"
+                className="w-full min-w-0 bg-transparent text-[12.5px] text-ink placeholder:text-ink-faint focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={submitPersonal}
+                className="ring-focus flex shrink-0 items-center gap-1 rounded-lg bg-white/10 px-2.5 py-1 text-[12px] font-semibold text-ink"
+              >
+                <Plus size={12} weight="bold" /> Add
+              </button>
+            </label>
+
+            <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
               BepInEx loader
             </span>
             <div className="glass rounded-xl px-3.5 py-3 text-[12.5px]">
@@ -230,7 +300,9 @@ export function SettingsModal({ open, settings, game, profileId, onClose, onSave
               {msg && <p className="mt-2 text-[12px] text-ink-dim">{msg}</p>}
             </div>
 
-            <div className="mt-6 flex justify-end gap-2.5">
+            </div>
+
+            <div className="mt-4 flex justify-end gap-2.5 border-t border-white/10 pt-4">
               <button
                 type="button"
                 onClick={onClose}

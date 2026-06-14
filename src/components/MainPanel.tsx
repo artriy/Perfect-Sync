@@ -10,7 +10,6 @@ interface MainPanelProps {
   game: GameStatus;
   busyModId: string | null;
   onToggle: (modId: string) => void;
-  onVersion: (modId: string, v: string) => void;
   onRemove: (modId: string) => void;
   onPickRelease: (modId: string) => void;
   onCopyCode: () => void;
@@ -154,7 +153,6 @@ export function MainPanel(props: MainPanelProps) {
               mod={mod}
               busy={busyModId === mod.packageId}
               onToggle={() => props.onToggle(mod.packageId)}
-              onVersion={(v) => props.onVersion(mod.packageId, v)}
               onRemove={() => props.onRemove(mod.packageId)}
               onPickRelease={() => props.onPickRelease(mod.packageId)}
             />

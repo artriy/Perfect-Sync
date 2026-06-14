@@ -1,8 +1,8 @@
 import { motion, useReducedMotion } from "motion/react";
 import {
   ArrowUp,
+  CaretDown,
   CircleNotch,
-  FileArrowDown,
   GearSix,
   MapTrifold,
   PuzzlePiece,
@@ -13,7 +13,6 @@ import {
 } from "@phosphor-icons/react";
 import { Pill, primaryTag } from "./Pill";
 import { Toggle } from "./Toggle";
-import { VersionPicker } from "./VersionPicker";
 import type { ModTag, ProfileMod } from "../lib/types";
 
 const ICON: Partial<Record<ModTag, Icon>> = {
@@ -37,12 +36,11 @@ interface ModRowProps {
   mod: ProfileMod;
   busy?: boolean;
   onToggle: () => void;
-  onVersion: (v: string) => void;
   onRemove: () => void;
   onPickRelease: () => void;
 }
 
-export function ModRow({ mod, busy, onToggle, onVersion, onRemove, onPickRelease }: ModRowProps) {
+export function ModRow({ mod, busy, onToggle, onRemove, onPickRelease }: ModRowProps) {
   const reduce = useReducedMotion();
   const tag = mod.tags.length ? primaryTag(mod.tags) : null;
   const Glyph = (tag && ICON[tag]) || PuzzlePiece;
@@ -99,18 +97,15 @@ export function ModRow({ mod, busy, onToggle, onVersion, onRemove, onPickRelease
           <CircleNotch size={13} className="animate-spin" /> working
         </span>
       ) : (
-        <>
-          <VersionPicker value={mod.version} options={mod.versions} onChange={onVersion} disabled={busy} />
-          <button
-            type="button"
-            onClick={onPickRelease}
-            aria-label={`Pick a specific release file for ${mod.name}`}
-            title="Pick a specific release / file"
-            className="ring-focus glass-2 grid h-[30px] w-[30px] place-items-center rounded-lg text-ink-dim transition-colors hover:text-ink"
-          >
-            <FileArrowDown size={15} />
-          </button>
-        </>
+        <button
+          type="button"
+          onClick={onPickRelease}
+          aria-label={`Choose version and file for ${mod.name}`}
+          title="Choose version / file"
+          className="ring-focus glass-2 flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 font-mono text-[12.5px] text-ink-dim transition-colors hover:text-ink"
+        >
+          {mod.version} <CaretDown size={12} weight="bold" className="opacity-70" />
+        </button>
       )}
 
       <Toggle on={mod.enabled} onChange={onToggle} disabled={busy} label={`Enable ${mod.name}`} />

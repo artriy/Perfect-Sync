@@ -29,7 +29,11 @@ export function App() {
   const [lobbyOpen, setLobbyOpen] = useState(false);
   const [lobbyCode, setLobbyCode] = useState<string | undefined>(undefined);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [pickerMod, setPickerMod] = useState<ProfileMod | null>(null);
+  const [pickerTarget, setPickerTarget] = useState<{
+    repo: string;
+    name: string;
+    personal?: boolean;
+  } | null>(null);
 
   const [toast, setToast] = useState<ToastState | null>(null);
   const toastId = useRef(0);
@@ -116,19 +120,6 @@ export function App() {
     }
   };
 
-  const changeVersion = async (modId: string, v: string) => {
-    setBusyModId(modId);
-    const name = active.mods.find((m) => m.packageId === modId)?.name ?? "mod";
-    try {
-      patchProfile(await bridge.setModVersion(active, modId, v, arch));
-      notify(`${name} set to ${v}`);
-    } catch (e) {
-      notify(String(e));
-    } finally {
-      setBusyModId(null);
-    }
-  };
-
   const removeMod = async (modId: string) => {
     const name = active.mods.find((m) => m.packageId === modId)?.name ?? "mod";
     try {
@@ -157,7 +148,8 @@ export function App() {
     }
   };
 
-  const addCatalog = async (item: CatalogItem) => {
+  // adding a mod opens the release/file picker so the user chooses the exact dll
+  const addCatalog = (item: CatalogItem) => {
     if (active.mods.some((m) => m.packageId === item.id)) {
       notify(`${item.name} is already in this profile`);
       return;
@@ -167,27 +159,10 @@ export function App() {
       return;
     }
     setAddOpen(false);
-    const browserMod: ProfileMod = {
-      packageId: item.id,
-      name: item.name,
-      repo: item.repo,
-      version: item.latest,
-      versions: [item.latest],
-      enabled: true,
-      source: "catalog",
-      tags: item.tags,
-    };
-    notify(`Adding ${item.name}…`);
-    try {
-      patchProfile(await bridge.addMod(active, item.repo, arch, browserMod));
-      notify(`Added ${item.name} to ${active.name}`);
-      await ensureLoader(active.id);
-    } catch (e) {
-      notify(String(e));
-    }
+    setPickerTarget({ repo: item.repo, name: item.name });
   };
 
-  const addUrl = async (url: string) => {
+  const addUrl = (url: string) => {
     const m = url.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
     const repo = m ? `${m[1]}/${m[2]}` : url;
     const name = m ? m[2] : "Mod";
@@ -196,24 +171,7 @@ export function App() {
       return;
     }
     setAddOpen(false);
-    const browserMod: ProfileMod = {
-      packageId: repo,
-      name,
-      repo,
-      version: "latest",
-      versions: ["latest"],
-      enabled: true,
-      source: "github",
-      tags: [],
-    };
-    notify(`Adding ${name}…`);
-    try {
-      patchProfile(await bridge.addMod(active, url, arch, browserMod));
-      notify(`Added ${name} from GitHub`);
-      await ensureLoader(active.id);
-    } catch (e) {
-      notify(String(e));
-    }
+    setPickerTarget({ repo, name });
   };
 
   const renameProfile = async (name: string) => {
@@ -249,19 +207,57 @@ export function App() {
 
   const openPicker = (modId: string) => {
     const m = active.mods.find((x) => x.packageId === modId);
-    if (m) setPickerMod(m);
+    if (m) setPickerTarget({ repo: m.repo ?? m.packageId, name: m.name });
+  };
+
+  const addPersonal = (repo: string, name: string) => {
+    setSettingsOpen(false);
+    setPickerTarget({ repo, name, personal: true });
+  };
+
+  const removePersonal = async (repo: string) => {
+    const next: Settings = {
+      ...settings,
+      personalMods: (settings.personalMods ?? []).filter((p) => p.repo !== repo),
+    };
+    setSettings(next);
+    try {
+      await bridge.saveSettings(next);
+    } catch (e) {
+      notify(String(e));
+    }
   };
 
   const pickRelease = async (tag: string, assetName: string) => {
-    if (!pickerMod) return;
-    const repo = pickerMod.repo ?? pickerMod.packageId;
-    const id = pickerMod.packageId;
-    setPickerMod(null);
-    setBusyModId(id);
+    const target = pickerTarget;
+    if (!target) return;
+    setPickerTarget(null);
+
+    // personal "always-include" mod: store in settings, don't install to a profile
+    if (target.personal) {
+      const next: Settings = {
+        ...settings,
+        personalMods: [
+          ...(settings.personalMods ?? []).filter((p) => p.repo !== target.repo),
+          { repo: target.repo, tag, asset: assetName, name: target.name },
+        ],
+      };
+      setSettings(next);
+      try {
+        await bridge.saveSettings(next);
+        notify(`${target.name} will be added to every lobby you join`);
+      } catch (e) {
+        notify(String(e));
+      }
+      return;
+    }
+
+    setBusyModId(target.repo);
     notify(`Installing ${assetName}…`);
     try {
-      patchProfile(await bridge.installAsset(active, repo, tag, assetName, arch));
+      patchProfile(await bridge.installAsset(active, target.repo, tag, assetName, arch));
       notify(`Installed ${assetName}`);
+      await ensureLoader(active.id);
     } catch (e) {
       notify(String(e));
     } finally {
@@ -364,7 +360,6 @@ export function App() {
             game={gameStatus}
             busyModId={busyModId}
             onToggle={toggleMod}
-            onVersion={changeVersion}
             onRemove={removeMod}
             onPickRelease={openPicker}
             onCopyCode={copyCode}
@@ -398,13 +393,15 @@ export function App() {
         profileId={active.id}
         onClose={() => setSettingsOpen(false)}
         onSave={saveSettings}
+        onAddPersonal={addPersonal}
+        onRemovePersonal={removePersonal}
       />
       <ReleasePicker
-        open={pickerMod !== null}
-        repo={pickerMod ? (pickerMod.repo ?? pickerMod.packageId) : ""}
-        modName={pickerMod?.name ?? ""}
+        open={pickerTarget !== null}
+        repo={pickerTarget?.repo ?? ""}
+        modName={pickerTarget?.name ?? ""}
         busy={busyModId !== null}
-        onClose={() => setPickerMod(null)}
+        onClose={() => setPickerTarget(null)}
         onPick={pickRelease}
       />
       <Toast toast={toast} />

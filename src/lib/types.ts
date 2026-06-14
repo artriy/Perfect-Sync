@@ -73,8 +73,17 @@ export interface GameInstall {
   arch: Arch;
 }
 
+export interface PersonalMod {
+  repo: string;
+  tag: string;
+  asset: string;
+  name?: string;
+}
+
 export interface Settings {
   githubToken?: string;
   gamePath?: string;
   arch?: Arch;
+  catalogUrl?: string;
+  personalMods?: PersonalMod[];
 }

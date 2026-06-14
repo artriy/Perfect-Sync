@@ -30,14 +30,14 @@ export function TopBar({ game, onAddMod, onPasteCode, onOpenSettings }: TopBarPr
         Perfect-Sync
       </div>
 
-      <label className="glass relative flex max-w-[380px] flex-1 items-center gap-2 rounded-xl px-3 py-2 text-ink-dim focus-within:text-ink">
-        <MagnifyingGlass size={16} className="opacity-70" />
+      <label className="glass relative flex max-w-[460px] min-w-[200px] flex-1 items-center gap-2 rounded-xl px-3 py-2 text-ink-dim focus-within:text-ink">
+        <MagnifyingGlass size={16} className="shrink-0 opacity-70" />
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && submit()}
-          placeholder="Search mods, or paste a PERFECT- code…"
-          className="w-full bg-transparent text-[13.5px] text-ink placeholder:text-ink-faint focus:outline-none"
+          placeholder="Search or paste a code…"
+          className="w-full min-w-0 bg-transparent text-[13.5px] text-ink placeholder:text-ink-faint focus:outline-none"
           aria-label="Search mods or paste a lobby code"
         />
       </label>

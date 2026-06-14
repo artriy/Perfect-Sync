@@ -348,6 +348,39 @@ fn install_asset_impl(
             file,
         });
     }
+
+    // auto-install this mod's catalog dependencies (Reactor/MiraAPI/etc.)
+    for dep in deps::resolve(&cat, &[repo.clone()]).ordered {
+        if dep == repo || rec.mods.iter().any(|m| m.package_id == dep) {
+            continue;
+        }
+        let dentry = cat.get(&dep);
+        let dep_repo = dentry
+            .and_then(|e| e.repo.clone())
+            .or_else(|| resolver::parse_repo(&dep))
+            .unwrap_or_else(|| dep.clone());
+        let rules = dentry.map(|e| e.asset_rules.clone()).unwrap_or_else(default_rules);
+        let tags = dentry.map(|e| e.tags.clone()).unwrap_or_default();
+        let name = dentry.map(|e| e.name.clone()).unwrap_or_else(|| dep.clone());
+        let Ok(resolved) = resolver::resolve_latest(&h, &dep_repo, &rules, &arch) else {
+            continue;
+        };
+        let dfile = install_resolved(&root, &profile_id, &h, &resolved)?;
+        rec.mods.push(InstalledMod {
+            package_id: dep,
+            name,
+            repo: Some(dep_repo),
+            version: resolved.version.clone(),
+            versions: vec![resolved.version],
+            enabled: true,
+            source: ModSource::Github,
+            tags,
+            managed: true,
+            update: None,
+            file: dfile,
+        });
+    }
+
     if let Some((gp, _)) = current_game() {
         let _ = ensure_loader_impl(&gp, &profile_id, &arch);
     }
@@ -562,6 +595,41 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
             source: ModSource::Github,
             tags,
             managed,
+            update: None,
+            file,
+        });
+    }
+
+    // merge the user's personal "always-include" mods (if not already in the code)
+    for pm in settings::load().personal_mods {
+        let prepo = resolver::parse_repo(&pm.repo).unwrap_or_else(|| pm.repo.clone());
+        if mods.iter().any(|m| m.package_id == prepo) {
+            continue;
+        }
+        let Ok(rel) = resolver::fetch_release_by_tag(&http, &prepo, &pm.tag) else {
+            continue;
+        };
+        let Some(asset) = rel.assets.iter().find(|a| a.name == pm.asset) else {
+            continue;
+        };
+        let resolved = ResolvedDownload {
+            url: asset.url.clone(),
+            asset_name: asset.name.clone(),
+            version: rel.tag.clone(),
+            size: asset.size,
+        };
+        let file = install_resolved(&root, &id, &http, &resolved)?;
+        let entry = cat.get(&prepo);
+        mods.push(InstalledMod {
+            package_id: prepo.clone(),
+            name: pm.name.clone().or_else(|| entry.map(|e| e.name.clone())).unwrap_or_else(|| prepo.clone()),
+            repo: Some(prepo),
+            version: rel.tag.clone(),
+            versions: vec![rel.tag],
+            enabled: true,
+            source: ModSource::Github,
+            tags: entry.map(|e| e.tags.clone()).unwrap_or_default(),
+            managed: false,
             update: None,
             file,
         });
