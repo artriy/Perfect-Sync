@@ -216,6 +216,37 @@ export function App() {
     }
   };
 
+  const renameProfile = async (name: string) => {
+    const updated = { ...active, name };
+    patchProfile(updated);
+    try {
+      await bridge.saveProfile(updated);
+    } catch (e) {
+      notify(String(e));
+    }
+  };
+
+  const deleteActiveProfile = async () => {
+    const id = active.id;
+    const name = active.name;
+    try {
+      await bridge.deleteProfile(id);
+    } catch (e) {
+      notify(String(e));
+    }
+    const left = profiles.filter((p) => p.id !== id);
+    if (left.length === 0) {
+      const starter: Profile = { id: "my-mods", name: "My mods", crewColor: CREW.violet, mods: [] };
+      await bridge.saveProfile(starter).catch(() => {});
+      setProfiles([starter]);
+      setActiveId(starter.id);
+    } else {
+      setProfiles(left);
+      setActiveId(left[0].id);
+    }
+    notify(`Deleted ${name}`);
+  };
+
   const openPicker = (modId: string) => {
     const m = active.mods.find((x) => x.packageId === modId);
     if (m) setPickerMod(m);
@@ -337,6 +368,8 @@ export function App() {
             onRemove={removeMod}
             onPickRelease={openPicker}
             onCopyCode={copyCode}
+            onRename={renameProfile}
+            onDelete={deleteActiveProfile}
             onLaunch={() => doLaunchProfile(active)}
             onAddMod={() => setAddOpen(true)}
           />

@@ -94,7 +94,7 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.97, y: 8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="glass-strong relative w-[560px] max-w-full rounded-3xl p-6"
+            className="glass-strong relative flex max-h-[90vh] w-[560px] max-w-full flex-col rounded-3xl p-6"
           >
             <button
               type="button"
@@ -112,7 +112,7 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
                 : "Decoded from a shared code. Here is precisely what will change."}
             </p>
 
-            <div className="mt-4">
+            <div className="mt-4 flex min-h-0 flex-1 flex-col">
               {mode === "input" ? (
                 <InputStep code={code} setCode={setCode} onDecode={decode} />
               ) : (
@@ -174,7 +174,8 @@ function ResultStep({
   onApply: (launch: boolean) => void;
 }) {
   return (
-    <>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="scroll-region -mr-2 min-h-0 flex-1 overflow-y-auto pr-2">
       <div className="glass mb-4 flex items-center gap-2 rounded-xl px-3 py-2.5 font-mono text-[12.5px] text-[#bfe0ff]">
         <LinkSimple size={14} />
         <span className="truncate">PERFECT-eyJ2IjoxLCJtb2RzIjpb…</span>
@@ -214,8 +215,9 @@ function ResultStep({
       <p className="mt-2 px-1 text-[12.5px] text-ink-faint">
         Built for Among Us 17.0.1 (reference only; the app won't change your game version).
       </p>
+      </div>
 
-      <div className="mt-5 flex justify-end gap-2.5">
+      <div className="mt-4 flex justify-end gap-2.5 border-t border-white/10 pt-4">
         <button
           type="button"
           onClick={() => onApply(false)}
@@ -234,7 +236,7 @@ function ResultStep({
           <Play size={15} weight="fill" /> Apply &amp; Launch
         </button>
       </div>
-    </>
+    </div>
   );
 }
 
