@@ -14,6 +14,14 @@ export interface Preview {
   items: DiffItem[];
 }
 
+/** Native folder picker (Tauri only). Returns the chosen path or null. */
+export async function pickFolder(): Promise<string | null> {
+  if (!inTauri) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const picked = await open({ directory: true, multiple: false, title: "Select your Among Us folder" });
+  return typeof picked === "string" ? picked : null;
+}
+
 // ------------------------------------------------------------------ catalog
 export async function loadCatalog(): Promise<CatalogItem[]> {
   if (inTauri) return invoke<CatalogItem[]>("get_catalog");

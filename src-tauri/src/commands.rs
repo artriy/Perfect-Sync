@@ -210,6 +210,21 @@ pub fn add_mod(profile_id: String, repo: String, arch: String) -> Result<Profile
     let cat = catalog();
     let http = http();
 
+    // enforce one role mod per profile (two role mods cannot coexist)
+    let main_tags = cat.get(&repo).map(|e| e.tags.clone()).unwrap_or_default();
+    if main_tags.contains(&ModTag::Role) {
+        if let Some(existing) = rec
+            .mods
+            .iter()
+            .find(|m| !m.managed && m.package_id != repo && m.tags.contains(&ModTag::Role))
+        {
+            return Err(format!(
+                "Only one role mod per profile. Remove {} first.",
+                existing.name
+            ));
+        }
+    }
+
     // expand dependency graph (deps before the mod); install whatever is missing
     rec.mods.retain(|m| m.package_id != repo);
     let ordered = deps::resolve(&cat, &[repo.clone()]).ordered;

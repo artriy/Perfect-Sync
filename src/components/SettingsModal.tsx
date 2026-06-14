@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { GameController, GithubLogo, X } from "@phosphor-icons/react";
+import { FolderOpen, GameController, GithubLogo, X } from "@phosphor-icons/react";
+import { pickFolder } from "../lib/bridge";
 import type { Arch, GameInstall, Settings } from "../lib/types";
 
 interface SettingsModalProps {
@@ -97,16 +98,28 @@ export function SettingsModal({ open, settings, game, onClose, onSave }: Setting
             <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
               Game folder (override)
             </span>
-            <label className="glass flex items-center gap-2 rounded-xl px-3 py-2.5 text-ink-dim focus-within:text-ink">
-              <GameController size={16} className="opacity-75" />
-              <input
-                value={gamePath}
-                onChange={(e) => setGamePath(e.target.value)}
-                placeholder="C:\\Program Files (x86)\\Steam\\steamapps\\common\\Among Us"
-                aria-label="Game folder"
-                className="w-full bg-transparent font-mono text-[12.5px] text-ink placeholder:text-ink-faint focus:outline-none"
-              />
-            </label>
+            <div className="flex items-center gap-2">
+              <label className="glass flex flex-1 items-center gap-2 rounded-xl px-3 py-2.5 text-ink-dim focus-within:text-ink">
+                <GameController size={16} className="opacity-75" />
+                <input
+                  value={gamePath}
+                  onChange={(e) => setGamePath(e.target.value)}
+                  placeholder="C:\\Program Files (x86)\\Steam\\steamapps\\common\\Among Us"
+                  aria-label="Game folder"
+                  className="w-full bg-transparent font-mono text-[12.5px] text-ink placeholder:text-ink-faint focus:outline-none"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={async () => {
+                  const p = await pickFolder();
+                  if (p) setGamePath(p);
+                }}
+                className="ring-focus glass flex items-center gap-1.5 rounded-xl px-3 py-2.5 text-[12.5px] text-ink-dim hover:text-ink"
+              >
+                <FolderOpen size={15} /> Browse
+              </button>
+            </div>
             <div className="mt-2 flex items-center gap-2">
               <span className="text-[12px] text-ink-faint">Build:</span>
               {(["x86", "x64"] as Arch[]).map((a) => (

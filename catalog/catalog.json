@@ -39,8 +39,8 @@
       "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor"],
       "assetRules": {
         "perArch": {
-          "x86": { "match": "(?i)x86.*(steam|itch)", "prefer": "zip" },
-          "x64": { "match": "(?i)x64.*(epic|msstore)", "prefer": "zip" }
+          "x86": { "match": "(?i)steam-itch", "prefer": "zip" },
+          "x64": { "match": "(?i)epic-msstore", "prefer": "zip" }
         },
         "dllName": "TownOfUsMira.dll",
         "bundlesLoader": true
@@ -56,7 +56,7 @@
       "assetRules": {
         "perArch": {
           "x86": { "match": "(?i)theotherroles\\.zip", "prefer": "zip" },
-          "x64": { "match": "(?i)_msstore", "prefer": "zip" }
+          "x64": { "match": "(?i)theotherroles_msstore\\.zip", "prefer": "zip" }
         },
         "dllName": "TheOtherRoles.dll",
         "bundlesLoader": true
@@ -71,8 +71,8 @@
       "dependencies": [],
       "assetRules": {
         "perArch": {
-          "x86": { "match": "(?i)steamitchio", "prefer": "zip" },
-          "x64": { "match": "(?i)epicmsstore", "prefer": "zip" }
+          "x86": { "match": "(?i)SteamItchio", "prefer": "zip" },
+          "x64": { "match": "(?i)EpicMsStore", "prefer": "zip" }
         },
         "dllName": "TOHE.dll"
       }
@@ -95,17 +95,17 @@
     {
       "id": "All-Of-Us-Mods/LaunchpadReloaded",
       "name": "Launchpad Reloaded",
-      "summary": "A fresh roster of roles built on Mira API. Platform-agnostic DLL.",
+      "summary": "A fresh roster of roles built on Mira API. Single platform-agnostic DLL.",
       "repo": "All-Of-Us-Mods/LaunchpadReloaded",
       "tags": ["role", "all-client"],
       "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor"],
       "assetRules": { "perArch": {}, "dllName": "LaunchpadReloaded.dll" }
     },
     {
-      "id": "DigEmAll/LevelImposter",
+      "id": "DigiWorm0/LevelImposter",
       "name": "LevelImposter",
       "summary": "Load community-built custom maps from files.",
-      "repo": "DigEmAll/LevelImposter",
+      "repo": "DigiWorm0/LevelImposter",
       "tags": ["map", "cosmetic"],
       "dependencies": ["NuclearPowered/Reactor"],
       "assetRules": { "perArch": {}, "dllName": "LevelImposter.dll" }

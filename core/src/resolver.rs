@@ -133,8 +133,22 @@ pub fn pick_asset<'a>(rel: &'a Release, rules: &AssetRules, arch: &str) -> Optio
 }
 
 pub fn fetch_latest_release(http: &dyn Http, repo: &str) -> Result<Release, ResolveError> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    parse_release(&http.get_text(&url)?)
+    // /releases/latest excludes prereleases (some mods only ship prereleases),
+    // so fall back to the newest entry in the full release list.
+    let latest = format!("https://api.github.com/repos/{repo}/releases/latest");
+    if let Ok(text) = http.get_text(&latest) {
+        if let Ok(rel) = parse_release(&text) {
+            return Ok(rel);
+        }
+    }
+    let list = format!("https://api.github.com/repos/{repo}/releases?per_page=1");
+    let text = http.get_text(&list)?;
+    let mut rels: Vec<Release> =
+        serde_json::from_str(&text).map_err(|e| ResolveError::Parse(e.to_string()))?;
+    if rels.is_empty() {
+        return Err(ResolveError::Parse(format!("no releases for {repo}")));
+    }
+    Ok(rels.remove(0))
 }
 
 pub fn fetch_release_by_tag(http: &dyn Http, repo: &str, tag: &str) -> Result<Release, ResolveError> {
