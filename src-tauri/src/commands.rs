@@ -123,10 +123,20 @@ fn ensure_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(
     }
     let root = settings::profiles_root();
     loader::ensure_profile_layout(&root, profile_id).map_err(|e| e.to_string())?;
-    if loader::is_installed(game_dir) {
+    // already the current loader version? nothing to do.
+    if loader::is_current(game_dir) {
         return Ok(());
     }
-    let cache = settings::cache_dir().join("bepinex").join(arch);
+    // stale or missing loader: remove old loader bits (keep plugins) then install current
+    let bep = game_dir.join("BepInEx");
+    let _ = fs::remove_file(game_dir.join("winhttp.dll"));
+    for d in ["core", "interop", "cache"] {
+        let _ = fs::remove_dir_all(bep.join(d));
+    }
+    let cache = settings::cache_dir()
+        .join("bepinex")
+        .join(loader::LOADER_VERSION)
+        .join(arch);
     if let Some(pack_root) = loader::locate_pack_root(&cache) {
         loader::install_pack(&pack_root, game_dir).map_err(|e| e.to_string())?;
     } else {
@@ -583,6 +593,7 @@ pub struct LoaderStatus {
     pub game_found: bool,
     pub winhttp: bool,
     pub preloader: bool,
+    pub current: bool,
     pub dotnet: bool,
     pub steam_appid: bool,
     pub profile_plugins: usize,
@@ -606,6 +617,7 @@ pub fn loader_status(game_path: String, profile_id: String) -> LoaderStatus {
         game_found: game.is_dir(),
         winhttp: game.join("winhttp.dll").exists(),
         preloader: game.join("BepInEx").join("core").join(loader::IL2CPP_PRELOADER).exists(),
+        current: loader::is_current(game),
         dotnet: game.join("dotnet").join("coreclr.dll").exists(),
         steam_appid: game.join("steam_appid.txt").exists(),
         profile_plugins: count_dll(loader::profile_plugins_dir(&root, &profile_id)),

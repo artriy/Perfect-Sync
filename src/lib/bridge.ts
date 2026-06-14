@@ -156,6 +156,7 @@ export interface LoaderStatus {
   gameFound: boolean;
   winhttp: boolean;
   preloader: boolean;
+  current: boolean;
   dotnet: boolean;
   steamAppid: boolean;
   profilePlugins: number;

@@ -21,6 +21,21 @@ pub const IL2CPP_PRELOADER: &str = "BepInEx.Unity.IL2CPP.dll";
 /// Among Us Steam app id, written so the game inits Steamworks on a direct launch.
 pub const STEAM_APP_ID: &str = "945360";
 
+/// Identifier for the loader pack this build installs. Bumping it invalidates an
+/// older installed loader (and its cache) so the app auto-reinstalls the current
+/// one. (6.0.700 is the first AmongUs pack whose Cpp2IL supports metadata 31.)
+pub const LOADER_VERSION: &str = "au-bepinex-6.0.700";
+
+const LOADER_MARKER: &str = ".perfectsync_loader";
+
+/// True only if the CURRENT loader version is installed in the game dir.
+pub fn is_current(game_dir: &Path) -> bool {
+    is_installed(game_dir)
+        && fs::read_to_string(game_dir.join("BepInEx").join(LOADER_MARKER))
+            .map(|s| s.trim() == LOADER_VERSION)
+            .unwrap_or(false)
+}
+
 pub fn profile_bepinex_dir(profiles_root: &Path, profile_id: &str) -> PathBuf {
     profiles_root.join(profile_id).join("BepInEx")
 }
@@ -73,6 +88,7 @@ pub fn install_pack(pack_dir: &Path, game_dir: &Path) -> io::Result<()> {
         }
     }
     fs::create_dir_all(game_dir.join("BepInEx").join("plugins"))?;
+    fs::write(game_dir.join("BepInEx").join(LOADER_MARKER), LOADER_VERSION)?;
     ensure_steam_appid(game_dir)?;
     Ok(())
 }
@@ -209,6 +225,7 @@ mod tests {
         assert!(game.join("BepInEx").join("plugins").is_dir());
         assert!(game.join("steam_appid.txt").exists());
         assert!(is_installed(&game));
+        assert!(is_current(&game), "marker written so current loader is detected");
     }
 
     #[test]
