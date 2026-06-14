@@ -2,14 +2,7 @@
   "schema": 1,
   "updated": "2026-06-14",
   "loader": {
-    "repo": "BepInEx/BepInEx",
-    "tag": "v6.0.0-pre.2",
-    "assetRules": {
-      "perArch": {
-        "x86": { "match": "(?i)IL2CPP-win-x86", "prefer": "zip" },
-        "x64": { "match": "(?i)IL2CPP-win-x64", "prefer": "zip" }
-      }
-    }
+    "thunderstoreApi": "https://thunderstore.io/api/experimental/package/BepInEx/BepInExPack_AmongUs/"
   },
   "mods": [
     {

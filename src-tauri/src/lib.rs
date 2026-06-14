@@ -24,6 +24,7 @@ pub fn run() {
       commands::get_catalog,
       commands::refresh_catalog,
       commands::ensure_loader,
+      commands::reinstall_loader,
       commands::loader_status,
       commands::list_profiles,
       commands::save_profile,

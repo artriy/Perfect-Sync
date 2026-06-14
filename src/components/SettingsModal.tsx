@@ -9,7 +9,7 @@ import {
   X,
   XCircle,
 } from "@phosphor-icons/react";
-import { ensureLoader, loaderStatus, pickFolder, type LoaderStatus } from "../lib/bridge";
+import { loaderStatus, pickFolder, reinstallLoader, type LoaderStatus } from "../lib/bridge";
 import type { Arch, GameInstall, Settings } from "../lib/types";
 
 interface SettingsModalProps {
@@ -28,6 +28,7 @@ export function SettingsModal({ open, settings, game, profileId, onClose, onSave
   const [arch, setArch] = useState<Arch>(settings.arch ?? "x86");
   const [status, setStatus] = useState<LoaderStatus | null>(null);
   const [working, setWorking] = useState(false);
+  const [msg, setMsg] = useState("");
 
   const refreshStatus = (path: string) => {
     if (!path.trim()) {
@@ -50,10 +51,12 @@ export function SettingsModal({ open, settings, game, profileId, onClose, onSave
   const reinstall = async () => {
     if (!gamePath.trim()) return;
     setWorking(true);
+    setMsg("");
     try {
-      await ensureLoader(gamePath.trim(), profileId, arch);
-    } catch {
-      // failure shows up in the refreshed status below
+      await reinstallLoader(gamePath.trim(), profileId, arch);
+      setMsg("BepInEx reinstalled (latest).");
+    } catch (e) {
+      setMsg(String(e));
     } finally {
       setWorking(false);
       refreshStatus(gamePath);
@@ -214,8 +217,9 @@ export function SettingsModal({ open, settings, game, profileId, onClose, onSave
                 className="ring-focus glass-2 mt-3 flex items-center gap-1.5 rounded-lg px-3 py-2 text-[12.5px] text-ink-dim hover:text-ink disabled:opacity-50"
               >
                 <ArrowsClockwise size={14} className={working ? "animate-spin" : ""} />
-                {working ? "Installing BepInEx…" : "Reinstall BepInEx now"}
+                {working ? "Reinstalling BepInEx…" : "Reinstall BepInEx (latest)"}
               </button>
+              {msg && <p className="mt-2 text-[12px] text-ink-dim">{msg}</p>}
             </div>
 
             <div className="mt-6 flex justify-end gap-2.5">

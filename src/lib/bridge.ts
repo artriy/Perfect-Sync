@@ -171,6 +171,11 @@ export async function ensureLoader(gamePath: string, profileId: string, arch: st
   if (inTauri) await invoke("ensure_loader", { gamePath, profileId, arch });
 }
 
+/** Force-wipe and reinstall the BepInEx engine (fixes a stale/broken loader). */
+export async function reinstallLoader(gamePath: string, profileId: string, arch: string): Promise<void> {
+  if (inTauri) await invoke("reinstall_loader", { gamePath, profileId, arch });
+}
+
 export async function launchProfile(gamePath: string, profileId: string): Promise<void> {
   if (inTauri) await invoke("launch_profile", { gamePath, profileId });
 }

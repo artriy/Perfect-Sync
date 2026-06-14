@@ -32,15 +32,16 @@ pub struct CatalogEntry {
     pub asset_rules: AssetRules,
 }
 
-/// Where the BepInEx loader pack comes from: a GitHub repo + release, resolved
-/// per-arch exactly like a mod (pure GitHub, no third-party registry).
+/// Where the BepInEx engine comes from. GitHub's BepInEx releases lag behind
+/// current Among Us (Cpp2IL metadata mismatch), so the loader uses BepInEx's
+/// own maintained Among Us pack: `packUrl` direct, else the latest via API.
+/// (This is only the BepInEx engine, never a mod.)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoaderInfo {
-    pub repo: String,
-    #[serde(default)]
-    pub tag: Option<String>,
-    #[serde(rename = "assetRules")]
-    pub asset_rules: AssetRules,
+    #[serde(rename = "thunderstoreApi", default)]
+    pub thunderstore_api: Option<String>,
+    #[serde(rename = "packUrl", default)]
+    pub pack_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

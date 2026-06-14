@@ -39,6 +39,12 @@ fn catalog() -> Catalog {
             return cat;
         }
     }
+    bundled_catalog()
+}
+
+/// The catalog compiled into this build (always current with the app). Used for
+/// the loader source so a stale on-disk mod cache can't break BepInEx install.
+fn bundled_catalog() -> Catalog {
     parse(BUNDLED_CATALOG).expect("bundled catalog parses")
 }
 
@@ -91,13 +97,21 @@ fn install_resolved(
     }
 }
 
-fn resolve_pack(http: &dyn Http, arch: &str) -> Result<ResolvedDownload, String> {
-    let loader = catalog().loader.ok_or("catalog has no loader entry")?;
-    match &loader.tag {
-        Some(tag) => resolver::resolve_tag(http, &loader.repo, tag, &loader.asset_rules, arch),
-        None => resolver::resolve_latest(http, &loader.repo, &loader.asset_rules, arch),
+/// Resolve the BepInEx Among Us pack download URL (direct, else latest via API).
+fn pack_url(http: &dyn Http) -> Result<String, String> {
+    let loader = bundled_catalog().loader.ok_or("catalog has no loader entry")?;
+    if let Some(u) = loader.pack_url {
+        if !u.is_empty() {
+            return Ok(u);
+        }
     }
-    .map_err(|e| e.to_string())
+    let api = loader.thunderstore_api.ok_or("no BepInEx loader source configured")?;
+    let text = http.get_text(&api).map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    v["latest"]["download_url"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "could not find BepInEx pack url".to_string())
 }
 
 /// Install the Doorstop/BepInEx loader for a profile (idempotent). Downloads +
@@ -117,11 +131,24 @@ fn ensure_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(
         loader::install_pack(&pack_root, game_dir).map_err(|e| e.to_string())?;
     } else {
         let h = http();
-        let resolved = resolve_pack(&h, arch)?;
-        let bytes = h.get_bytes(&resolved.url).map_err(|e| e.to_string())?;
+        let url = pack_url(&h)?;
+        let bytes = h.get_bytes(&url).map_err(|e| e.to_string())?;
         loader::install_pack_from_zip(&bytes, game_dir, &cache).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Force a clean BepInEx reinstall: wipe the cached pack + the game's loader
+/// (keeping plugins), then reinstall the current pack. Use when the installed
+/// BepInEx is stale (e.g. Cpp2IL metadata version mismatch).
+fn reinstall_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(), String> {
+    let game = Path::new(game_path);
+    let _ = fs::remove_dir_all(settings::cache_dir().join("bepinex"));
+    let _ = fs::remove_file(game.join("winhttp.dll"));
+    let _ = fs::remove_dir_all(game.join("BepInEx").join("core"));
+    let _ = fs::remove_dir_all(game.join("BepInEx").join("interop"));
+    let _ = fs::remove_dir_all(game.join("BepInEx").join("cache"));
+    ensure_loader_impl(game_path, profile_id, arch)
 }
 
 // ---------- settings + detection (fast, stay sync) ----------
@@ -539,6 +566,15 @@ pub async fn ensure_loader(
     arch: String,
 ) -> Result<(), String> {
     blocking(move || ensure_loader_impl(&game_path, &profile_id, &arch)).await
+}
+
+#[tauri::command]
+pub async fn reinstall_loader(
+    game_path: String,
+    profile_id: String,
+    arch: String,
+) -> Result<(), String> {
+    blocking(move || reinstall_loader_impl(&game_path, &profile_id, &arch)).await
 }
 
 #[derive(Serialize)]
