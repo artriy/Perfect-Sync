@@ -1,16 +1,16 @@
 use crate::types::ModTag;
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AssetArchRule {
     #[serde(rename = "match")]
     pub pat: String,
     pub prefer: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AssetRules {
     #[serde(rename = "perArch", default)]
     pub per_arch: HashMap<String, AssetArchRule>,
@@ -20,7 +20,7 @@ pub struct AssetRules {
     pub bundles_loader: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CatalogEntry {
     pub id: String,
     pub name: String,
@@ -32,10 +32,23 @@ pub struct CatalogEntry {
     pub asset_rules: AssetRules,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Where the BepInEx loader pack comes from: a GitHub repo + release, resolved
+/// per-arch exactly like a mod (pure GitHub, no third-party registry).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LoaderInfo {
+    pub repo: String,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(rename = "assetRules")]
+    pub asset_rules: AssetRules,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Catalog {
     pub schema: u32,
     pub mods: Vec<CatalogEntry>,
+    #[serde(default)]
+    pub loader: Option<LoaderInfo>,
 }
 
 impl Catalog {

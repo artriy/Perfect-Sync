@@ -13,6 +13,16 @@ pub struct Settings {
     pub game_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub catalog_url: Option<String>,
+}
+
+pub fn cache_dir() -> PathBuf {
+    app_data_dir().join("cache")
+}
+
+pub fn catalog_cache_path() -> PathBuf {
+    app_data_dir().join("catalog.json")
 }
 
 pub fn app_data_dir() -> PathBuf {

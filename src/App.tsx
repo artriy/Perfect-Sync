@@ -22,6 +22,7 @@ export function App() {
 
   const [game, setGame] = useState<GameInstall | null>(null);
   const [settings, setSettings] = useState<Settings>({});
+  const [catalog, setCatalog] = useState<CatalogItem[]>(CATALOG);
 
   const [addOpen, setAddOpen] = useState(false);
   const [lobbyOpen, setLobbyOpen] = useState(false);
@@ -56,6 +57,13 @@ export function App() {
       setProfiles(list);
       setActiveId(list[0].id);
       setLoaded(true);
+      // best-effort: pull the hosted catalog, then show it
+      bridge
+        .refreshCatalog()
+        .catch(() => {})
+        .then(() => bridge.loadCatalog())
+        .then(setCatalog)
+        .catch(() => {});
     })().catch((e) => {
       notify(String(e));
       setLoaded(true);
@@ -295,6 +303,7 @@ export function App() {
       <AddModPanel
         open={addOpen}
         profileName={active.name}
+        catalog={catalog}
         onClose={() => setAddOpen(false)}
         onAddCatalog={addCatalog}
         onAddUrl={addUrl}

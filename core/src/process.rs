@@ -21,7 +21,7 @@ pub struct LaunchSpec {
 pub fn build_launch(game_dir: &Path, profile_dir: &Path) -> LaunchSpec {
     LaunchSpec {
         program: game_dir.join(GAME_EXE),
-        env: loader::launch_env(profile_dir),
+        env: loader::launch_env(game_dir, profile_dir),
     }
 }
 

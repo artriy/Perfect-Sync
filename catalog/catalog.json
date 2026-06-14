@@ -1,0 +1,114 @@
+{
+  "schema": 1,
+  "updated": "2026-06-14",
+  "loader": {
+    "repo": "BepInEx/BepInEx",
+    "tag": "v6.0.0-pre.2",
+    "assetRules": {
+      "perArch": {
+        "x86": { "match": "(?i)IL2CPP-win-x86", "prefer": "zip" },
+        "x64": { "match": "(?i)IL2CPP-win-x64", "prefer": "zip" }
+      }
+    }
+  },
+  "mods": [
+    {
+      "id": "NuclearPowered/Reactor",
+      "name": "Reactor",
+      "summary": "The modding API and modded handshake. Most all-client mods depend on it.",
+      "repo": "NuclearPowered/Reactor",
+      "tags": ["library"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "Reactor.dll" }
+    },
+    {
+      "id": "All-Of-Us-Mods/MiraAPI",
+      "name": "MiraAPI",
+      "summary": "Shared role/options API layer used by modern mods.",
+      "repo": "All-Of-Us-Mods/MiraAPI",
+      "tags": ["library"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "assetRules": { "perArch": {}, "dllName": "MiraAPI.dll" }
+    },
+    {
+      "id": "AU-Avengers/TOU-Mira",
+      "name": "Town of Us - Mira",
+      "summary": "The Mira-API rebuild of Town of Us. Dozens of custom roles.",
+      "repo": "AU-Avengers/TOU-Mira",
+      "tags": ["role", "all-client"],
+      "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor"],
+      "assetRules": {
+        "perArch": {
+          "x86": { "match": "(?i)x86.*(steam|itch)", "prefer": "zip" },
+          "x64": { "match": "(?i)x64.*(epic|msstore)", "prefer": "zip" }
+        },
+        "dllName": "TownOfUsMira.dll",
+        "bundlesLoader": true
+      }
+    },
+    {
+      "id": "TheOtherRolesAU/TheOtherRoles",
+      "name": "The Other Roles",
+      "summary": "Classic all-client role mod with a deep options menu.",
+      "repo": "TheOtherRolesAU/TheOtherRoles",
+      "tags": ["role", "all-client"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "assetRules": {
+        "perArch": {
+          "x86": { "match": "(?i)theotherroles\\.zip", "prefer": "zip" },
+          "x64": { "match": "(?i)_msstore", "prefer": "zip" }
+        },
+        "dllName": "TheOtherRoles.dll",
+        "bundlesLoader": true
+      }
+    },
+    {
+      "id": "EnhancedNetwork/TownofHost-Enhanced",
+      "name": "Town of Host - Enhanced",
+      "summary": "Host-only chaos modes. Guests can stay vanilla. No Reactor (fat DLL).",
+      "repo": "EnhancedNetwork/TownofHost-Enhanced",
+      "tags": ["role", "host-only"],
+      "dependencies": [],
+      "assetRules": {
+        "perArch": {
+          "x86": { "match": "(?i)steamitchio", "prefer": "zip" },
+          "x64": { "match": "(?i)epicmsstore", "prefer": "zip" }
+        },
+        "dllName": "TOHE.dll"
+      }
+    },
+    {
+      "id": "SubmergedAmongUs/Submerged",
+      "name": "Submerged",
+      "summary": "The underwater map, with elevators and verticality.",
+      "repo": "SubmergedAmongUs/Submerged",
+      "tags": ["map"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "assetRules": {
+        "perArch": {
+          "x86": { "match": "(?i)steam\\.itch", "prefer": "zip" },
+          "x64": { "match": "(?i)epic\\.msstore", "prefer": "zip" }
+        },
+        "dllName": "Submerged.dll"
+      }
+    },
+    {
+      "id": "All-Of-Us-Mods/LaunchpadReloaded",
+      "name": "Launchpad Reloaded",
+      "summary": "A fresh roster of roles built on Mira API. Platform-agnostic DLL.",
+      "repo": "All-Of-Us-Mods/LaunchpadReloaded",
+      "tags": ["role", "all-client"],
+      "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor"],
+      "assetRules": { "perArch": {}, "dllName": "LaunchpadReloaded.dll" }
+    },
+    {
+      "id": "DigEmAll/LevelImposter",
+      "name": "LevelImposter",
+      "summary": "Load community-built custom maps from files.",
+      "repo": "DigEmAll/LevelImposter",
+      "tags": ["map", "cosmetic"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "assetRules": { "perArch": {}, "dllName": "LevelImposter.dll" }
+    }
+  ]
+}

@@ -65,11 +65,70 @@ pub fn install_pack(pack_dir: &Path, game_dir: &Path, profile_dir: &Path) -> io:
     if dotnet.is_dir() {
         copy_dir_recursive(&dotnet, &game_dir.join("dotnet"))?;
     }
-    let core = pack_dir.join("BepInEx").join("core");
-    if core.is_dir() {
-        copy_dir_recursive(&core, &profile_dir.join("BepInEx").join("core"))?;
+    for sub in ["core", "config"] {
+        let src = pack_dir.join("BepInEx").join(sub);
+        if src.is_dir() {
+            copy_dir_recursive(&src, &profile_dir.join("BepInEx").join(sub))?;
+        }
     }
     Ok(())
+}
+
+/// Extract an entire zip archive into `dest` (used for the BepInEx pack).
+pub fn extract_all(bytes: &[u8], dest: &Path) -> io::Result<()> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let name = file.name().replace('\\', "/");
+        if name.contains("..") {
+            continue; // guard against path traversal
+        }
+        let out = dest.join(&name);
+        if file.is_dir() {
+            fs::create_dir_all(&out)?;
+        } else {
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut sink = fs::File::create(&out)?;
+            io::copy(&mut file, &mut sink)?;
+        }
+    }
+    Ok(())
+}
+
+/// Find the directory that holds `winhttp.dll` within an extracted pack (the zip
+/// nests everything under `BepInExPack_AmongUs/`). Checks `dir` then its children.
+pub fn locate_pack_root(dir: &Path) -> Option<PathBuf> {
+    if dir.join("winhttp.dll").exists() {
+        return Some(dir.to_path_buf());
+    }
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() && p.join("winhttp.dll").exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Extract a downloaded BepInEx pack into `cache_dir` (once) and install it into
+/// the game dir + profile. Idempotent: re-extraction is skipped if cached.
+pub fn install_pack_from_zip(
+    bytes: &[u8],
+    game_dir: &Path,
+    profile_dir: &Path,
+    cache_dir: &Path,
+) -> io::Result<()> {
+    if locate_pack_root(cache_dir).is_none() {
+        extract_all(bytes, cache_dir)?;
+    }
+    let root = locate_pack_root(cache_dir)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "winhttp.dll not found in pack"))?;
+    install_pack(&root, game_dir, profile_dir)
 }
 
 /// True if the game dir already has the Doorstop bootstrap installed.
@@ -77,19 +136,32 @@ pub fn is_bootstrapped(game_dir: &Path) -> bool {
     game_dir.join("winhttp.dll").exists()
 }
 
+/// The BepInEx IL2CPP preloader Doorstop 4.x targets (verified against
+/// BepInExPack_AmongUs 6.0.700 / Doorstop 4.3.0).
+pub const IL2CPP_PRELOADER: &str = "BepInEx.Unity.IL2CPP.dll";
+
 /// The Doorstop environment that launches the game against a specific profile's
-/// BepInEx. Setting `DOORSTOP_TARGET_ASSEMBLY` to the profile's preloader makes
-/// BepInEx resolve `plugins/`, `config/`, etc. relative to that profile.
-pub fn launch_env(profile_dir: &Path) -> Vec<(String, String)> {
-    let preloader = profile_dir
-        .join("BepInEx")
-        .join("core")
-        .join("BepInEx.Preloader.IL2CPP.dll");
+/// BepInEx. `DOORSTOP_TARGET_ASSEMBLY` points at the profile's preloader (so
+/// BepInEx resolves `plugins/`, `config/`, etc. from that profile), while the
+/// CoreCLR runtime lives in the game dir's bundled `dotnet/`. Env vars override
+/// the on-disk `doorstop_config.ini`, which is how profiles stay isolated.
+pub fn launch_env(game_dir: &Path, profile_dir: &Path) -> Vec<(String, String)> {
+    let preloader = profile_dir.join("BepInEx").join("core").join(IL2CPP_PRELOADER);
+    let coreclr = game_dir.join("dotnet").join("coreclr.dll");
+    let corlib = game_dir.join("dotnet");
     vec![
         ("DOORSTOP_ENABLED".to_string(), "1".to_string()),
         (
             "DOORSTOP_TARGET_ASSEMBLY".to_string(),
             preloader.to_string_lossy().into_owned(),
+        ),
+        (
+            "DOORSTOP_CLR_RUNTIME_CORECLR_PATH".to_string(),
+            coreclr.to_string_lossy().into_owned(),
+        ),
+        (
+            "DOORSTOP_CLR_CORLIB_DIR".to_string(),
+            corlib.to_string_lossy().into_owned(),
         ),
     ]
 }
@@ -158,15 +230,59 @@ mod tests {
 
     #[test]
     fn launch_env_points_at_profile_preloader() {
-        let env = launch_env(Path::new("/profiles/p1"));
+        let env = launch_env(Path::new("/games/au"), Path::new("/profiles/p1"));
         assert!(env.iter().any(|(k, v)| k == "DOORSTOP_ENABLED" && v == "1"));
-        let target = env
-            .iter()
-            .find(|(k, _)| k == "DOORSTOP_TARGET_ASSEMBLY")
-            .map(|(_, v)| v.clone())
-            .unwrap();
+        let get = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        let target = get("DOORSTOP_TARGET_ASSEMBLY");
         assert!(target.contains("p1"));
-        assert!(target.ends_with("BepInEx.Preloader.IL2CPP.dll"));
+        assert!(target.ends_with("BepInEx.Unity.IL2CPP.dll"));
+        assert!(get("DOORSTOP_CLR_RUNTIME_CORECLR_PATH").ends_with("coreclr.dll"));
+        assert!(get("DOORSTOP_CLR_CORLIB_DIR").ends_with("dotnet"));
+    }
+
+    #[test]
+    fn installs_pack_from_zip_mimicking_thunderstore_layout() {
+        // craft a zip nesting everything under BepInExPack_AmongUs/ like the real pack
+        let mut buf = Vec::new();
+        {
+            use std::io::Write;
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            for (path, body) in [
+                ("BepInExPack_AmongUs/winhttp.dll", "proxy"),
+                ("BepInExPack_AmongUs/doorstop_config.ini", "[General]"),
+                ("BepInExPack_AmongUs/dotnet/coreclr.dll", "clr"),
+                ("BepInExPack_AmongUs/BepInEx/core/BepInEx.Unity.IL2CPP.dll", "preloader"),
+                ("BepInExPack_AmongUs/BepInEx/config/BepInEx.cfg", "cfg"),
+            ] {
+                zw.start_file(path, opts).unwrap();
+                zw.write_all(body.as_bytes()).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("game");
+        let profile = tmp.path().join("profiles").join("p1");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&game).unwrap();
+        fs::create_dir_all(&profile).unwrap();
+
+        install_pack_from_zip(&buf, &game, &profile, &cache).unwrap();
+
+        assert!(game.join("winhttp.dll").exists());
+        assert!(game.join("dotnet").join("coreclr.dll").exists());
+        assert!(profile
+            .join("BepInEx")
+            .join("core")
+            .join("BepInEx.Unity.IL2CPP.dll")
+            .exists());
+        assert!(profile.join("BepInEx").join("config").join("BepInEx.cfg").exists());
+        assert!(is_bootstrapped(&game));
     }
 
     #[test]

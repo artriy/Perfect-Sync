@@ -1,5 +1,5 @@
-import type { DiffItem, GameInstall, Profile, ProfileMod, Settings } from "./types";
-import { PROFILES, SAMPLE_CODE, SAMPLE_DIFF } from "../data/mock";
+import type { CatalogItem, DiffItem, GameInstall, Profile, ProfileMod, Settings } from "./types";
+import { CATALOG, PROFILES, SAMPLE_CODE, SAMPLE_DIFF } from "../data/mock";
 
 /** True when running inside the Tauri shell (vs a plain browser via `pnpm dev`). */
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -12,6 +12,18 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 export interface Preview {
   name: string;
   items: DiffItem[];
+}
+
+// ------------------------------------------------------------------ catalog
+export async function loadCatalog(): Promise<CatalogItem[]> {
+  if (inTauri) return invoke<CatalogItem[]>("get_catalog");
+  return CATALOG;
+}
+
+/** Best-effort pull of the hosted catalog into the local cache. */
+export async function refreshCatalog(): Promise<number> {
+  if (inTauri) return invoke<number>("refresh_catalog");
+  return CATALOG.length;
 }
 
 // ---------------------------------------------------------------- detection

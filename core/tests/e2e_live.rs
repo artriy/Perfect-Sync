@@ -6,11 +6,52 @@
 //! It resolves Reactor's latest release, downloads the actual asset, installs it
 //! into a temp profile's BepInEx/plugins, and builds the Doorstop launch spec.
 
+use perfect_sync_core::catalog::{AssetArchRule, AssetRules};
 use perfect_sync_core::resolver::Http;
 use perfect_sync_core::{catalog, loader, process, profile, resolver};
+use std::collections::HashMap;
 use std::path::Path;
 
 const CATALOG: &str = include_str!("../fixtures/catalog.sample.json");
+
+/// LIVE: resolve + download the BepInEx IL2CPP pack from GitHub (no Thunderstore)
+/// and install the Doorstop bootstrap + framework into a temp game + profile.
+#[test]
+#[ignore]
+fn live_install_bepinex_loader_from_github() {
+    let http = resolver::UreqHttp::new(None);
+    let mut per_arch = HashMap::new();
+    per_arch.insert(
+        "x86".to_string(),
+        AssetArchRule { pat: "(?i)IL2CPP-win-x86".to_string(), prefer: Some("zip".to_string()) },
+    );
+    let rules = AssetRules { per_arch, dll_name: None, bundles_loader: false };
+    let resolved =
+        resolver::resolve_tag(&http, "BepInEx/BepInEx", "v6.0.0-pre.2", &rules, "x86").unwrap();
+    println!("loader pack: {} ({} bytes)", resolved.asset_name, resolved.size);
+    assert!(resolved.asset_name.to_lowercase().contains("il2cpp"));
+
+    let bytes = http.get_bytes(&resolved.url).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    let profile = tmp.path().join("profiles").join("p1");
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::create_dir_all(&profile).unwrap();
+
+    loader::install_pack_from_zip(&bytes, &game, &profile, &cache).unwrap();
+
+    assert!(game.join("winhttp.dll").exists(), "winhttp installed to game dir");
+    assert!(game.join("dotnet").join("coreclr.dll").exists(), "dotnet runtime installed");
+    assert!(
+        profile
+            .join("BepInEx")
+            .join("core")
+            .join("BepInEx.Unity.IL2CPP.dll")
+            .exists(),
+        "preloader installed to profile"
+    );
+}
 
 #[test]
 #[ignore]

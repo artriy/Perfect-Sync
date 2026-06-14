@@ -8,14 +8,26 @@ use perfect_sync_core::preview::{preview, Preview};
 use perfect_sync_core::profile::{InstalledMod, ProfileRecord, ProfileStore};
 use perfect_sync_core::resolver::{Http, ResolvedDownload, UreqHttp};
 use perfect_sync_core::types::{ModSource, ModTag};
-use perfect_sync_core::{codec, game, process, profile, resolver};
+use perfect_sync_core::{codec, deps, game, loader, process, profile, resolver};
+use serde::Serialize;
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
-const CATALOG_JSON: &str = include_str!("../../core/fixtures/catalog.sample.json");
+/// Real catalog bundled into the binary as the offline fallback.
+const BUNDLED_CATALOG: &str = include_str!("../../catalog/catalog.json");
 
+const DEFAULT_CATALOG_URL: &str =
+    "https://raw.githubusercontent.com/artriy/Perfect-Sync/main/catalog/catalog.json";
+
+/// Load the catalog: prefer the fetched cache, fall back to the bundled copy.
 fn catalog() -> Catalog {
-    parse(CATALOG_JSON).expect("bundled catalog parses")
+    if let Ok(text) = fs::read_to_string(settings::catalog_cache_path()) {
+        if let Ok(cat) = parse(&text) {
+            return cat;
+        }
+    }
+    parse(BUNDLED_CATALOG).expect("bundled catalog parses")
 }
 
 fn store() -> ProfileStore {
@@ -56,6 +68,44 @@ fn install_resolved(
     }
 }
 
+/// Resolve the BepInEx loader pack from GitHub for the given arch (no Thunderstore).
+fn resolve_pack(http: &dyn Http, arch: &str) -> Result<ResolvedDownload, String> {
+    let loader = catalog().loader.ok_or("catalog has no loader entry")?;
+    match &loader.tag {
+        Some(tag) => resolver::resolve_tag(http, &loader.repo, tag, &loader.asset_rules, arch),
+        None => resolver::resolve_latest(http, &loader.repo, &loader.asset_rules, arch),
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// Ensure the Doorstop/BepInEx loader is installed for a profile (idempotent).
+/// Downloads + caches the GitHub pack once per arch, copies the bootstrap into
+/// the game dir and the framework into the profile.
+fn ensure_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(), String> {
+    let game_dir = Path::new(game_path);
+    let root = settings::profiles_root();
+    let profile_dir = root.join(profile_id);
+    let preloader = profile_dir
+        .join("BepInEx")
+        .join("core")
+        .join(loader::IL2CPP_PRELOADER);
+    if loader::is_bootstrapped(game_dir) && preloader.exists() {
+        return Ok(());
+    }
+    loader::ensure_profile_layout(&root, profile_id).map_err(|e| e.to_string())?;
+    let cache = settings::cache_dir().join("bepinex").join(arch);
+    if let Some(pack_root) = loader::locate_pack_root(&cache) {
+        loader::install_pack(&pack_root, game_dir, &profile_dir).map_err(|e| e.to_string())?;
+    } else {
+        let h = http();
+        let resolved = resolve_pack(&h, arch)?;
+        let bytes = h.get_bytes(&resolved.url).map_err(|e| e.to_string())?;
+        loader::install_pack_from_zip(&bytes, game_dir, &profile_dir, &cache)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ---------- settings + detection ----------
 
 #[tauri::command]
@@ -76,6 +126,47 @@ pub fn save_settings(settings: Settings) -> Result<(), String> {
 #[tauri::command]
 pub fn game_running() -> bool {
     process::is_running()
+}
+
+// ---------- catalog (hosted, cached, bundled fallback) ----------
+
+#[derive(Serialize)]
+pub struct CatalogListItem {
+    pub id: String,
+    pub name: String,
+    pub repo: String,
+    pub summary: String,
+    pub tags: Vec<ModTag>,
+    pub latest: String,
+}
+
+#[tauri::command]
+pub fn get_catalog() -> Vec<CatalogListItem> {
+    catalog()
+        .mods
+        .into_iter()
+        .map(|m| CatalogListItem {
+            id: m.id.clone(),
+            name: m.name,
+            repo: m.repo.unwrap_or(m.id),
+            summary: m.summary,
+            tags: m.tags,
+            latest: String::new(),
+        })
+        .collect()
+}
+
+/// Fetch the hosted catalog and write it to the local cache. Returns mod count.
+#[tauri::command]
+pub fn refresh_catalog() -> Result<usize, String> {
+    let url = settings::load()
+        .catalog_url
+        .unwrap_or_else(|| DEFAULT_CATALOG_URL.to_string());
+    let text = http().get_text(&url).map_err(|e| e.to_string())?;
+    let cat = parse(&text).map_err(|e| format!("invalid catalog: {e}"))?;
+    fs::create_dir_all(settings::app_data_dir()).map_err(|e| e.to_string())?;
+    fs::write(settings::catalog_cache_path(), &text).map_err(|e| e.to_string())?;
+    Ok(cat.mods.len())
 }
 
 // ---------- profiles ----------
@@ -116,31 +207,47 @@ pub fn add_mod(profile_id: String, repo: String, arch: String) -> Result<Profile
     let store = ProfileStore::new(&root);
     let mut rec = store.load(&profile_id).ok_or("profile not found")?;
     let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
-
     let cat = catalog();
-    let entry = cat.get(&repo);
-    let rules = entry.map(|e| e.asset_rules.clone()).unwrap_or_else(default_rules);
-    let tags = entry.map(|e| e.tags.clone()).unwrap_or_default();
-    let name = entry.map(|e| e.name.clone()).unwrap_or_else(|| repo.clone());
-
     let http = http();
-    let resolved = resolver::resolve_latest(&http, &repo, &rules, &arch).map_err(|e| e.to_string())?;
-    let file = install_resolved(&root, &profile_id, &http, &resolved)?;
 
+    // expand dependency graph (deps before the mod); install whatever is missing
     rec.mods.retain(|m| m.package_id != repo);
-    rec.mods.push(InstalledMod {
-        package_id: repo.clone(),
-        name,
-        repo: Some(repo),
-        version: resolved.version.clone(),
-        versions: vec![resolved.version],
-        enabled: true,
-        source: ModSource::Github,
-        tags,
-        managed: false,
-        update: None,
-        file,
-    });
+    let ordered = deps::resolve(&cat, &[repo.clone()]).ordered;
+    for id in ordered {
+        if rec.mods.iter().any(|m| m.package_id == id) {
+            continue;
+        }
+        let entry = cat.get(&id);
+        let id_repo = entry
+            .and_then(|e| e.repo.clone())
+            .or_else(|| resolver::parse_repo(&id))
+            .unwrap_or_else(|| id.clone());
+        let rules = entry.map(|e| e.asset_rules.clone()).unwrap_or_else(default_rules);
+        let tags = entry.map(|e| e.tags.clone()).unwrap_or_default();
+        let name = entry.map(|e| e.name.clone()).unwrap_or_else(|| id.clone());
+        let resolved =
+            resolver::resolve_latest(&http, &id_repo, &rules, &arch).map_err(|e| e.to_string())?;
+        let file = install_resolved(&root, &profile_id, &http, &resolved)?;
+        let managed = id != repo && tags.iter().any(|t| matches!(t, ModTag::Library | ModTag::Loader));
+        rec.mods.push(InstalledMod {
+            package_id: id,
+            name,
+            repo: Some(id_repo),
+            version: resolved.version.clone(),
+            versions: vec![resolved.version],
+            enabled: true,
+            source: ModSource::Github,
+            tags,
+            managed,
+            update: None,
+            file,
+        });
+    }
+
+    // best-effort loader setup if the game path is known
+    if let Some(game_path) = settings::load().game_path {
+        let _ = ensure_loader_impl(&game_path, &profile_id, &arch);
+    }
     store.save(&rec).map_err(|e| e.to_string())?;
     Ok(rec)
 }
@@ -280,23 +387,34 @@ pub fn apply_lobby_code(code: String, arch: String) -> Result<ProfileRecord, Str
     }
 
     let record = ProfileRecord {
-        id,
+        id: id.clone(),
         name: format!("Lobby - {display}"),
         crew_color: "#ffd23f".to_string(),
         game_build: manifest.game_build.clone(),
         mods,
     };
     store.save(&record).map_err(|e| e.to_string())?;
+    if let Some(game_path) = settings::load().game_path {
+        let _ = ensure_loader_impl(&game_path, &id, &arch);
+    }
     Ok(record)
 }
 
-// ---------- launch ----------
+// ---------- loader + launch ----------
+
+#[tauri::command]
+pub fn ensure_loader(game_path: String, profile_id: String, arch: String) -> Result<(), String> {
+    ensure_loader_impl(&game_path, &profile_id, &arch)
+}
 
 #[tauri::command]
 pub fn launch_profile(game_path: String, profile_id: String) -> Result<(), String> {
     if process::is_running() {
         return Err("Among Us is running. Close it before launching.".into());
     }
+    let arch = settings::load().arch.unwrap_or_else(|| "x86".to_string());
+    // guarantee the loader is set up before launching modded
+    ensure_loader_impl(&game_path, &profile_id, &arch)?;
     let root = settings::profiles_root();
     let spec = process::build_launch(Path::new(&game_path), &root.join(&profile_id));
     process::launch(&spec).map_err(|e| e.to_string())?;

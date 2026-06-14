@@ -2,24 +2,24 @@ import { useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { GithubLogo, MagnifyingGlass, Plus, X } from "@phosphor-icons/react";
 import { Pill, primaryTag } from "./Pill";
-import { CATALOG } from "../data/mock";
 import type { CatalogItem } from "../lib/types";
 
 interface AddModPanelProps {
   open: boolean;
   profileName: string;
+  catalog: CatalogItem[];
   onClose: () => void;
   onAddCatalog: (item: CatalogItem) => void;
   onAddUrl: (url: string) => void;
 }
 
-export function AddModPanel({ open, profileName, onClose, onAddCatalog, onAddUrl }: AddModPanelProps) {
+export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog, onAddUrl }: AddModPanelProps) {
   const reduce = useReducedMotion();
   const [url, setUrl] = useState("");
   const [q, setQ] = useState("");
 
   const looksLikeRepo = /github\.com\/.+\/.+/i.test(url.trim());
-  const results = CATALOG.filter(
+  const results = catalog.filter(
     (c) =>
       c.name.toLowerCase().includes(q.toLowerCase()) ||
       c.summary.toLowerCase().includes(q.toLowerCase()),
@@ -109,7 +109,9 @@ export function AddModPanel({ open, profileName, onClose, onAddCatalog, onAddUrl
                   <div className="flex items-center gap-2">
                     <span className="text-[14.5px] font-semibold text-ink">{item.name}</span>
                     <Pill tag={primaryTag(item.tags)} />
-                    <span className="ml-auto font-mono text-[12px] text-ink-faint">{item.latest}</span>
+                    {item.latest && (
+                      <span className="ml-auto font-mono text-[12px] text-ink-faint">{item.latest}</span>
+                    )}
                   </div>
                   <p className="mt-1.5 text-[12.5px] leading-snug text-ink-dim">{item.summary}</p>
                   <div className="mt-3 flex items-center justify-between">
