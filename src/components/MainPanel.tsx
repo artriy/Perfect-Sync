@@ -11,6 +11,7 @@ interface MainPanelProps {
   onToggle: (modId: string) => void;
   onVersion: (modId: string, v: string) => void;
   onRemove: (modId: string) => void;
+  onPickRelease: (modId: string) => void;
   onCopyCode: () => void;
   onLaunch: () => void;
   onAddMod: () => void;
@@ -76,6 +77,7 @@ export function MainPanel(props: MainPanelProps) {
               onToggle={() => props.onToggle(mod.packageId)}
               onVersion={(v) => props.onVersion(mod.packageId, v)}
               onRemove={() => props.onRemove(mod.packageId)}
+              onPickRelease={() => props.onPickRelease(mod.packageId)}
             />
           ))
         )}

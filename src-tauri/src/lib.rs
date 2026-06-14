@@ -28,6 +28,8 @@ pub fn run() {
       commands::save_profile,
       commands::delete_profile,
       commands::encode_lobby_code,
+      commands::list_releases,
+      commands::install_asset,
       commands::add_mod,
       commands::set_mod_enabled,
       commands::set_mod_version,

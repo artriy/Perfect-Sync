@@ -14,7 +14,7 @@ pub enum ResolveError {
     Http(String),
     #[error("could not parse response: {0}")]
     Parse(String),
-    #[error("no asset matched architecture {0}")]
+    #[error("{0}")]
     NoAsset(String),
 }
 
@@ -116,20 +116,31 @@ pub fn pick_asset<'a>(rel: &'a Release, rules: &AssetRules, arch: &str) -> Optio
     if let Some(name) = catalog::select_asset(rules, arch, &names) {
         return rel.assets.iter().find(|a| &a.name == name);
     }
+    // exact dllName, if the catalog specified one
     if let Some(dll) = &rules.dll_name {
         if let Some(a) = rel.assets.iter().find(|a| &a.name == dll) {
             return Some(a);
         }
     }
+    // a mod that *declares* this arch but has no matching asset is genuinely
+    // missing this arch's build — don't guess.
+    if rules.per_arch.contains_key(arch) {
+        return None;
+    }
+    // no per-arch rules (e.g. a single-DLL mod or an unknown repo): take the lone
+    // .dll, else any .dll, else a bundle .zip, else whatever the release has.
     let dlls: Vec<&Asset> = rel
         .assets
         .iter()
         .filter(|a| a.name.to_lowercase().ends_with(".dll"))
         .collect();
-    if dlls.len() == 1 {
-        return Some(dlls[0]);
+    if let Some(dll) = dlls.first() {
+        return Some(dll);
     }
-    None
+    if let Some(zip) = rel.assets.iter().find(|a| a.name.to_lowercase().ends_with(".zip")) {
+        return Some(zip);
+    }
+    rel.assets.first()
 }
 
 pub fn fetch_latest_release(http: &dyn Http, repo: &str) -> Result<Release, ResolveError> {
@@ -165,7 +176,7 @@ pub fn resolve_tag(
     arch: &str,
 ) -> Result<ResolvedDownload, ResolveError> {
     let rel = fetch_release_by_tag(http, repo, tag)?;
-    let asset = pick_asset(&rel, rules, arch).ok_or_else(|| ResolveError::NoAsset(arch.into()))?;
+    let asset = pick_asset(&rel, rules, arch).ok_or_else(|| no_asset_err(repo, &rel))?;
     Ok(ResolvedDownload {
         url: asset.url.clone(),
         asset_name: asset.name.clone(),
@@ -182,13 +193,35 @@ pub fn resolve_latest(
     arch: &str,
 ) -> Result<ResolvedDownload, ResolveError> {
     let rel = fetch_latest_release(http, repo)?;
-    let asset = pick_asset(&rel, rules, arch).ok_or_else(|| ResolveError::NoAsset(arch.into()))?;
+    let asset = pick_asset(&rel, rules, arch).ok_or_else(|| no_asset_err(repo, &rel))?;
     Ok(ResolvedDownload {
         url: asset.url.clone(),
         asset_name: asset.name.clone(),
         version: rel.tag.clone(),
         size: asset.size,
     })
+}
+
+fn no_asset_err(repo: &str, rel: &Release) -> ResolveError {
+    let names: Vec<&str> = rel.assets.iter().map(|a| a.name.as_str()).collect();
+    if names.is_empty() {
+        ResolveError::NoAsset(format!(
+            "{repo} release {} has no downloadable files (only source). Create a GitHub release with the mod .dll, or pick a file manually.",
+            rel.tag
+        ))
+    } else {
+        ResolveError::NoAsset(format!(
+            "{repo}: could not auto-pick a file from release {} (files: {}). Use the file picker to choose one.",
+            rel.tag,
+            names.join(", ")
+        ))
+    }
+}
+
+/// List a repo's recent releases (for the manual release/file picker).
+pub fn fetch_releases(http: &dyn Http, repo: &str, per_page: u32) -> Result<Vec<Release>, ResolveError> {
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page={per_page}");
+    serde_json::from_str(&http.get_text(&url)?).map_err(|e| ResolveError::Parse(e.to_string()))
 }
 
 #[cfg(test)]
@@ -253,6 +286,25 @@ mod tests {
             assets: vec![Asset { name: "Reactor.dll".into(), url: "https://x/r".into(), size: 10 }],
         };
         assert_eq!(pick_asset(&rel, rules, "x86").unwrap().name, "Reactor.dll");
+    }
+
+    #[test]
+    fn unknown_repo_falls_back_to_dll_then_zip() {
+        use crate::catalog::AssetRules;
+        use std::collections::HashMap;
+        let rules = AssetRules { per_arch: HashMap::new(), dll_name: None, bundles_loader: false };
+        let dll = Release {
+            tag: "1".into(),
+            assets: vec![Asset { name: "Perfect-Comms.dll".into(), url: "u".into(), size: 1 }],
+        };
+        assert_eq!(pick_asset(&dll, &rules, "x86").unwrap().name, "Perfect-Comms.dll");
+        let zip = Release {
+            tag: "1".into(),
+            assets: vec![Asset { name: "bundle.zip".into(), url: "u".into(), size: 1 }],
+        };
+        assert_eq!(pick_asset(&zip, &rules, "x86").unwrap().name, "bundle.zip");
+        let empty = Release { tag: "1".into(), assets: vec![] };
+        assert!(pick_asset(&empty, &rules, "x86").is_none());
     }
 
     #[test]

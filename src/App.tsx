@@ -5,6 +5,7 @@ import { MainPanel } from "./components/MainPanel";
 import { LobbyCodeModal } from "./components/LobbyCodeModal";
 import { AddModPanel } from "./components/AddModPanel";
 import { SettingsModal } from "./components/SettingsModal";
+import { ReleasePicker } from "./components/ReleasePicker";
 import { Toast, type ToastState } from "./components/Toast";
 import * as bridge from "./lib/bridge";
 import { CATALOG, SAMPLE_DIFF } from "./data/mock";
@@ -28,6 +29,7 @@ export function App() {
   const [lobbyOpen, setLobbyOpen] = useState(false);
   const [lobbyCode, setLobbyCode] = useState<string | undefined>(undefined);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [pickerMod, setPickerMod] = useState<ProfileMod | null>(null);
 
   const [toast, setToast] = useState<ToastState | null>(null);
   const toastId = useRef(0);
@@ -197,6 +199,28 @@ export function App() {
     }
   };
 
+  const openPicker = (modId: string) => {
+    const m = active.mods.find((x) => x.packageId === modId);
+    if (m) setPickerMod(m);
+  };
+
+  const pickRelease = async (tag: string, assetName: string) => {
+    if (!pickerMod) return;
+    const repo = pickerMod.repo ?? pickerMod.packageId;
+    const id = pickerMod.packageId;
+    setPickerMod(null);
+    setBusyModId(id);
+    notify(`Installing ${assetName}…`);
+    try {
+      patchProfile(await bridge.installAsset(active, repo, tag, assetName, arch));
+      notify(`Installed ${assetName}`);
+    } catch (e) {
+      notify(String(e));
+    } finally {
+      setBusyModId(null);
+    }
+  };
+
   const copyCode = async () => {
     try {
       const code = await bridge.encodeLobbyCode(active);
@@ -293,6 +317,7 @@ export function App() {
             onToggle={toggleMod}
             onVersion={changeVersion}
             onRemove={removeMod}
+            onPickRelease={openPicker}
             onCopyCode={copyCode}
             onLaunch={() => doLaunchProfile(active)}
             onAddMod={() => setAddOpen(true)}
@@ -321,6 +346,14 @@ export function App() {
         game={game}
         onClose={() => setSettingsOpen(false)}
         onSave={saveSettings}
+      />
+      <ReleasePicker
+        open={pickerMod !== null}
+        repo={pickerMod ? (pickerMod.repo ?? pickerMod.packageId) : ""}
+        modName={pickerMod?.name ?? ""}
+        busy={busyModId !== null}
+        onClose={() => setPickerMod(null)}
+        onPick={pickRelease}
       />
       <Toast toast={toast} />
     </div>

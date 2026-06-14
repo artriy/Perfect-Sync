@@ -1,6 +1,8 @@
 import { motion, useReducedMotion } from "motion/react";
 import {
   ArrowUp,
+  CircleNotch,
+  FileArrowDown,
   GearSix,
   MapTrifold,
   PuzzlePiece,
@@ -37,9 +39,10 @@ interface ModRowProps {
   onToggle: () => void;
   onVersion: (v: string) => void;
   onRemove: () => void;
+  onPickRelease: () => void;
 }
 
-export function ModRow({ mod, busy, onToggle, onVersion, onRemove }: ModRowProps) {
+export function ModRow({ mod, busy, onToggle, onVersion, onRemove, onPickRelease }: ModRowProps) {
   const reduce = useReducedMotion();
   const tag = mod.tags.length ? primaryTag(mod.tags) : null;
   const Glyph = (tag && ICON[tag]) || PuzzlePiece;
@@ -80,8 +83,23 @@ export function ModRow({ mod, busy, onToggle, onVersion, onRemove }: ModRowProps
         <span className="glass-2 rounded-lg px-2.5 py-1.5 font-mono text-[12.5px] text-ink-faint">
           {mod.version}
         </span>
+      ) : busy ? (
+        <span className="glass-2 flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12px] text-ink-dim">
+          <CircleNotch size={13} className="animate-spin" /> working
+        </span>
       ) : (
-        <VersionPicker value={mod.version} options={mod.versions} onChange={onVersion} disabled={busy} />
+        <>
+          <VersionPicker value={mod.version} options={mod.versions} onChange={onVersion} disabled={busy} />
+          <button
+            type="button"
+            onClick={onPickRelease}
+            aria-label={`Pick a specific release file for ${mod.name}`}
+            title="Pick a specific release / file"
+            className="ring-focus glass-2 grid h-[30px] w-[30px] place-items-center rounded-lg text-ink-dim transition-colors hover:text-ink"
+          >
+            <FileArrowDown size={15} />
+          </button>
+        </>
       )}
 
       <Toggle on={mod.enabled} onChange={onToggle} disabled={busy} label={`Enable ${mod.name}`} />

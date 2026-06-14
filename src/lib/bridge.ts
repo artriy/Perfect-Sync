@@ -14,6 +14,38 @@ export interface Preview {
   items: DiffItem[];
 }
 
+export interface GhAsset {
+  name: string;
+  browser_download_url: string;
+  size: number;
+}
+export interface GhRelease {
+  tag_name: string;
+  assets: GhAsset[];
+}
+
+/** List a repo's releases + asset files (for manual selection). */
+export async function listReleases(repo: string): Promise<GhRelease[]> {
+  if (inTauri) return invoke<GhRelease[]>("list_releases", { repo });
+  return [];
+}
+
+/** Install a specific chosen release asset into the active profile. */
+export async function installAsset(
+  profile: Profile,
+  repo: string,
+  tag: string,
+  assetName: string,
+  arch: string,
+): Promise<Profile> {
+  if (inTauri)
+    return invoke<Profile>("install_asset", { profileId: profile.id, repo, tag, assetName, arch });
+  return {
+    ...profile,
+    mods: profile.mods.map((m) => (m.repo === repo || m.packageId === repo ? { ...m, version: tag } : m)),
+  };
+}
+
 /** Native folder picker (Tauri only). Returns the chosen path or null. */
 export async function pickFolder(): Promise<string | null> {
   if (!inTauri) return null;
