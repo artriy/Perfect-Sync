@@ -293,6 +293,40 @@ mod tests {
     }
 
     #[test]
+    fn to_manifest_sets_github_ref_for_custom_mod() {
+        // a mod NOT in any catalog, added by pasting a GitHub URL
+        let p = ProfileRecord {
+            id: "p".into(),
+            name: "Custom".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            mods: vec![InstalledMod {
+                package_id: "SomeUser/CoolMod".into(),
+                name: "CoolMod".into(),
+                repo: Some("SomeUser/CoolMod".into()),
+                version: "1.2.3".into(),
+                versions: vec!["1.2.3".into()],
+                enabled: true,
+                source: ModSource::Github,
+                tags: vec![],
+                managed: false,
+                update: None,
+                file: Some("CoolMod.dll".into()),
+            }],
+        };
+        let m = to_manifest(&p);
+        // the code carries an explicit GitHub ref so a recipient without the
+        // catalog can still resolve + download it at the exact version
+        assert_eq!(
+            m.mods[0].r#ref.as_deref(),
+            Some("https://github.com/SomeUser/CoolMod")
+        );
+        assert_eq!(m.mods[0].v, "1.2.3");
+        let repo = crate::resolver::parse_repo(m.mods[0].r#ref.as_ref().unwrap());
+        assert_eq!(repo.as_deref(), Some("SomeUser/CoolMod"));
+    }
+
+    #[test]
     fn installs_bare_dll() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("Reactor.dll");

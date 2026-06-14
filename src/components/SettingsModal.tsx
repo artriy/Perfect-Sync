@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { GameController, GithubLogo, X } from "@phosphor-icons/react";
-import type { GameInstall, Settings } from "../lib/types";
+import type { Arch, GameInstall, Settings } from "../lib/types";
 
 interface SettingsModalProps {
   open: boolean;
@@ -14,10 +14,15 @@ interface SettingsModalProps {
 export function SettingsModal({ open, settings, game, onClose, onSave }: SettingsModalProps) {
   const reduce = useReducedMotion();
   const [token, setToken] = useState(settings.githubToken ?? "");
+  const [gamePath, setGamePath] = useState(settings.gamePath ?? "");
+  const [arch, setArch] = useState<Arch>(settings.arch ?? "x86");
 
   useEffect(() => {
-    if (open) setToken(settings.githubToken ?? "");
-  }, [open, settings.githubToken]);
+    if (!open) return;
+    setToken(settings.githubToken ?? "");
+    setGamePath(settings.gamePath ?? game?.path ?? "");
+    setArch(settings.arch ?? game?.arch ?? "x86");
+  }, [open, settings.githubToken, settings.gamePath, settings.arch, game]);
 
   useEffect(() => {
     if (!open) return;
@@ -30,8 +35,8 @@ export function SettingsModal({ open, settings, game, onClose, onSave }: Setting
     onSave({
       ...settings,
       githubToken: token.trim() || undefined,
-      gamePath: game?.path ?? settings.gamePath,
-      arch: game?.arch ?? settings.arch,
+      gamePath: gamePath.trim() || game?.path || undefined,
+      arch,
     });
 
   return (
@@ -87,6 +92,35 @@ export function SettingsModal({ open, settings, game, onClose, onSave }: Setting
                   No Among Us install detected. Open the game once, or set the path manually later.
                 </div>
               )}
+            </div>
+
+            <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
+              Game folder (override)
+            </span>
+            <label className="glass flex items-center gap-2 rounded-xl px-3 py-2.5 text-ink-dim focus-within:text-ink">
+              <GameController size={16} className="opacity-75" />
+              <input
+                value={gamePath}
+                onChange={(e) => setGamePath(e.target.value)}
+                placeholder="C:\\Program Files (x86)\\Steam\\steamapps\\common\\Among Us"
+                aria-label="Game folder"
+                className="w-full bg-transparent font-mono text-[12.5px] text-ink placeholder:text-ink-faint focus:outline-none"
+              />
+            </label>
+            <div className="mt-2 flex items-center gap-2">
+              <span className="text-[12px] text-ink-faint">Build:</span>
+              {(["x86", "x64"] as Arch[]).map((a) => (
+                <button
+                  key={a}
+                  type="button"
+                  onClick={() => setArch(a)}
+                  className={`ring-focus rounded-lg px-3 py-1 text-[12.5px] ${
+                    arch === a ? "accent-grad text-[#0d0820] font-semibold" : "glass text-ink-dim"
+                  }`}
+                >
+                  {a === "x86" ? "x86 (Steam/Epic/itch)" : "x64 (MS Store)"}
+                </button>
+              ))}
             </div>
 
             <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
