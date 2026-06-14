@@ -23,8 +23,9 @@ pub const STEAM_APP_ID: &str = "945360";
 
 /// Identifier for the loader pack this build installs. Bumping it invalidates an
 /// older installed loader (and its cache) so the app auto-reinstalls the current
-/// one. (6.0.700 is the first AmongUs pack whose Cpp2IL supports metadata 31.)
-pub const LOADER_VERSION: &str = "au-bepinex-6.0.700";
+/// one. (be.764: supports metadata 31 AND satisfies modern mods that require
+/// be.738+, e.g. Town of Us - Mira.)
+pub const LOADER_VERSION: &str = "bepinex-be.764";
 
 const LOADER_MARKER: &str = ".perfectsync_loader";
 

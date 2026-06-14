@@ -201,7 +201,7 @@ export function SettingsModal({ open, settings, game, profileId, onClose, onSave
                 <div className="flex flex-col gap-1">
                   <StatusRow ok={status.winhttp} label="Doorstop (winhttp.dll)" />
                   <StatusRow ok={status.preloader} label="BepInEx core" />
-                  <StatusRow ok={status.current} label="BepInEx up to date (6.0.700, metadata 31)" />
+                  <StatusRow ok={status.current} label="BepInEx up to date (be.764)" />
                   <StatusRow ok={status.dotnet} label=".NET runtime" />
                   <StatusRow ok={status.steamAppid} label="Steam launch fix" />
                   <div className="mt-1 text-ink-faint">
