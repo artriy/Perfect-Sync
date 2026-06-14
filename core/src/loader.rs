@@ -112,8 +112,18 @@ pub fn install_pack(pack_dir: &Path, game_dir: &Path, version: &str) -> io::Resu
     }
     fs::create_dir_all(game_dir.join("BepInEx").join("plugins"))?;
     fs::write(game_dir.join("BepInEx").join(LOADER_MARKER), version)?;
+    write_console_off(game_dir)?;
     ensure_steam_appid(game_dir)?;
     Ok(())
+}
+
+/// Force the BepInEx console window off (keep the on-disk log). BepInEx merges
+/// missing keys on launch but preserves our explicit `Enabled = false`.
+pub fn write_console_off(game_dir: &Path) -> io::Result<()> {
+    let cfg_dir = game_dir.join("BepInEx").join("config");
+    fs::create_dir_all(&cfg_dir)?;
+    let cfg = "[Logging.Console]\nEnabled = false\n\n[Logging.Disk]\nEnabled = true\nWriteUnityLog = false\n";
+    fs::write(cfg_dir.join("BepInEx.cfg"), cfg)
 }
 
 /// Write `steam_appid.txt` next to the exe so a direct launch passes Steam auth.
@@ -272,6 +282,16 @@ mod tests {
         );
         // x64 picks the x64 asset
         assert_eq!(parse_latest_build(html, "x64").unwrap().0, "be.763");
+    }
+
+    #[test]
+    fn console_disabled_in_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_console_off(tmp.path()).unwrap();
+        let cfg =
+            fs::read_to_string(tmp.path().join("BepInEx").join("config").join("BepInEx.cfg")).unwrap();
+        assert!(cfg.contains("[Logging.Console]"));
+        assert!(cfg.contains("Enabled = false"));
     }
 
     #[test]

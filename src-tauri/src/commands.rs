@@ -650,6 +650,7 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
         let arch = settings::load().arch.unwrap_or_else(|| "x86".to_string());
         ensure_loader_impl(&game_path, &profile_id, &arch)?;
         let _ = loader::ensure_steam_appid(Path::new(&game_path));
+        let _ = loader::write_console_off(Path::new(&game_path));
         // copy this profile's enabled plugins into the game's BepInEx/plugins
         loader::sync_profile_plugins(&settings::profiles_root(), &profile_id, Path::new(&game_path))
             .map_err(|e| e.to_string())?;
