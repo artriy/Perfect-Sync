@@ -151,7 +151,11 @@ export async function applyLobbyCode(code: string, arch: string, browserProfile:
   return browserProfile;
 }
 
-// -------------------------------------------------------------------- launch
+// ------------------------------------------------------------ loader + launch
+export async function ensureLoader(gamePath: string, profileId: string, arch: string): Promise<void> {
+  if (inTauri) await invoke("ensure_loader", { gamePath, profileId, arch });
+}
+
 export async function launchProfile(gamePath: string, profileId: string): Promise<void> {
   if (inTauri) await invoke("launch_profile", { gamePath, profileId });
 }

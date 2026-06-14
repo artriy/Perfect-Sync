@@ -552,6 +552,7 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
         }
         let arch = settings::load().arch.unwrap_or_else(|| "x86".to_string());
         ensure_loader_impl(&game_path, &profile_id, &arch)?;
+        let _ = loader::ensure_steam_appid(Path::new(&game_path));
         let root = settings::profiles_root();
         let spec = process::build_launch(Path::new(&game_path), &root.join(&profile_id));
         process::launch(&spec).map_err(|e| e.to_string())?;

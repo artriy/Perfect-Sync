@@ -64,9 +64,20 @@ export function ModRow({ mod, busy, onToggle, onVersion, onRemove, onPickRelease
 
       <div className="min-w-0">
         <div className="truncate text-[15px] font-semibold text-ink">{mod.name}</div>
-        <div className="truncate text-[12px] text-ink-faint">
-          {mod.managed ? (mod.tags.includes("loader") ? "loader · auto-managed" : "dependency · auto-managed") : mod.repo}
-        </div>
+        {mod.managed ? (
+          <div className="truncate text-[12px] text-ink-faint">
+            {mod.tags.includes("loader") ? "loader · auto-managed" : "dependency · auto-managed"}
+            {mod.file ? ` · ${mod.file}` : ""}
+          </div>
+        ) : (
+          <div className="truncate text-[12px] text-ink-faint" title={mod.repo}>
+            {mod.file ? (
+              <span className="font-mono text-ink-dim">{mod.file}</span>
+            ) : (
+              mod.repo
+            )}
+          </div>
+        )}
       </div>
 
       <div className="flex-1" />

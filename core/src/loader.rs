@@ -71,7 +71,17 @@ pub fn install_pack(pack_dir: &Path, game_dir: &Path, profile_dir: &Path) -> io:
             copy_dir_recursive(&src, &profile_dir.join("BepInEx").join(sub))?;
         }
     }
+    ensure_steam_appid(game_dir)?;
     Ok(())
+}
+
+/// Among Us Steam app id, written so the game can init Steamworks when launched
+/// directly (with Doorstop env vars) instead of through the Steam client.
+pub const STEAM_APP_ID: &str = "945360";
+
+/// Write `steam_appid.txt` next to the exe so a direct launch passes Steam auth.
+pub fn ensure_steam_appid(game_dir: &Path) -> io::Result<()> {
+    fs::write(game_dir.join("steam_appid.txt"), STEAM_APP_ID)
 }
 
 /// Extract an entire zip archive into `dest` (used for the BepInEx pack).
@@ -226,6 +236,16 @@ mod tests {
             .join("BepInEx.Preloader.IL2CPP.dll")
             .exists());
         assert!(is_bootstrapped(&game));
+    }
+
+    #[test]
+    fn writes_steam_appid_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_steam_appid(tmp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("steam_appid.txt")).unwrap(),
+            "945360"
+        );
     }
 
     #[test]

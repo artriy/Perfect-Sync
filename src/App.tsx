@@ -89,6 +89,21 @@ export function App() {
   const patchProfile = (updated: Profile) =>
     setProfiles((ps) => ps.map((p) => (p.id === updated.id ? updated : p)));
 
+  // Install/verify the BepInEx loader for a profile, surfacing any failure.
+  const ensureLoader = async (profileId: string) => {
+    if (!bridge.inTauri) return;
+    const gamePath = game?.path ?? settings.gamePath;
+    if (!gamePath) {
+      notify("Set your Among Us folder in Settings so BepInEx can install.");
+      return;
+    }
+    try {
+      await bridge.ensureLoader(gamePath, profileId, arch);
+    } catch (e) {
+      notify(`BepInEx setup failed: ${e}`);
+    }
+  };
+
   const hasRoleMod = (mods: ProfileMod[]) => mods.some((m) => !m.managed && m.tags.includes("role"));
 
   const toggleMod = async (modId: string) => {
@@ -166,6 +181,7 @@ export function App() {
     try {
       patchProfile(await bridge.addMod(active, item.repo, arch, browserMod));
       notify(`Added ${item.name} to ${active.name}`);
+      await ensureLoader(active.id);
     } catch (e) {
       notify(String(e));
     }
@@ -194,6 +210,7 @@ export function App() {
     try {
       patchProfile(await bridge.addMod(active, url, arch, browserMod));
       notify(`Added ${name} from GitHub`);
+      await ensureLoader(active.id);
     } catch (e) {
       notify(String(e));
     }
@@ -264,6 +281,7 @@ export function App() {
       const built = await bridge.applyLobbyCode(code, arch, buildLobbyProfile());
       setProfiles((ps) => [...ps.filter((p) => p.id !== built.id), built]);
       setActiveId(built.id);
+      await ensureLoader(built.id);
       if (doLaunch) await doLaunchProfile(built);
       else notify(`Lobby profile ready: ${built.name}`);
     } catch (e) {
