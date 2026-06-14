@@ -59,11 +59,14 @@ impl UreqHttp {
         Self { token }
     }
     fn req(&self, url: &str) -> ureq::Request {
-        let mut r = ureq::get(url)
-            .set("User-Agent", "perfect-sync")
-            .set("Accept", "application/vnd.github+json");
-        if let Some(t) = &self.token {
-            r = r.set("Authorization", &format!("Bearer {t}"));
+        // No GitHub-specific Accept header: Thunderstore (used for the BepInEx
+        // pack) returns 406 for it. Default `*/*` works for both GitHub + TS.
+        let mut r = ureq::get(url).set("User-Agent", "perfect-sync");
+        // only attach the GitHub token to GitHub requests (don't leak it elsewhere)
+        if url.contains("github") {
+            if let Some(t) = &self.token {
+                r = r.set("Authorization", &format!("Bearer {t}"));
+            }
         }
         r
     }
