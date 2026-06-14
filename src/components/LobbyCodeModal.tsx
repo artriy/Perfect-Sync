@@ -239,7 +239,7 @@ function ResultStep({
 }
 
 function DiffRow({ item }: { item: DiffItem }) {
-  const tag = primaryTag(item.tags);
+  const tag = item.tags.length ? primaryTag(item.tags) : null;
   const badge =
     item.action === "install"
       ? { node: <DownloadSimple size={13} weight="bold" />, fg: "#d4c6ff", bg: "rgba(155,123,255,0.3)" }
@@ -260,7 +260,7 @@ function DiffRow({ item }: { item: DiffItem }) {
         <div className="truncate text-[12px] text-ink-faint">{item.detail}</div>
       </div>
       <div className="ml-auto flex items-center gap-2">
-        <Pill tag={tag} />
+        {tag && <Pill tag={tag} />}
         <span className="font-mono text-[12px] text-ink-dim">
           {item.action === "change" ? `→ ${item.to}` : item.action === "install" ? item.to : ""}
         </span>

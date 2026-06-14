@@ -14,6 +14,21 @@ export interface Preview {
   items: DiffItem[];
 }
 
+// ----------------------------------------------------------- window controls
+async function appWindow() {
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  return getCurrentWindow();
+}
+export async function winMinimize(): Promise<void> {
+  if (inTauri) (await appWindow()).minimize();
+}
+export async function winToggleMaximize(): Promise<void> {
+  if (inTauri) (await appWindow()).toggleMaximize();
+}
+export async function winClose(): Promise<void> {
+  if (inTauri) (await appWindow()).close();
+}
+
 export interface GhAsset {
   name: string;
   browser_download_url: string;

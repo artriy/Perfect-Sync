@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { GearSix, MagnifyingGlass, Plus } from "@phosphor-icons/react";
+import { GearSix, MagnifyingGlass, Minus, Plus, Square, X } from "@phosphor-icons/react";
+import { winClose, winMinimize, winToggleMaximize } from "../lib/bridge";
 import type { GameStatus } from "../lib/types";
 
 interface TopBarProps {
@@ -20,7 +21,7 @@ export function TopBar({ game, onAddMod, onPasteCode, onOpenSettings }: TopBarPr
   };
 
   return (
-    <header className="glass-2 flex items-center gap-4 px-4 py-3">
+    <header data-tauri-drag-region className="glass-2 flex items-center gap-4 px-4 py-3">
       <div className="flex items-center gap-2.5 font-semibold tracking-tight">
         <span
           className="h-[22px] w-[22px] rounded-[7px] accent-grad"
@@ -72,6 +73,33 @@ export function TopBar({ game, onAddMod, onPasteCode, onOpenSettings }: TopBarPr
       >
         <GearSix size={17} />
       </button>
+
+      <div className="ml-1 flex items-center gap-1">
+        <button
+          type="button"
+          aria-label="Minimize"
+          onClick={() => winMinimize()}
+          className="ring-focus grid h-[34px] w-[34px] place-items-center rounded-[10px] text-ink-dim transition-colors hover:bg-white/10 hover:text-ink"
+        >
+          <Minus size={15} weight="bold" />
+        </button>
+        <button
+          type="button"
+          aria-label="Maximize"
+          onClick={() => winToggleMaximize()}
+          className="ring-focus grid h-[34px] w-[34px] place-items-center rounded-[10px] text-ink-dim transition-colors hover:bg-white/10 hover:text-ink"
+        >
+          <Square size={13} weight="bold" />
+        </button>
+        <button
+          type="button"
+          aria-label="Close"
+          onClick={() => winClose()}
+          className="ring-focus grid h-[34px] w-[34px] place-items-center rounded-[10px] text-ink-dim transition-colors hover:bg-[#e23b3b] hover:text-white"
+        >
+          <X size={16} weight="bold" />
+        </button>
+      </div>
     </header>
   );
 }
