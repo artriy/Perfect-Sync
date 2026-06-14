@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "build:exe": "tauri build --bundles nsis"
   },
   "dependencies": {
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
