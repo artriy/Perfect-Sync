@@ -141,6 +141,26 @@
       "dependencies": [],
       "assetRules": {},
       "trust": "community"
+    },
+    {
+      "id": "rewalo/TownOfUsMiraRolesExtension",
+      "name": "TOU-Mira Roles Extension",
+      "summary": "Community add-on roles and modifiers for Town of Us - Mira.",
+      "repo": "rewalo/TownOfUsMiraRolesExtension",
+      "tags": ["role", "all-client"],
+      "dependencies": ["AU-Avengers/TOU-Mira"],
+      "assetRules": {},
+      "trust": "community"
+    },
+    {
+      "id": "idkimneil/DraftMode-TOUM",
+      "name": "Draft Mode",
+      "summary": "Adds a full role draft where players pick their own role. Built for TOU-Mira.",
+      "repo": "idkimneil/DraftMode-TOUM",
+      "tags": ["role", "all-client"],
+      "dependencies": ["AU-Avengers/TOU-Mira"],
+      "assetRules": {},
+      "trust": "community"
     }
   ]
 }
