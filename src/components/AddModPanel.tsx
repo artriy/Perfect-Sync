@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { GithubLogo, MagnifyingGlass, Plus, X } from "@phosphor-icons/react";
+import { CaretDown, CaretUp, GithubLogo, MagnifyingGlass, Plus, TrashSimple, X } from "@phosphor-icons/react";
 import { Pill, primaryTag } from "./Pill";
 import type { CatalogItem } from "../lib/types";
 
@@ -11,12 +11,15 @@ interface AddModPanelProps {
   onClose: () => void;
   onAddCatalog: (item: CatalogItem) => void;
   onAddUrl: (url: string) => void;
+  onRemoveCatalog: (id: string) => void;
+  onMoveCatalog: (id: string, dir: "up" | "down") => void;
 }
 
-export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog, onAddUrl }: AddModPanelProps) {
+export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog, onAddUrl, onRemoveCatalog, onMoveCatalog }: AddModPanelProps) {
   const reduce = useReducedMotion();
   const [url, setUrl] = useState("");
   const [q, setQ] = useState("");
+  const [manage, setManage] = useState(false);
 
   const looksLikeRepo = /github\.com\/.+\/.+/i.test(url.trim());
   const results = catalog.filter(
@@ -88,6 +91,13 @@ export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog,
               <div className="h-px flex-1 bg-white/10" />
               <span className="text-[11px] tracking-[0.14em] text-ink-faint uppercase">Catalog</span>
               <div className="h-px flex-1 bg-white/10" />
+              <button
+                type="button"
+                onClick={() => setManage((m) => !m)}
+                className="ring-focus shrink-0 rounded-lg px-2 py-0.5 text-[11px] font-semibold text-ink-dim hover:bg-white/10 hover:text-ink"
+              >
+                {manage ? "Done" : "Manage"}
+              </button>
             </div>
 
             <div className="px-5 pb-3">
@@ -104,31 +114,67 @@ export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog,
             </div>
 
             <div className="scroll-region flex flex-1 flex-col gap-2 overflow-y-auto px-5 pb-5">
-              {results.map((item) => (
+              {(manage ? catalog : results).map((item, i, arr) => (
                 <div key={item.id} className="glass rounded-2xl p-3.5">
                   <div className="flex items-center gap-2">
-                    <span className="text-[14.5px] font-semibold text-ink">{item.name}</span>
-                    <Pill tag={primaryTag(item.tags)} />
+                    <span className="min-w-0 truncate text-[14.5px] font-semibold text-ink">{item.name}</span>
+                    {item.tags.length > 0 && <Pill tag={primaryTag(item.tags)} />}
                     {item.latest && (
                       <span className="ml-auto font-mono text-[12px] text-ink-faint">{item.latest}</span>
                     )}
                   </div>
-                  <p className="mt-1.5 text-[12.5px] leading-snug text-ink-dim">{item.summary}</p>
-                  <div className="mt-3 flex items-center justify-between">
-                    <span className="font-mono text-[11.5px] text-ink-faint">{item.repo}</span>
-                    <button
-                      type="button"
-                      onClick={() => onAddCatalog(item)}
-                      className="ring-focus accent-grad flex items-center gap-1 rounded-lg px-3 py-1.5 text-[12.5px] font-semibold text-[#0d0820] transition-transform active:scale-[0.96]"
-                    >
-                      <Plus size={13} weight="bold" /> Add
-                    </button>
+                  <p className="mt-1.5 text-[12.5px] leading-snug text-ink-dim">{item.summary || item.repo}</p>
+                  <div className="mt-3 flex items-center justify-between gap-2">
+                    <span className="min-w-0 truncate font-mono text-[11.5px] text-ink-faint">{item.repo}</span>
+                    {manage ? (
+                      <div className="flex shrink-0 items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => onMoveCatalog(item.id, "up")}
+                          disabled={i === 0}
+                          aria-label="Move up"
+                          className="ring-focus grid h-7 w-7 place-items-center rounded-lg text-ink-dim hover:bg-white/10 hover:text-ink disabled:opacity-30"
+                        >
+                          <CaretUp size={14} weight="bold" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onMoveCatalog(item.id, "down")}
+                          disabled={i === arr.length - 1}
+                          aria-label="Move down"
+                          className="ring-focus grid h-7 w-7 place-items-center rounded-lg text-ink-dim hover:bg-white/10 hover:text-ink disabled:opacity-30"
+                        >
+                          <CaretDown size={14} weight="bold" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onRemoveCatalog(item.id)}
+                          aria-label="Remove from catalog"
+                          className="ring-focus grid h-7 w-7 place-items-center rounded-lg text-[#ff8a8a] hover:bg-[rgba(226,59,59,0.15)]"
+                        >
+                          <TrashSimple size={14} />
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => onAddCatalog(item)}
+                        className="ring-focus accent-grad flex shrink-0 items-center gap-1 rounded-lg px-3 py-1.5 text-[12.5px] font-semibold text-[#0d0820] transition-transform active:scale-[0.96]"
+                      >
+                        <Plus size={13} weight="bold" /> Add
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
-              {results.length === 0 && (
+              {!manage && results.length === 0 && (
                 <p className="px-1 py-6 text-center text-[13px] text-ink-faint">
                   No catalog match. Paste the GitHub URL above to add it anyway.
+                </p>
+              )}
+              {manage && catalog.length === 0 && (
+                <p className="px-1 py-6 text-center text-[13px] text-ink-faint">
+                  Your catalog is empty. Paste a GitHub URL above to add a mod.
                 </p>
               )}
             </div>

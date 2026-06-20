@@ -72,7 +72,7 @@ fn live_end_to_end_reactor_install() {
         std::fs::write(&dl, &bytes).unwrap();
         profile::install_plugin_dll(profiles_root, "live", &dl).unwrap()
     } else {
-        let installed = profile::install_from_zip(profiles_root, "live", &bytes).unwrap();
+        let installed = profile::install_from_zip(profiles_root, "live", &bytes, None).unwrap();
         assert!(!installed.is_empty(), "zip should contain a plugin dll");
         loader::profile_plugins_dir(profiles_root, "live").join(&installed[0])
     };
@@ -100,6 +100,7 @@ fn live_end_to_end_reactor_install() {
                 managed: true,
                 update: None,
                 file: Some("Reactor.dll".into()),
+                asset: Some("Reactor.dll".into()),
             }],
         })
         .unwrap();

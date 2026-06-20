@@ -11,8 +11,8 @@ use perfect_sync_core::preview::{preview, Preview};
 use perfect_sync_core::profile::{InstalledMod, ProfileRecord, ProfileStore};
 use perfect_sync_core::resolver::{Http, Release, ResolvedDownload, UreqHttp};
 use perfect_sync_core::types::{Arch, ModSource, ModTag};
-use perfect_sync_core::{codec, deps, game, loader, process, profile, resolver};
-use serde::Serialize;
+use perfect_sync_core::{codec, game, loader, process, profile, resolver};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -84,6 +84,7 @@ fn install_resolved(
     profile_id: &str,
     http: &dyn Http,
     resolved: &ResolvedDownload,
+    only: Option<&str>,
 ) -> Result<Option<String>, String> {
     let bytes = http.get_bytes(&resolved.url).map_err(|e| e.to_string())?;
     if resolved.asset_name.to_lowercase().ends_with(".dll") {
@@ -91,7 +92,7 @@ fn install_resolved(
             .map_err(|e| e.to_string())?;
         Ok(Some(resolved.asset_name.clone()))
     } else {
-        let installed = profile::install_from_zip(profiles_root, profile_id, &bytes)
+        let installed = profile::install_from_zip(profiles_root, profile_id, &bytes, only)
             .map_err(|e| e.to_string())?;
         Ok(installed.into_iter().next())
     }
@@ -199,7 +200,7 @@ pub fn game_running() -> bool {
 
 // ---------- catalog ----------
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CatalogListItem {
     pub id: String,
     pub name: String,
@@ -209,8 +210,18 @@ pub struct CatalogListItem {
     pub latest: String,
 }
 
-#[tauri::command]
-pub fn get_catalog() -> Vec<CatalogListItem> {
+fn display_catalog() -> Vec<CatalogListItem> {
+    if let Ok(text) = fs::read_to_string(settings::user_catalog_path()) {
+        if let Ok(list) = serde_json::from_str::<Vec<CatalogListItem>>(&text) {
+            return list;
+        }
+    }
+    let seeded = seed_display_catalog();
+    let _ = save_display_catalog(&seeded);
+    seeded
+}
+
+fn seed_display_catalog() -> Vec<CatalogListItem> {
     catalog()
         .mods
         .into_iter()
@@ -223,6 +234,69 @@ pub fn get_catalog() -> Vec<CatalogListItem> {
             latest: String::new(),
         })
         .collect()
+}
+
+fn save_display_catalog(list: &[CatalogListItem]) -> Result<(), String> {
+    fs::create_dir_all(settings::app_data_dir()).map_err(|e| e.to_string())?;
+    let text = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
+    fs::write(settings::user_catalog_path(), text).map_err(|e| e.to_string())
+}
+
+fn ensure_display_catalog(repo: &str, name: &str, summary: String, tags: Vec<ModTag>) {
+    let mut list = display_catalog();
+    if !list.iter().any(|c| c.id == repo) {
+        list.push(CatalogListItem {
+            id: repo.to_string(),
+            name: name.to_string(),
+            repo: repo.to_string(),
+            summary,
+            tags,
+            latest: String::new(),
+        });
+        let _ = save_display_catalog(&list);
+    }
+}
+
+#[tauri::command]
+pub fn get_catalog() -> Vec<CatalogListItem> {
+    display_catalog()
+}
+
+#[tauri::command]
+pub fn add_catalog_mod(repo: String, name: Option<String>) -> Result<Vec<CatalogListItem>, String> {
+    let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
+    let entry = catalog().get(&repo).cloned();
+    let display_name = name
+        .or_else(|| entry.as_ref().map(|e| e.name.clone()))
+        .unwrap_or_else(|| repo.clone());
+    let summary = entry.as_ref().map(|e| e.summary.clone()).unwrap_or_default();
+    let tags = entry.map(|e| e.tags).unwrap_or_default();
+    ensure_display_catalog(&repo, &display_name, summary, tags);
+    Ok(display_catalog())
+}
+
+#[tauri::command]
+pub fn remove_catalog_mod(id: String) -> Result<Vec<CatalogListItem>, String> {
+    let mut list = display_catalog();
+    list.retain(|c| c.id != id);
+    save_display_catalog(&list)?;
+    Ok(list)
+}
+
+#[tauri::command]
+pub fn reorder_catalog(ids: Vec<String>) -> Result<Vec<CatalogListItem>, String> {
+    let current = display_catalog();
+    let mut out: Vec<CatalogListItem> = ids
+        .iter()
+        .filter_map(|id| current.iter().find(|c| &c.id == id).cloned())
+        .collect();
+    for c in &current {
+        if !out.iter().any(|r| r.id == c.id) {
+            out.push(c.clone());
+        }
+    }
+    save_display_catalog(&out)?;
+    Ok(out)
 }
 
 #[tauri::command]
@@ -244,7 +318,26 @@ pub async fn refresh_catalog() -> Result<usize, String> {
 
 #[tauri::command]
 pub fn list_profiles() -> Vec<ProfileRecord> {
-    store().list()
+    let store = store();
+    let root = settings::profiles_root();
+    let mut profiles = store.list();
+    for rec in &mut profiles {
+        let stale: Vec<String> = rec
+            .mods
+            .iter()
+            .filter(|m| m.managed && m.asset.is_none())
+            .filter_map(|m| m.file.clone())
+            .collect();
+        let before = rec.mods.len();
+        rec.mods.retain(|m| !(m.managed && m.asset.is_none()));
+        if rec.mods.len() != before {
+            for f in &stale {
+                let _ = profile::remove_plugin(&root, &rec.id, f);
+            }
+            let _ = store.save(rec);
+        }
+    }
+    profiles
 }
 
 #[tauri::command]
@@ -319,7 +412,7 @@ fn install_asset_impl(
     };
     let cat = catalog();
     let entry = cat.get(&repo);
-    let file = install_resolved(&root, &profile_id, &h, &resolved)?;
+    let file = install_resolved(&root, &profile_id, &h, &resolved, entry.and_then(|e| e.asset_rules.dll_name.as_deref()))?;
 
     if let Some(pos) = rec.mods.iter().position(|m| m.package_id == repo) {
         if let Some(old) = rec.mods[pos].file.clone() {
@@ -329,6 +422,7 @@ fn install_asset_impl(
         }
         rec.mods[pos].version = rel.tag.clone();
         rec.mods[pos].file = file;
+        rec.mods[pos].asset = Some(resolved.asset_name.clone());
         if !rec.mods[pos].versions.contains(&rel.tag) {
             rec.mods[pos].versions.insert(0, rel.tag.clone());
         }
@@ -346,38 +440,7 @@ fn install_asset_impl(
             managed: false,
             update: None,
             file,
-        });
-    }
-
-    // auto-install this mod's catalog dependencies (Reactor/MiraAPI/etc.)
-    for dep in deps::resolve(&cat, &[repo.clone()]).ordered {
-        if dep == repo || rec.mods.iter().any(|m| m.package_id == dep) {
-            continue;
-        }
-        let dentry = cat.get(&dep);
-        let dep_repo = dentry
-            .and_then(|e| e.repo.clone())
-            .or_else(|| resolver::parse_repo(&dep))
-            .unwrap_or_else(|| dep.clone());
-        let rules = dentry.map(|e| e.asset_rules.clone()).unwrap_or_else(default_rules);
-        let tags = dentry.map(|e| e.tags.clone()).unwrap_or_default();
-        let name = dentry.map(|e| e.name.clone()).unwrap_or_else(|| dep.clone());
-        let Ok(resolved) = resolver::resolve_latest(&h, &dep_repo, &rules, &arch) else {
-            continue;
-        };
-        let dfile = install_resolved(&root, &profile_id, &h, &resolved)?;
-        rec.mods.push(InstalledMod {
-            package_id: dep,
-            name,
-            repo: Some(dep_repo),
-            version: resolved.version.clone(),
-            versions: vec![resolved.version],
-            enabled: true,
-            source: ModSource::Github,
-            tags,
-            managed: true,
-            update: None,
-            file: dfile,
+            asset: Some(resolved.asset_name.clone()),
         });
     }
 
@@ -385,6 +448,12 @@ fn install_asset_impl(
         let _ = ensure_loader_impl(&gp, &profile_id, &arch);
     }
     store.save(&rec).map_err(|e| e.to_string())?;
+    ensure_display_catalog(
+        &repo,
+        entry.map(|e| e.name.as_str()).unwrap_or(repo.as_str()),
+        entry.map(|e| e.summary.clone()).unwrap_or_default(),
+        entry.map(|e| e.tags.clone()).unwrap_or_default(),
+    );
     Ok(rec)
 }
 
@@ -419,7 +488,7 @@ fn add_mod_impl(profile_id: String, repo: String, arch: String) -> Result<Profil
     }
 
     rec.mods.retain(|m| m.package_id != repo);
-    let ordered = deps::resolve(&cat, &[repo.clone()]).ordered;
+    let ordered = vec![repo.clone()];
     for id in ordered {
         if rec.mods.iter().any(|m| m.package_id == id) {
             continue;
@@ -434,7 +503,7 @@ fn add_mod_impl(profile_id: String, repo: String, arch: String) -> Result<Profil
         let name = entry.map(|e| e.name.clone()).unwrap_or_else(|| id.clone());
         let resolved =
             resolver::resolve_latest(&http, &id_repo, &rules, &arch).map_err(|e| e.to_string())?;
-        let file = install_resolved(&root, &profile_id, &http, &resolved)?;
+        let file = install_resolved(&root, &profile_id, &http, &resolved, rules.dll_name.as_deref())?;
         let managed = id != repo && tags.iter().any(|t| matches!(t, ModTag::Library | ModTag::Loader));
         rec.mods.push(InstalledMod {
             package_id: id,
@@ -448,6 +517,7 @@ fn add_mod_impl(profile_id: String, repo: String, arch: String) -> Result<Profil
             managed,
             update: None,
             file,
+            asset: Some(resolved.asset_name.clone()),
         });
     }
 
@@ -523,9 +593,10 @@ fn set_mod_version_impl(
     if let Some(old) = rec.mods[pos].file.clone() {
         let _ = profile::remove_plugin(&root, &profile_id, &old);
     }
-    let file = install_resolved(&root, &profile_id, &http, &resolved)?;
+    let file = install_resolved(&root, &profile_id, &http, &resolved, rules.dll_name.as_deref())?;
     rec.mods[pos].version = resolved.version.clone();
     rec.mods[pos].file = file;
+    rec.mods[pos].asset = Some(resolved.asset_name.clone());
     if !rec.mods[pos].versions.contains(&resolved.version) {
         rec.mods[pos].versions.push(resolved.version.clone());
     }
@@ -594,7 +665,7 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
         } else {
             resolver::resolve_tag(&http, &repo, &mm.v, &rules, &arch).map_err(|e| e.to_string())?
         };
-        let file = install_resolved(&root, &id, &http, &resolved)?;
+        let file = install_resolved(&root, &id, &http, &resolved, rules.dll_name.as_deref())?;
         let managed = tags.iter().any(|t| matches!(t, ModTag::Library | ModTag::Loader));
         mods.push(InstalledMod {
             package_id: mm.id.clone(),
@@ -608,39 +679,7 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
             managed,
             update: None,
             file,
-        });
-    }
-
-    // re-resolve dependencies (kept out of the code to keep it short)
-    let chosen: Vec<String> = manifest.mods.iter().map(|m| m.id.clone()).collect();
-    for dep in deps::resolve(&cat, &chosen).ordered {
-        if mods.iter().any(|m| m.package_id == dep) {
-            continue;
-        }
-        let dentry = cat.get(&dep);
-        let dep_repo = dentry
-            .and_then(|e| e.repo.clone())
-            .or_else(|| resolver::parse_repo(&dep))
-            .unwrap_or_else(|| dep.clone());
-        let rules = dentry.map(|e| e.asset_rules.clone()).unwrap_or_else(default_rules);
-        let tags = dentry.map(|e| e.tags.clone()).unwrap_or_default();
-        let dname = dentry.map(|e| e.name.clone()).unwrap_or_else(|| dep.clone());
-        let Ok(resolved) = resolver::resolve_latest(&http, &dep_repo, &rules, &arch) else {
-            continue;
-        };
-        let file = install_resolved(&root, &id, &http, &resolved)?;
-        mods.push(InstalledMod {
-            package_id: dep,
-            name: dname,
-            repo: Some(dep_repo),
-            version: resolved.version.clone(),
-            versions: vec![resolved.version],
-            enabled: true,
-            source: ModSource::Github,
-            tags,
-            managed: true,
-            update: None,
-            file,
+            asset: Some(resolved.asset_name.clone()),
         });
     }
 
@@ -662,7 +701,7 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
             version: rel.tag.clone(),
             size: asset.size,
         };
-        let file = install_resolved(&root, &id, &http, &resolved)?;
+        let file = install_resolved(&root, &id, &http, &resolved, cat.get(&prepo).and_then(|e| e.asset_rules.dll_name.as_deref()))?;
         let entry = cat.get(&prepo);
         mods.push(InstalledMod {
             package_id: prepo.clone(),
@@ -676,6 +715,7 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
             managed: false,
             update: None,
             file,
+            asset: Some(resolved.asset_name.clone()),
         });
     }
 

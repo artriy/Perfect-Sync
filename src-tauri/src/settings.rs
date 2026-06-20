@@ -38,6 +38,10 @@ pub fn catalog_cache_path() -> PathBuf {
     app_data_dir().join("catalog.json")
 }
 
+pub fn user_catalog_path() -> PathBuf {
+    app_data_dir().join("user_catalog.json")
+}
+
 pub fn app_data_dir() -> PathBuf {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(base).join("Perfect-Sync")

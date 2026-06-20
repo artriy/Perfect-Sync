@@ -81,6 +81,26 @@ export async function refreshCatalog(): Promise<number> {
   return CATALOG.length;
 }
 
+/** Add a custom repo to the persistent catalog (returns the updated list). */
+export async function addCatalogMod(list: CatalogItem[], repo: string, name: string): Promise<CatalogItem[]> {
+  if (inTauri) return invoke<CatalogItem[]>("add_catalog_mod", { repo, name });
+  if (list.some((c) => c.id === repo)) return list;
+  return [...list, { id: repo, name, repo, summary: "", tags: [], latest: "" }];
+}
+
+/** Remove a mod from the persistent catalog (returns the updated list). */
+export async function removeCatalogMod(list: CatalogItem[], id: string): Promise<CatalogItem[]> {
+  if (inTauri) return invoke<CatalogItem[]>("remove_catalog_mod", { id });
+  return list.filter((c) => c.id !== id);
+}
+
+/** Persist a new catalog order (returns the updated list). */
+export async function reorderCatalog(list: CatalogItem[], ids: string[]): Promise<CatalogItem[]> {
+  if (inTauri) return invoke<CatalogItem[]>("reorder_catalog", { ids });
+  const byId = new Map(list.map((c) => [c.id, c] as const));
+  return ids.map((id) => byId.get(id)).filter((c): c is CatalogItem => !!c);
+}
+
 // ---------------------------------------------------------------- detection
 export async function detectGames(): Promise<GameInstall[]> {
   if (inTauri) return invoke<GameInstall[]>("detect_games");
@@ -195,4 +215,43 @@ export async function reinstallLoader(gamePath: string, profileId: string, arch:
 
 export async function launchProfile(gamePath: string, profileId: string): Promise<void> {
   if (inTauri) await invoke("launch_profile", { gamePath, profileId });
+}
+
+// ----------------------------------------------------------- lobby sharing
+/** Custom URI scheme the Tauri shell registers for one-click lobby links. */
+export const LOBBY_SCHEME = "perfectsync";
+
+/** A clickable deep link that opens Perfect-Sync straight onto this lobby. */
+export function lobbyDeepLink(code: string): string {
+  return `${LOBBY_SCHEME}://lobby/${code}`;
+}
+
+export const LOBBY_WEB_BASE = "https://artriy.github.io/Perfect-Sync/";
+
+export function webLobbyLink(name: string, code: string): string {
+  const slug = name.trim() ? `?lobby=${encodeURIComponent(name.trim())}` : "";
+  return `${LOBBY_WEB_BASE}${slug}#${code}`;
+}
+
+/** Pull a PERFECT- code out of a raw code, a deep link, or a markdown link. */
+export function extractLobbyCode(input: string): string | null {
+  const m = input.match(/PERFECT-[A-Za-z0-9_-]+\.[0-9a-fA-F]{1,8}/);
+  return m ? m[0] : null;
+}
+
+/** Subscribe to incoming perfectsync:// links (cold start + while running). */
+export async function onLobbyLink(cb: (code: string) => void): Promise<(() => void) | void> {
+  if (!inTauri) return;
+  const dl = await import("@tauri-apps/plugin-deep-link");
+  try {
+    const initial = await dl.getCurrent();
+    const code = initial?.map(extractLobbyCode).find((c): c is string => !!c);
+    if (code) cb(code);
+  } catch (e) {
+    console.error("deep link getCurrent failed", e);
+  }
+  return dl.onOpenUrl((urls) => {
+    const code = urls.map(extractLobbyCode).find((c): c is string => !!c);
+    if (code) cb(code);
+  });
 }

@@ -33,6 +33,8 @@ pub struct InstalledMod {
     /// installed plugin file name, used to enable/disable/remove the mod
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub asset: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,13 +116,11 @@ pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
         mods: profile
             .mods
             .iter()
-            // only the user's chosen mods; dependencies are re-resolved on apply,
-            // which keeps the share code short
-            .filter(|m| m.enabled && !m.managed)
+            .filter(|m| m.enabled)
             .map(|m| ManifestMod {
                 id: m.package_id.clone(),
                 v: m.version.clone(),
-                asset: m.file.clone(),
+                asset: m.asset.clone(),
             })
             .collect(),
         loader: None,
@@ -167,7 +167,7 @@ pub fn remove_plugin(profiles_root: &Path, id: &str, file_name: &str) -> io::Res
 /// Extract every plugin `.dll` from a release zip into the profile's plugins
 /// dir. Handles both bare-dll-in-zip and `.../BepInEx/plugins/*.dll` bundles.
 /// Returns the installed plugin file names.
-pub fn install_from_zip(profiles_root: &Path, id: &str, bytes: &[u8]) -> io::Result<Vec<String>> {
+pub fn install_from_zip(profiles_root: &Path, id: &str, bytes: &[u8], only: Option<&str>) -> io::Result<Vec<String>> {
     let plugins = loader::profile_plugins_dir(profiles_root, id);
     fs::create_dir_all(&plugins)?;
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
@@ -190,6 +190,11 @@ pub fn install_from_zip(profiles_root: &Path, id: &str, bytes: &[u8]) -> io::Res
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| name.clone());
+        if let Some(want) = only {
+            if !base.eq_ignore_ascii_case(want) {
+                continue;
+            }
+        }
         let mut out = fs::File::create(plugins.join(&base))?;
         io::copy(&mut file, &mut out)?;
         installed.push(base);
@@ -239,6 +244,7 @@ mod tests {
                 managed: false,
                 update: None,
                 file: Some("TownOfUsMira.dll".into()),
+                asset: Some("TownOfUsMira.zip".into()),
             }],
         }
     }
@@ -282,6 +288,7 @@ mod tests {
             managed: false,
             update: None,
             file: None,
+            asset: None,
         });
         let manifest = to_manifest(&p);
         // disabled mod is excluded
@@ -291,6 +298,32 @@ mod tests {
         // survives a codec round-trip
         let code = crate::codec::encode(&manifest);
         assert_eq!(crate::codec::decode(&code).unwrap(), manifest);
+    }
+
+    #[test]
+    fn to_manifest_includes_enabled_libraries() {
+        // a library/dependency the host has enabled must be in the code verbatim,
+        // so the recipient reproduces the EXACT mod set (no re-resolution).
+        let mut p = sample_profile();
+        p.mods.push(InstalledMod {
+            package_id: "NuclearPowered/Reactor".into(),
+            name: "Reactor".into(),
+            repo: Some("NuclearPowered/Reactor".into()),
+            version: "2.3.0".into(),
+            versions: vec!["2.3.0".into()],
+            enabled: true,
+            source: ModSource::Github,
+            tags: vec![ModTag::Library],
+            managed: true,
+            update: None,
+            file: Some("Reactor.dll".into()),
+            asset: Some("Reactor.dll".into()),
+        });
+        let manifest = to_manifest(&p);
+        assert_eq!(manifest.mods.len(), 2);
+        let reactor = manifest.mods.iter().find(|m| m.id == "NuclearPowered/Reactor").unwrap();
+        assert_eq!(reactor.v, "2.3.0");
+        assert_eq!(reactor.asset.as_deref(), Some("Reactor.dll"));
     }
 
     #[test]
@@ -313,6 +346,7 @@ mod tests {
                 managed: false,
                 update: None,
                 file: Some("CoolMod.dll".into()),
+                asset: Some("CoolMod.dll".into()),
             }],
         };
         let m = to_manifest(&p);
@@ -350,11 +384,37 @@ mod tests {
             zw.finish().unwrap();
         }
         let tmp = tempfile::tempdir().unwrap();
-        let installed = install_from_zip(tmp.path(), "p1", &buf).unwrap();
+        let installed = install_from_zip(tmp.path(), "p1", &buf, None).unwrap();
         assert_eq!(installed, vec!["TheOtherRoles.dll".to_string()]);
         assert!(loader::profile_plugins_dir(tmp.path(), "p1")
             .join("TheOtherRoles.dll")
             .exists());
+    }
+
+    #[test]
+    fn extracts_only_named_dll_when_filtered() {
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            use std::io::Write;
+            for n in [
+                "BepInEx/plugins/TownOfUsMira.dll",
+                "BepInEx/plugins/Reactor.dll",
+                "BepInEx/plugins/MiraAPI.dll",
+            ] {
+                zw.start_file(n, opts).unwrap();
+                zw.write_all(b"x").unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = install_from_zip(tmp.path(), "p1", &buf, Some("TownOfUsMira.dll")).unwrap();
+        assert_eq!(installed, vec!["TownOfUsMira.dll".to_string()]);
+        let plugins = loader::profile_plugins_dir(tmp.path(), "p1");
+        assert!(plugins.join("TownOfUsMira.dll").exists());
+        assert!(!plugins.join("Reactor.dll").exists());
+        assert!(!plugins.join("MiraAPI.dll").exists());
     }
 
     #[test]

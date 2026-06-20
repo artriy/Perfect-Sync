@@ -6,6 +6,7 @@ import { LobbyCodeModal } from "./components/LobbyCodeModal";
 import { AddModPanel } from "./components/AddModPanel";
 import { SettingsModal } from "./components/SettingsModal";
 import { ReleasePicker } from "./components/ReleasePicker";
+import { ShareModal } from "./components/ShareModal";
 import { Toast, type ToastState } from "./components/Toast";
 import * as bridge from "./lib/bridge";
 import { CATALOG, SAMPLE_DIFF } from "./data/mock";
@@ -29,6 +30,7 @@ export function App() {
   const [lobbyOpen, setLobbyOpen] = useState(false);
   const [lobbyCode, setLobbyCode] = useState<string | undefined>(undefined);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
   const [pickerTarget, setPickerTarget] = useState<{
     repo: string;
     name: string;
@@ -74,6 +76,20 @@ export function App() {
       notify(String(e));
       setLoaded(true);
     });
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    bridge
+      .onLobbyLink((code) => {
+        setLobbyCode(code);
+        setLobbyOpen(true);
+      })
+      .then((u) => {
+        if (typeof u === "function") unlisten = u;
+      })
+      .catch(() => {});
+    return () => unlisten?.();
   }, []);
 
   const arch: Arch = game?.arch ?? settings.arch ?? "x86";
@@ -258,6 +274,7 @@ export function App() {
       patchProfile(await bridge.installAsset(active, target.repo, tag, assetName, arch));
       notify(`Installed ${assetName}`);
       await ensureLoader(active.id);
+      bridge.loadCatalog().then(setCatalog).catch(() => {});
     } catch (e) {
       notify(String(e));
     } finally {
@@ -265,11 +282,22 @@ export function App() {
     }
   };
 
-  const copyCode = async () => {
+  const removeCatalogItem = async (id: string) => {
     try {
-      const code = await bridge.encodeLobbyCode(active);
-      await navigator.clipboard?.writeText(code);
-      notify("Lobby code copied to clipboard");
+      setCatalog(await bridge.removeCatalogMod(catalog, id));
+    } catch (e) {
+      notify(String(e));
+    }
+  };
+
+  const moveCatalogItem = async (id: string, dir: "up" | "down") => {
+    const ids = catalog.map((c) => c.id);
+    const i = ids.indexOf(id);
+    const j = dir === "up" ? i - 1 : i + 1;
+    if (i < 0 || j < 0 || j >= ids.length) return;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    try {
+      setCatalog(await bridge.reorderCatalog(catalog, ids));
     } catch (e) {
       notify(String(e));
     }
@@ -362,7 +390,7 @@ export function App() {
             onToggle={toggleMod}
             onRemove={removeMod}
             onPickRelease={openPicker}
-            onCopyCode={copyCode}
+            onShare={() => setShareOpen(true)}
             onRename={renameProfile}
             onDelete={deleteActiveProfile}
             onLaunch={() => doLaunchProfile(active)}
@@ -378,6 +406,8 @@ export function App() {
         onClose={() => setAddOpen(false)}
         onAddCatalog={addCatalog}
         onAddUrl={addUrl}
+        onRemoveCatalog={removeCatalogItem}
+        onMoveCatalog={moveCatalogItem}
       />
       <LobbyCodeModal
         open={lobbyOpen}
@@ -403,6 +433,11 @@ export function App() {
         busy={busyModId !== null}
         onClose={() => setPickerTarget(null)}
         onPick={pickRelease}
+      />
+      <ShareModal
+        open={shareOpen}
+        profile={active}
+        onClose={() => setShareOpen(false)}
       />
       <Toast toast={toast} />
     </div>

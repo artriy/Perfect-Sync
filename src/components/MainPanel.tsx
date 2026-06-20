@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { Copy, DotsThree, PencilSimple, PlusCircle, Stack, TrashSimple } from "@phosphor-icons/react";
+import { DotsThree, PencilSimple, PlusCircle, ShareNetwork, Stack, TrashSimple } from "@phosphor-icons/react";
 import { ModRow } from "./ModRow";
 import { LaunchBar } from "./LaunchBar";
 import type { GameStatus, Profile } from "../lib/types";
@@ -12,7 +12,7 @@ interface MainPanelProps {
   onToggle: (modId: string) => void;
   onRemove: (modId: string) => void;
   onPickRelease: (modId: string) => void;
-  onCopyCode: () => void;
+  onShare: () => void;
   onRename: (name: string) => void;
   onDelete: () => void;
   onLaunch: () => void;
@@ -87,10 +87,10 @@ export function MainPanel(props: MainPanelProps) {
 
         <button
           type="button"
-          onClick={props.onCopyCode}
+          onClick={props.onShare}
           className="ring-focus glass flex items-center gap-1.5 rounded-xl px-3 py-2 text-[13px] text-ink-dim transition-colors hover:text-ink"
         >
-          <Copy size={15} /> Copy lobby code
+          <ShareNetwork size={15} /> Share lobby
         </button>
         <div className="relative" ref={menuRef}>
           <button

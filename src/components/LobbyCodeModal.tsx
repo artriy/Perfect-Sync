@@ -11,7 +11,7 @@ import {
 } from "@phosphor-icons/react";
 import { Pill, primaryTag } from "./Pill";
 import type { DiffItem } from "../lib/types";
-import { previewCode } from "../lib/bridge";
+import { extractLobbyCode, previewCode } from "../lib/bridge";
 
 type Mode = "input" | "decoding" | "diff";
 
@@ -67,8 +67,10 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
   }, [open, onClose]);
 
   const decode = () => {
-    if (!code.trim()) return;
-    runDecode(code);
+    const c = extractLobbyCode(code);
+    if (!c) return;
+    setCode(c);
+    runDecode(c);
   };
 
   return (
@@ -142,7 +144,7 @@ function InputStep({
   setCode: (v: string) => void;
   onDecode: () => void;
 }) {
-  const valid = code.trim().toUpperCase().startsWith("PERFECT-");
+  const valid = extractLobbyCode(code) != null;
   return (
     <>
       <textarea

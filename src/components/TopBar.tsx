@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { GearSix, MagnifyingGlass, Minus, Plus, Square, X } from "@phosphor-icons/react";
-import { winClose, winMinimize, winToggleMaximize } from "../lib/bridge";
+import { extractLobbyCode, winClose, winMinimize, winToggleMaximize } from "../lib/bridge";
 import type { GameStatus } from "../lib/types";
 
 interface TopBarProps {
@@ -14,8 +14,9 @@ export function TopBar({ game, onAddMod, onPasteCode, onOpenSettings }: TopBarPr
   const [q, setQ] = useState("");
 
   const submit = () => {
-    if (q.trim().toUpperCase().startsWith("PERFECT-")) {
-      onPasteCode(q.trim());
+    const code = extractLobbyCode(q);
+    if (code) {
+      onPasteCode(code);
       setQ("");
     }
   };
