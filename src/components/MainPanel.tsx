@@ -3,7 +3,7 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { DotsThree, PencilSimple, PlusCircle, ShareNetwork, Stack, TrashSimple } from "@phosphor-icons/react";
 import { ModRow } from "./ModRow";
 import { LaunchBar } from "./LaunchBar";
-import type { GameStatus, Profile } from "../lib/types";
+import type { GameStatus, Profile, Trust } from "../lib/types";
 
 interface MainPanelProps {
   profile: Profile;
@@ -17,6 +17,7 @@ interface MainPanelProps {
   onDelete: () => void;
   onLaunch: () => void;
   onAddMod: () => void;
+  trustOf: (id: string) => Trust;
 }
 
 export function MainPanel(props: MainPanelProps) {
@@ -151,6 +152,7 @@ export function MainPanel(props: MainPanelProps) {
             <ModRow
               key={mod.packageId}
               mod={mod}
+              trust={props.trustOf(mod.packageId)}
               busy={busyModId === mod.packageId}
               onToggle={() => props.onToggle(mod.packageId)}
               onRemove={() => props.onRemove(mod.packageId)}

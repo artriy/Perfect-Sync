@@ -9,9 +9,9 @@ import { ReleasePicker } from "./components/ReleasePicker";
 import { ShareModal } from "./components/ShareModal";
 import { Toast, type ToastState } from "./components/Toast";
 import * as bridge from "./lib/bridge";
-import { CATALOG, SAMPLE_DIFF } from "./data/mock";
+import { CATALOG } from "./data/mock";
 import { CREW } from "./lib/palette";
-import type { Arch, CatalogItem, GameInstall, Profile, ProfileMod, Settings } from "./lib/types";
+import type { Arch, CatalogItem, GameInstall, Profile, ProfileMod, Settings, Trust } from "./lib/types";
 
 const CREW_CYCLE = Object.values(CREW);
 
@@ -24,7 +24,7 @@ export function App() {
 
   const [game, setGame] = useState<GameInstall | null>(null);
   const [settings, setSettings] = useState<Settings>({});
-  const [catalog, setCatalog] = useState<CatalogItem[]>(CATALOG);
+  const [catalog, setCatalog] = useState<CatalogItem[]>([]);
 
   const [addOpen, setAddOpen] = useState(false);
   const [lobbyOpen, setLobbyOpen] = useState(false);
@@ -39,10 +39,10 @@ export function App() {
 
   const [toast, setToast] = useState<ToastState | null>(null);
   const toastId = useRef(0);
-  const notify = (msg: string) => {
+  const notify = (msg: string, kind: "success" | "error" = "success") => {
     toastId.current += 1;
     const id = toastId.current;
-    setToast({ id, msg });
+    setToast({ id, msg, kind });
     setTimeout(() => setToast((t) => (t?.id === id ? null : t)), 2600);
   };
 
@@ -65,7 +65,8 @@ export function App() {
       setProfiles(list);
       setActiveId(list[0].id);
       setLoaded(true);
-      // best-effort: pull the hosted catalog, then show it
+      // show the cached catalog right away, then refresh from the hosted copy
+      bridge.loadCatalog().then(setCatalog).catch(() => {});
       bridge
         .refreshCatalog()
         .catch(() => {})
@@ -73,7 +74,7 @@ export function App() {
         .then(setCatalog)
         .catch(() => {});
     })().catch((e) => {
-      notify(String(e));
+      notify(String(e), "error");
       setLoaded(true);
     });
   }, []);
@@ -109,18 +110,22 @@ export function App() {
   const patchProfile = (updated: Profile) =>
     setProfiles((ps) => ps.map((p) => (p.id === updated.id ? updated : p)));
 
+  // a mod's vetting tier, resolved against the (bundled-authoritative) catalog
+  const trustOf = (id: string): Trust =>
+    catalog.find((c) => c.id === id || c.repo === id)?.trust ?? "flagged";
+
   // Install/verify the BepInEx loader for a profile, surfacing any failure.
   const ensureLoader = async (profileId: string) => {
     if (!bridge.inTauri) return;
     const gamePath = game?.path ?? settings.gamePath;
     if (!gamePath) {
-      notify("Set your Among Us folder in Settings so BepInEx can install.");
+      notify("Set your Among Us folder in Settings so BepInEx can install.", "error");
       return;
     }
     try {
       await bridge.ensureLoader(gamePath, profileId, arch);
     } catch (e) {
-      notify(`BepInEx setup failed: ${e}`);
+      notify(`BepInEx setup failed: ${e}`, "error");
     }
   };
 
@@ -132,7 +137,7 @@ export function App() {
     try {
       patchProfile(await bridge.setModEnabled(active, modId, !mod.enabled));
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
@@ -142,7 +147,7 @@ export function App() {
       patchProfile(await bridge.removeMod(active, modId));
       notify(`Removed ${name}`);
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
@@ -160,18 +165,18 @@ export function App() {
     try {
       await bridge.saveProfile(profile);
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
   // adding a mod opens the release/file picker so the user chooses the exact dll
   const addCatalog = (item: CatalogItem) => {
     if (active.mods.some((m) => m.packageId === item.id)) {
-      notify(`${item.name} is already in this profile`);
+      notify(`${item.name} is already in this profile`, "error");
       return;
     }
     if (item.tags.includes("role") && hasRoleMod(active.mods)) {
-      notify("Only one role mod per profile. Remove the current one first.");
+      notify("Only one role mod per profile. Remove the current one first.", "error");
       return;
     }
     setAddOpen(false);
@@ -183,7 +188,7 @@ export function App() {
     const repo = m ? `${m[1]}/${m[2]}` : url;
     const name = m ? m[2] : "Mod";
     if (active.mods.some((mod) => mod.packageId === repo)) {
-      notify(`${name} is already in this profile`);
+      notify(`${name} is already in this profile`, "error");
       return;
     }
     setAddOpen(false);
@@ -196,7 +201,7 @@ export function App() {
     try {
       await bridge.saveProfile(updated);
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
@@ -206,7 +211,7 @@ export function App() {
     try {
       await bridge.deleteProfile(id);
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
     const left = profiles.filter((p) => p.id !== id);
     if (left.length === 0) {
@@ -240,7 +245,7 @@ export function App() {
     try {
       await bridge.saveSettings(next);
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
@@ -255,7 +260,7 @@ export function App() {
     try {
       await bridge.saveSettings(next);
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
@@ -278,7 +283,7 @@ export function App() {
         await bridge.saveSettings(next);
         notify(`${target.name} will be added to every lobby you join`);
       } catch (e) {
-        notify(String(e));
+        notify(String(e), "error");
       }
       return;
     }
@@ -291,7 +296,7 @@ export function App() {
       await ensureLoader(active.id);
       bridge.loadCatalog().then(setCatalog).catch(() => {});
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     } finally {
       setBusyModId(null);
     }
@@ -301,7 +306,7 @@ export function App() {
     try {
       setCatalog(await bridge.removeCatalogMod(catalog, id));
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
@@ -314,14 +319,14 @@ export function App() {
     try {
       setCatalog(await bridge.reorderCatalog(catalog, ids));
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
   const doLaunchProfile = async (p: Profile) => {
     const gamePath = game?.path ?? settings.gamePath;
     if (bridge.inTauri && !gamePath) {
-      notify("No game detected. Set the game path in Settings.");
+      notify("No game detected. Set the game path in Settings.", "error");
       return;
     }
     try {
@@ -331,7 +336,7 @@ export function App() {
       if (!bridge.inTauri) setTimeout(() => setRunning(false), 2800);
     } catch (e) {
       setRunning(false);
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
@@ -355,7 +360,7 @@ export function App() {
       if (doLaunch) await doLaunchProfile(built);
       else notify(`Lobby profile ready: ${built.name}`);
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
@@ -366,7 +371,7 @@ export function App() {
       await bridge.saveSettings(s);
       notify("Settings saved");
     } catch (e) {
-      notify(String(e));
+      notify(String(e), "error");
     }
   };
 
@@ -402,6 +407,7 @@ export function App() {
             profile={active}
             game={gameStatus}
             busyModId={busyModId}
+            trustOf={trustOf}
             onToggle={toggleMod}
             onRemove={removeMod}
             onPickRelease={openPicker}
@@ -427,7 +433,8 @@ export function App() {
       <LobbyCodeModal
         open={lobbyOpen}
         initialCode={lobbyCode}
-        diff={SAMPLE_DIFF}
+        installed={active.mods.map((m) => [m.packageId, m.version] as [string, string])}
+        trustOf={trustOf}
         personalMods={settings.personalMods ?? []}
         onClose={() => setLobbyOpen(false)}
         onApply={applyLobby}
@@ -442,6 +449,7 @@ export function App() {
         onAddPersonal={addPersonal}
         onRemovePersonal={removePersonal}
         onTogglePersonal={togglePersonal}
+        trustOf={trustOf}
       />
       <ReleasePicker
         open={pickerTarget !== null}

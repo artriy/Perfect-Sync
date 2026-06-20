@@ -82,39 +82,44 @@ export function ReleasePicker({ open, repo, modName, busy, onClose, onPick }: Re
             <div className="scroll-region mt-4 flex-1 overflow-y-auto pr-1">
               {loading && <p className="py-8 text-center text-[13px] text-ink-faint">Loading releases…</p>}
               {err && <p className="py-8 text-center text-[13px] text-[#ff8a8a]">{err}</p>}
-              {!loading && !err && releases.length === 0 && (
-                <p className="py-8 text-center text-[13px] text-ink-faint">
-                  No releases with downloadable files found for this repo.
-                </p>
-              )}
               {!loading &&
-                releases.map((rel) => (
-                  <div key={rel.tag_name} className="mb-3">
-                    <div className="mb-1.5 flex items-center gap-2 px-1">
-                      <span className="font-mono text-[12.5px] text-ink">{rel.tag_name}</span>
-                      <div className="h-px flex-1 bg-white/10" />
+                !err &&
+                !releases.some((r) => r.assets.some((a) => a.name.toLowerCase().endsWith(".dll"))) && (
+                  <p className="py-8 text-center text-[13px] text-ink-faint">
+                    No .dll files in this repo's releases. Zips and source archives are hidden.
+                  </p>
+                )}
+              {!loading &&
+                releases
+                  .map((rel) => ({
+                    rel,
+                    dlls: rel.assets.filter((a) => a.name.toLowerCase().endsWith(".dll")),
+                  }))
+                  .filter(({ dlls }) => dlls.length > 0)
+                  .map(({ rel, dlls }) => (
+                    <div key={rel.tag_name} className="mb-3">
+                      <div className="mb-1.5 flex items-center gap-2 px-1">
+                        <span className="font-mono text-[12.5px] text-ink">{rel.tag_name}</span>
+                        <div className="h-px flex-1 bg-white/10" />
+                      </div>
+                      <div className="flex flex-col gap-1.5">
+                        {dlls.map((a) => (
+                          <button
+                            key={a.name}
+                            type="button"
+                            disabled={busy}
+                            onClick={() => onPick(rel.tag_name, a.name)}
+                            className="ring-focus glass flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-left hover:bg-white/10 disabled:opacity-50"
+                          >
+                            <FileArrowDown size={16} className="shrink-0 text-ink-dim" />
+                            <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">{a.name}</span>
+                            <span className="text-[11.5px] text-ink-faint">{mb(a.size)}</span>
+                            <DownloadSimple size={14} className="text-[#9b7bff]" />
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                    {rel.assets.length === 0 && (
-                      <p className="px-1 text-[12px] text-ink-faint">no attached files (source only)</p>
-                    )}
-                    <div className="flex flex-col gap-1.5">
-                      {rel.assets.map((a) => (
-                        <button
-                          key={a.name}
-                          type="button"
-                          disabled={busy}
-                          onClick={() => onPick(rel.tag_name, a.name)}
-                          className="ring-focus glass flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-left hover:bg-white/10 disabled:opacity-50"
-                        >
-                          <FileArrowDown size={16} className="shrink-0 text-ink-dim" />
-                          <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">{a.name}</span>
-                          <span className="text-[11.5px] text-ink-faint">{mb(a.size)}</span>
-                          <DownloadSimple size={14} className="text-[#9b7bff]" />
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ))}
+                  ))}
             </div>
           </motion.div>
         </motion.div>

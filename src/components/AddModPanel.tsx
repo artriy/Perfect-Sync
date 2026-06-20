@@ -2,6 +2,7 @@ import { useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { CaretDown, CaretUp, GithubLogo, MagnifyingGlass, Plus, TrashSimple, X } from "@phosphor-icons/react";
 import { Pill, primaryTag } from "./Pill";
+import { TrustBadge } from "./TrustBadge";
 import type { CatalogItem } from "../lib/types";
 
 interface AddModPanelProps {
@@ -119,6 +120,7 @@ export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog,
                   <div className="flex items-center gap-2">
                     <span className="min-w-0 truncate text-[14.5px] font-semibold text-ink">{item.name}</span>
                     {item.tags.length > 0 && <Pill tag={primaryTag(item.tags)} />}
+                    <TrustBadge trust={item.trust ?? "flagged"} />
                     {item.latest && (
                       <span className="ml-auto font-mono text-[12px] text-ink-faint">{item.latest}</span>
                     )}

@@ -54,6 +54,22 @@ pub struct UreqHttp {
     pub token: Option<String>,
 }
 
+const MAX_DOWNLOAD: u64 = 300 * 1024 * 1024;
+
+fn is_github_host(url: &str) -> bool {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let authority = after_scheme
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    let host = hostport.split(':').next().unwrap_or(hostport);
+    host == "api.github.com" || host == "github.com" || host.ends_with(".githubusercontent.com")
+}
+
 impl UreqHttp {
     pub fn new(token: Option<String>) -> Self {
         Self { token }
@@ -62,8 +78,8 @@ impl UreqHttp {
         // No GitHub-specific Accept header: Thunderstore (used for the BepInEx
         // pack) returns 406 for it. Default `*/*` works for both GitHub + TS.
         let mut r = ureq::get(url).set("User-Agent", "perfect-sync");
-        // only attach the GitHub token to GitHub requests (don't leak it elsewhere)
-        if url.contains("github") {
+        // only attach the GitHub token to real GitHub hosts (don't leak it elsewhere)
+        if is_github_host(url) {
             if let Some(t) = &self.token {
                 r = r.set("Authorization", &format!("Bearer {t}"));
             }
@@ -87,8 +103,12 @@ impl Http for UreqHttp {
             .map_err(|e| ResolveError::Http(e.to_string()))?;
         let mut buf = Vec::new();
         resp.into_reader()
+            .take(MAX_DOWNLOAD + 1)
             .read_to_end(&mut buf)
             .map_err(|e| ResolveError::Http(e.to_string()))?;
+        if buf.len() as u64 > MAX_DOWNLOAD {
+            return Err(ResolveError::Http("download too large".into()));
+        }
         Ok(buf)
     }
 }
@@ -268,6 +288,16 @@ mod tests {
         assert_eq!(parse_repo("https://github.com/AU-Avengers/TOU-Mira.git").as_deref(), Some("AU-Avengers/TOU-Mira"));
         assert_eq!(parse_repo("NuclearPowered/Reactor").as_deref(), Some("NuclearPowered/Reactor"));
         assert_eq!(parse_repo("not a repo"), None);
+    }
+
+    #[test]
+    fn is_github_host_allowlist() {
+        assert!(is_github_host("https://api.github.com/repos/x/y/releases"));
+        assert!(is_github_host("https://raw.githubusercontent.com/x/y/main/f.dll"));
+        assert!(is_github_host("https://github.com/x/y"));
+        assert!(!is_github_host("https://github.evil.com/x"));
+        assert!(!is_github_host("https://evilgithub.com/x"));
+        assert!(!is_github_host("https://evil.com/?x=github"));
     }
 
     #[test]

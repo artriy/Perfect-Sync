@@ -1,4 +1,4 @@
-use crate::types::ModTag;
+use crate::types::{ModTag, Trust};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -30,6 +30,8 @@ pub struct CatalogEntry {
     pub dependencies: Vec<String>,
     #[serde(rename = "assetRules")]
     pub asset_rules: AssetRules,
+    #[serde(default)]
+    pub trust: Trust,
 }
 
 /// Where the BepInEx engine comes from. GitHub's BepInEx releases lag behind

@@ -1,9 +1,10 @@
 import { AnimatePresence, motion } from "motion/react";
-import { CheckCircle } from "@phosphor-icons/react";
+import { CheckCircle, WarningCircle } from "@phosphor-icons/react";
 
 export interface ToastState {
   id: number;
   msg: string;
+  kind?: "success" | "error";
 }
 
 export function Toast({ toast }: { toast: ToastState | null }) {
@@ -18,7 +19,11 @@ export function Toast({ toast }: { toast: ToastState | null }) {
           transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
           className="glass-strong fixed bottom-6 left-1/2 z-[60] flex -translate-x-1/2 items-center gap-2 rounded-xl px-4 py-3 text-[13.5px] text-ink"
         >
-          <CheckCircle size={17} weight="fill" className="text-[#5be3b0]" />
+          {toast.kind === "error" ? (
+            <WarningCircle size={17} weight="fill" className="text-[#ff8a8a]" />
+          ) : (
+            <CheckCircle size={17} weight="fill" className="text-[#5be3b0]" />
+          )}
           {toast.msg}
         </motion.div>
       )}

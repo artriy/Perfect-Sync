@@ -1,7 +1,7 @@
 use crate::catalog::Catalog;
 use crate::codec::{decode, CodecError};
 use crate::diff::{diff, Action};
-use crate::types::ModTag;
+use crate::types::{ModTag, Trust};
 use serde::Serialize;
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -13,6 +13,7 @@ pub struct PreviewItem {
     pub from: Option<String>,
     pub to: String,
     pub detail: String,
+    pub trust: Trust,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -36,7 +37,7 @@ pub fn preview(code: &str, cat: &Catalog, installed: &[(String, String)]) -> Res
                 Action::Change => format!("you have {}, lobby needs {}", row.from.clone().unwrap_or_default(), row.to),
                 Action::Ok => format!("{}, already cached", row.to),
             };
-            PreviewItem { name, repo, tags, action: row.action, from: row.from, to: row.to, detail }
+            PreviewItem { name, repo, tags, action: row.action, from: row.from, to: row.to, detail, trust: entry.map(|e| e.trust).unwrap_or(Trust::Flagged) }
         })
         .collect();
     Ok(Preview {

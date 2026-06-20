@@ -13,7 +13,8 @@ import {
   XCircle,
 } from "@phosphor-icons/react";
 import { loaderStatus, pickFolder, reinstallLoader, type LoaderStatus } from "../lib/bridge";
-import type { Arch, GameInstall, Settings } from "../lib/types";
+import { TrustBadge } from "./TrustBadge";
+import type { Arch, GameInstall, Settings, Trust } from "../lib/types";
 
 interface SettingsModalProps {
   open: boolean;
@@ -25,6 +26,7 @@ interface SettingsModalProps {
   onAddPersonal: (repo: string, name: string) => void;
   onRemovePersonal: (repo: string) => void;
   onTogglePersonal: (repo: string, enabled: boolean) => void;
+  trustOf: (repo: string) => Trust;
 }
 
 export function SettingsModal({
@@ -37,6 +39,7 @@ export function SettingsModal({
   onAddPersonal,
   onRemovePersonal,
   onTogglePersonal,
+  trustOf,
 }: SettingsModalProps) {
   const reduce = useReducedMotion();
   const [token, setToken] = useState(settings.githubToken ?? "");
@@ -238,6 +241,7 @@ export function SettingsModal({
                     <span className={`min-w-0 flex-1 truncate ${on ? "text-ink" : "text-ink-faint"}`}>
                       {pm.name ?? pm.repo}
                     </span>
+                    <TrustBadge trust={trustOf(pm.repo)} compact />
                     <button
                       type="button"
                       onClick={() => onAddPersonal(pm.repo, pm.name ?? pm.repo)}

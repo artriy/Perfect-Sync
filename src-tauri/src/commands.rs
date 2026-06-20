@@ -10,7 +10,7 @@ use perfect_sync_core::catalog::{parse, AssetArchRule, AssetRules, Catalog};
 use perfect_sync_core::preview::{preview, Preview};
 use perfect_sync_core::profile::{InstalledMod, ProfileRecord, ProfileStore};
 use perfect_sync_core::resolver::{Http, Release, ResolvedDownload, UreqHttp};
-use perfect_sync_core::types::{Arch, ModSource, ModTag};
+use perfect_sync_core::types::{Arch, ModSource, ModTag, Trust};
 use perfect_sync_core::{codec, compat, game, loader, process, profile, resolver};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -240,17 +240,28 @@ pub struct CatalogListItem {
     pub summary: String,
     pub tags: Vec<ModTag>,
     pub latest: String,
+    #[serde(default)]
+    pub trust: Trust,
 }
 
 fn display_catalog() -> Vec<CatalogListItem> {
-    if let Ok(text) = fs::read_to_string(settings::user_catalog_path()) {
-        if let Ok(list) = serde_json::from_str::<Vec<CatalogListItem>>(&text) {
-            return list;
+    let mut list = match fs::read_to_string(settings::user_catalog_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Vec<CatalogListItem>>(&t).ok())
+    {
+        Some(list) => list,
+        None => {
+            let seeded = seed_display_catalog();
+            let _ = save_display_catalog(&seeded);
+            seeded
         }
+    };
+    // trust is authoritative from the bundled catalog, not the cache or hosted list
+    let bundled = bundled_catalog();
+    for it in &mut list {
+        it.trust = bundled.get(&it.id).map(|e| e.trust).unwrap_or(Trust::Flagged);
     }
-    let seeded = seed_display_catalog();
-    let _ = save_display_catalog(&seeded);
-    seeded
+    list
 }
 
 fn seed_display_catalog() -> Vec<CatalogListItem> {
@@ -264,6 +275,7 @@ fn seed_display_catalog() -> Vec<CatalogListItem> {
             summary: m.summary,
             tags: m.tags,
             latest: String::new(),
+            trust: Trust::Flagged,
         })
         .collect()
 }
@@ -284,6 +296,7 @@ fn ensure_display_catalog(repo: &str, name: &str, summary: String, tags: Vec<Mod
             summary,
             tags,
             latest: String::new(),
+            trust: Trust::Flagged,
         });
         let _ = save_display_catalog(&list);
     }
@@ -391,7 +404,7 @@ pub fn encode_lobby_code(profile: ProfileRecord) -> String {
 
 #[tauri::command]
 pub fn preview_code(code: String, installed: Vec<(String, String)>) -> Result<Preview, String> {
-    preview(&code, &catalog(), &installed).map_err(|e| e.to_string())
+    preview(&code, &bundled_catalog(), &installed).map_err(|e| e.to_string())
 }
 
 // ---------- release/file picker ----------

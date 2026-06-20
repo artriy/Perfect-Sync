@@ -28,6 +28,17 @@ pub enum Runtime {
     Crossover,
 }
 
+/// How vetted a mod is. Drives the trust badge and warns on unknown mods pulled
+/// in by a shared lobby code. Anything not in the catalog is `Flagged`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Trust {
+    Trusted,
+    Community,
+    #[default]
+    Flagged,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModTag {

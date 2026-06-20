@@ -7,10 +7,12 @@ import {
   LinkSimple,
   Play,
   ShieldCheck,
+  Warning,
   X,
 } from "@phosphor-icons/react";
 import { Pill, primaryTag } from "./Pill";
-import type { DiffItem, PersonalMod } from "../lib/types";
+import { TrustBadge } from "./TrustBadge";
+import type { DiffItem, PersonalMod, Trust } from "../lib/types";
 import { extractLobbyCode, previewCode } from "../lib/bridge";
 
 type Mode = "input" | "decoding" | "diff";
@@ -18,26 +20,25 @@ type Mode = "input" | "decoding" | "diff";
 interface LobbyCodeModalProps {
   open: boolean;
   initialCode?: string;
-  diff: DiffItem[];
+  installed: [string, string][];
+  trustOf: (id: string) => Trust;
   personalMods: PersonalMod[];
   onClose: () => void;
   onApply: (launch: boolean, code: string) => void;
 }
 
-export function LobbyCodeModal({ open, initialCode, diff, personalMods, onClose, onApply }: LobbyCodeModalProps) {
+export function LobbyCodeModal({ open, initialCode, installed, trustOf, personalMods, onClose, onApply }: LobbyCodeModalProps) {
   const reduce = useReducedMotion();
   const [mode, setMode] = useState<Mode>("input");
   const [code, setCode] = useState("");
-  const [rows, setRows] = useState<DiffItem[]>(diff);
+  const [rows, setRows] = useState<DiffItem[]>([]);
   const [name, setName] = useState("");
+  const [error, setError] = useState<string | null>(null);
 
   const runDecode = (value: string) => {
     setMode("decoding");
-    // TODO(phase 2): pass the active profile's real installed [id, version] pairs.
-    previewCode(value, [
-      ["AU-Avengers/TOU-Mira", "1.6.2"],
-      ["Dolfannn/LevelImposter", "0.7.2"],
-    ])
+    setError(null);
+    previewCode(value, installed)
       .then((p) => {
         setRows(p.items);
         setName(p.name);
@@ -45,6 +46,8 @@ export function LobbyCodeModal({ open, initialCode, diff, personalMods, onClose,
       })
       .catch((err) => {
         console.error("lobby code decode failed", err);
+        setRows([]);
+        setError("This code couldn't be read. Ask your friend for a fresh PERFECT- code.");
         setMode("diff");
       });
   };
@@ -124,6 +127,8 @@ export function LobbyCodeModal({ open, initialCode, diff, personalMods, onClose,
                   mode={mode}
                   diff={rows}
                   personalMods={personalMods}
+                  trustOf={trustOf}
+                  error={error}
                   name={name}
                   code={code || initialCode || ""}
                   onApply={(launch) => onApply(launch, code || initialCode || "")}
@@ -177,6 +182,8 @@ function ResultStep({
   name,
   code,
   personalMods,
+  trustOf,
+  error,
   onApply,
 }: {
   mode: Mode;
@@ -184,17 +191,20 @@ function ResultStep({
   name: string;
   code: string;
   personalMods: PersonalMod[];
+  trustOf: (id: string) => Trust;
+  error: string | null;
   onApply: (launch: boolean) => void;
 }) {
   const alwaysAdded = personalMods.filter((p) => p.enabled !== false);
+  const flaggedCount = diff.filter((d) => d.trust === "flagged").length;
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="scroll-region -mr-2 min-h-0 flex-1 overflow-y-auto pr-2">
       <div className="glass mb-4 flex items-center gap-2 rounded-xl px-3 py-2.5 font-mono text-[12.5px] text-[#bfe0ff]">
         <LinkSimple size={14} />
         <span className="truncate">{code || "PERFECT-…"}</span>
-        <span className="ml-auto shrink-0 rounded-full bg-[rgba(91,227,176,0.2)] px-2 py-0.5 font-sans text-[11px] text-[#aef3d8]">
-          valid
+        <span className={`ml-auto shrink-0 rounded-full px-2 py-0.5 font-sans text-[11px] ${error ? "bg-[rgba(226,59,59,0.2)] text-[#ff8a8a]" : "bg-[rgba(91,227,176,0.2)] text-[#aef3d8]"}`}>
+          {error ? "invalid" : "valid"}
         </span>
       </div>
 
@@ -214,8 +224,22 @@ function ResultStep({
       <div className="flex flex-col gap-2">
         {mode === "decoding"
           ? [0, 1, 2, 3].map((i) => <SkeletonRow key={i} />)
-          : diff.map((d) => <DiffRow key={d.name} item={d} />)}
+          : error
+            ? <p className="glass rounded-xl px-3.5 py-4 text-[13px] text-[#ff8a8a]">{error}</p>
+            : diff.map((d) => <DiffRow key={d.name} item={d} />)}
       </div>
+
+      {mode !== "decoding" && !error && flaggedCount > 0 && (
+        <div
+          className="mt-3 flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-[13px]"
+          style={{ background: "rgba(255,170,60,0.12)", border: "1px solid rgba(255,170,60,0.32)", color: "#ffd9a8" }}
+        >
+          <Warning size={16} weight="fill" />
+          <span>
+            {flaggedCount} mod{flaggedCount > 1 ? "s are" : " is"} <strong>unverified</strong> (not in the trusted catalog). Only apply a code from someone you trust.
+          </span>
+        </div>
+      )}
 
       {alwaysAdded.length > 0 && (
         <>
@@ -235,6 +259,7 @@ function ResultStep({
                   <div className="truncate text-[14px] font-semibold text-ink">{pm.name ?? pm.repo}</div>
                   <div className="truncate text-[12px] text-ink-faint">Always added to your lobbies</div>
                 </div>
+                <TrustBadge trust={trustOf(pm.repo)} compact />
                 <span className="font-mono text-[12px] text-ink-dim">{pm.tag}</span>
               </div>
             ))}
@@ -242,25 +267,29 @@ function ResultStep({
         </>
       )}
 
-      <div
-        className="mt-4 flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-[13px]"
-        style={{ background: "rgba(91,227,176,0.12)", border: "1px solid rgba(91,227,176,0.3)", color: "#aef3d8" }}
-      >
-        <ShieldCheck size={16} weight="fill" />
-        <span>
-          All all-client mods will match the lobby <strong>exactly</strong>, so the Reactor handshake passes.
-        </span>
-      </div>
-      <p className="mt-2 px-1 text-[12.5px] text-ink-faint">
-        Built for Among Us 17.0.1 (reference only; the app won't change your game version).
-      </p>
+      {!error && (
+        <>
+          <div
+            className="mt-4 flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-[13px]"
+            style={{ background: "rgba(91,227,176,0.12)", border: "1px solid rgba(91,227,176,0.3)", color: "#aef3d8" }}
+          >
+            <ShieldCheck size={16} weight="fill" />
+            <span>
+              All all-client mods will match the lobby <strong>exactly</strong>, so the Reactor handshake passes.
+            </span>
+          </div>
+          <p className="mt-2 px-1 text-[12.5px] text-ink-faint">
+            Built for Among Us 17.0.1 (reference only; the app won't change your game version).
+          </p>
+        </>
+      )}
       </div>
 
       <div className="mt-4 flex justify-end gap-2.5 border-t border-white/10 pt-4">
         <button
           type="button"
           onClick={() => onApply(false)}
-          disabled={mode === "decoding"}
+          disabled={mode === "decoding" || !!error}
           className="ring-focus glass rounded-xl px-4 py-2.5 text-[14px] text-ink disabled:opacity-50"
         >
           Apply only
@@ -268,7 +297,7 @@ function ResultStep({
         <button
           type="button"
           onClick={() => onApply(true)}
-          disabled={mode === "decoding"}
+          disabled={mode === "decoding" || !!error}
           className="ring-focus accent-grad flex items-center gap-2 rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820] disabled:opacity-50"
           style={{ boxShadow: "0 8px 24px rgba(123,150,255,0.5)" }}
         >
@@ -302,6 +331,7 @@ function DiffRow({ item }: { item: DiffItem }) {
       </div>
       <div className="ml-auto flex items-center gap-2">
         {tag && <Pill tag={tag} />}
+        {item.trust && <TrustBadge trust={item.trust} compact />}
         <span className="font-mono text-[12px] text-ink-dim">
           {item.action === "change" ? `→ ${item.to}` : item.action === "install" ? item.to : ""}
         </span>

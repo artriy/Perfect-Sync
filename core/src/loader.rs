@@ -143,6 +143,14 @@ pub fn extract_all(bytes: &[u8], dest: &Path) -> io::Result<()> {
         if name.contains("..") {
             continue;
         }
+        let rel = Path::new(&name);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
         let out = dest.join(&name);
         if file.is_dir() {
             fs::create_dir_all(&out)?;
@@ -343,5 +351,36 @@ mod tests {
         fs::create_dir_all(&empty).unwrap();
         sync_profile_plugins(&profiles, "p2", &game).unwrap();
         assert!(!game_plugins.join("TheOtherRoles.dll").exists());
+    }
+
+    #[test]
+    fn extract_all_rejects_absolute_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let escape = tmp.path().join("escaped.txt");
+        let abs_name = escape.to_string_lossy().replace('\\', "/");
+
+        let mut buf = Vec::new();
+        {
+            use std::io::Write;
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            zw.start_file(abs_name.as_str(), opts).unwrap();
+            zw.write_all(b"EVIL").unwrap();
+            zw.start_file("ok.txt", opts).unwrap();
+            zw.write_all(b"good").unwrap();
+            zw.finish().unwrap();
+        }
+
+        let mut ar = zip::ZipArchive::new(std::io::Cursor::new(&buf)).unwrap();
+        let preserved = (0..ar.len())
+            .any(|i| Path::new(&ar.by_index(i).unwrap().name().replace('\\', "/")).is_absolute());
+        assert!(preserved, "zip writer did not preserve an absolute entry name");
+
+        extract_all(&buf, &dest).unwrap();
+
+        assert_eq!(fs::read(dest.join("ok.txt")).unwrap(), b"good");
+        assert!(!escape.exists(), "absolute zip entry escaped dest");
     }
 }

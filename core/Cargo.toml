@@ -2,6 +2,9 @@
 name = "perfect-sync-core"
 version = "0.1.0"
 edition = "2021"
+description = "Core logic for Perfect-Sync (catalog, lobby codec, resolver, loader)"
+license = "MIT"
+repository = "https://github.com/artriy/Perfect-Sync"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

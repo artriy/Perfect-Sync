@@ -4,6 +4,7 @@
 export type Arch = "x86" | "x64";
 export type Store = "steam" | "epic" | "itch" | "msstore" | "manual";
 export type Runtime = "native" | "proton" | "wine" | "crossover";
+export type Trust = "trusted" | "community" | "flagged";
 export type ModTag =
   | "role"
   | "all-client"
@@ -48,6 +49,8 @@ export interface CatalogItem {
   summary: string;
   tags: ModTag[];
   latest: string;
+  /** vetting tier: trusted (curated) | community (listed) | flagged (unknown) */
+  trust?: Trust;
 }
 
 /** one line in the lobby-code apply diff */
@@ -59,6 +62,7 @@ export interface DiffItem {
   from?: string;
   to?: string;
   detail: string;
+  trust?: Trust;
 }
 
 export interface GameStatus {

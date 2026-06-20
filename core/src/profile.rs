@@ -54,6 +54,16 @@ pub struct ProfileStore {
     pub root: PathBuf,
 }
 
+fn validate_id(id: &str) -> io::Result<()> {
+    let mut comps = Path::new(id).components();
+    let single_normal =
+        matches!(comps.next(), Some(std::path::Component::Normal(_))) && comps.next().is_none();
+    if id.is_empty() || id.contains('/') || id.contains('\\') || !single_normal {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid profile id"));
+    }
+    Ok(())
+}
+
 impl ProfileStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -68,10 +78,13 @@ impl ProfileStore {
     }
 
     pub fn save(&self, profile: &ProfileRecord) -> io::Result<()> {
+        validate_id(&profile.id)?;
         let dir = self.profile_dir(&profile.id);
         fs::create_dir_all(&dir)?;
         let json = serde_json::to_string_pretty(profile)?;
-        fs::write(self.manifest_path(&profile.id), json)
+        let tmp = dir.join("profile.json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, self.manifest_path(&profile.id))
     }
 
     pub fn load(&self, id: &str) -> Option<ProfileRecord> {
@@ -97,6 +110,7 @@ impl ProfileStore {
     }
 
     pub fn delete(&self, id: &str) -> io::Result<()> {
+        validate_id(id)?;
         let dir = self.profile_dir(id);
         if dir.is_dir() {
             fs::remove_dir_all(dir)?;
@@ -432,5 +446,18 @@ mod tests {
         set_plugin_enabled(tmp.path(), "p1", "Mod.dll", true).unwrap();
         assert!(plugins.join("Mod.dll").exists());
         assert!(!plugins.join("Mod.dll.disabled").exists());
+    }
+
+    #[test]
+    fn delete_rejects_unsafe_ids_and_keeps_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = tmp.path().join("keep.txt");
+        fs::write(&sentinel, b"keep").unwrap();
+        let store = ProfileStore::new(tmp.path());
+        assert!(store.delete("").is_err());
+        assert!(store.delete(".").is_err());
+        assert!(store.delete("..").is_err());
+        assert!(tmp.path().is_dir());
+        assert!(sentinel.exists());
     }
 }

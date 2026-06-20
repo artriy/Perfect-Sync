@@ -12,8 +12,9 @@ import {
   type Icon,
 } from "@phosphor-icons/react";
 import { Pill, primaryTag } from "./Pill";
+import { TrustBadge } from "./TrustBadge";
 import { Toggle } from "./Toggle";
-import type { ModTag, ProfileMod } from "../lib/types";
+import type { ModTag, ProfileMod, Trust } from "../lib/types";
 
 const ICON: Partial<Record<ModTag, Icon>> = {
   role: UsersThree,
@@ -38,9 +39,10 @@ interface ModRowProps {
   onToggle: () => void;
   onRemove: () => void;
   onPickRelease: () => void;
+  trust?: Trust;
 }
 
-export function ModRow({ mod, busy, onToggle, onRemove, onPickRelease }: ModRowProps) {
+export function ModRow({ mod, busy, trust, onToggle, onRemove, onPickRelease }: ModRowProps) {
   const reduce = useReducedMotion();
   const tag = mod.tags.length ? primaryTag(mod.tags) : null;
   const Glyph = (tag && ICON[tag]) || PuzzlePiece;
@@ -81,6 +83,7 @@ export function ModRow({ mod, busy, onToggle, onRemove, onPickRelease }: ModRowP
       <div className="flex-1" />
 
       {tag && <Pill tag={tag} />}
+      {!mod.managed && trust && <TrustBadge trust={trust} compact />}
 
       {mod.update && !mod.managed && (
         <span className="flex items-center gap-1 rounded-lg border border-[rgba(255,210,63,0.35)] bg-[rgba(255,210,63,0.16)] px-2 py-1 text-[11.5px] font-medium text-[#ffe49a]">

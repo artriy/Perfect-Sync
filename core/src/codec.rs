@@ -6,6 +6,8 @@ use flate2::Compression;
 use std::io::{Read, Write};
 
 const PREFIX: &str = "PERFECT-";
+const MAX_CODE_LEN: usize = 64 * 1024;
+const MAX_DECOMPRESSED: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum CodecError {
@@ -28,6 +30,9 @@ pub fn encode(m: &LobbyManifest) -> String {
 }
 
 pub fn decode(code: &str) -> Result<LobbyManifest, CodecError> {
+    if code.len() > MAX_CODE_LEN {
+        return Err(CodecError::Malformed);
+    }
     let rest = code.strip_prefix(PREFIX).ok_or(CodecError::BadPrefix)?;
     let (body, crc_str) = rest.rsplit_once('.').ok_or(CodecError::Malformed)?;
     let want = u32::from_str_radix(crc_str, 16).map_err(|_| CodecError::Malformed)?;
@@ -37,10 +42,15 @@ pub fn decode(code: &str) -> Result<LobbyManifest, CodecError> {
     let gz = URL_SAFE_NO_PAD
         .decode(body.as_bytes())
         .map_err(|_| CodecError::Malformed)?;
-    let mut s = String::new();
+    let mut buf = Vec::new();
     GzDecoder::new(&gz[..])
-        .read_to_string(&mut s)
+        .take((MAX_DECOMPRESSED + 1) as u64)
+        .read_to_end(&mut buf)
         .map_err(|_| CodecError::Malformed)?;
+    if buf.len() > MAX_DECOMPRESSED {
+        return Err(CodecError::Malformed);
+    }
+    let s = String::from_utf8(buf).map_err(|_| CodecError::Malformed)?;
     serde_json::from_str(&s).map_err(|_| CodecError::Malformed)
 }
 
@@ -84,5 +94,13 @@ mod tests {
         let bytes = unsafe { code.as_bytes_mut() };
         bytes[dot - 1] = if bytes[dot - 1] == b'A' { b'B' } else { b'A' };
         assert_eq!(decode(&code), Err(CodecError::BadChecksum));
+    }
+
+    #[test]
+    fn rejects_decompression_bomb() {
+        let mut m = sample();
+        m.name = Some("a".repeat(2 * 1024 * 1024));
+        let code = encode(&m);
+        assert_eq!(decode(&code), Err(CodecError::Malformed));
     }
 }

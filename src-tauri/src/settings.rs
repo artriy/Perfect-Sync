@@ -49,8 +49,19 @@ pub fn user_catalog_path() -> PathBuf {
 }
 
 pub fn app_data_dir() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("Perfect-Sync")
+    let base = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+            })
+    };
+    base.unwrap_or_else(|| PathBuf::from(".")).join("Perfect-Sync")
 }
 
 pub fn profiles_root() -> PathBuf {
