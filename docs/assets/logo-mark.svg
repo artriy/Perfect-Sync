@@ -1,0 +1,23 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Perfect-Sync mark">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#150a2c"/>
+      <stop offset="1" stop-color="#0a1430"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="20" y1="40" x2="108" y2="88" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9b7bff"/>
+      <stop offset="1" stop-color="#5bc0ff"/>
+    </linearGradient>
+    <filter id="g" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="5"/></filter>
+  </defs>
+  <rect width="128" height="128" rx="30" fill="url(#bg)"/>
+  <rect x="0.75" y="0.75" width="126.5" height="126.5" rx="29.25" fill="none" stroke="#ffffff" stroke-opacity="0.12"/>
+  <g transform="translate(64 64) scale(1.18)">
+    <g filter="url(#g)" opacity="0.7">
+      <path d="M0 0 C0 -28 -40 -28 -40 0 S0 28 0 0 C0 -28 40 -28 40 0 S0 28 0 0 Z" fill="none" stroke="url(#accent)" stroke-width="10" stroke-linecap="round"/>
+    </g>
+    <path d="M0 0 C0 -28 -40 -28 -40 0 S0 28 0 0 C0 -28 40 -28 40 0 S0 28 0 0 Z" fill="none" stroke="url(#accent)" stroke-width="10" stroke-linecap="round"/>
+    <circle cx="-40" cy="0" r="6" fill="#9b7bff"/>
+    <circle cx="40" cy="0" r="6" fill="#5bc0ff"/>
+  </g>
+</svg>

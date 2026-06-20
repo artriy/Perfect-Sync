@@ -1,0 +1,14 @@
+<svg width="96" height="96" viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Lobby codes">
+  <defs>
+    <linearGradient id="g" x1="20" y1="30" x2="76" y2="66" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9b7bff"/><stop offset="1" stop-color="#5bc0ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="22" fill="#16102e"/>
+  <rect x="0.75" y="0.75" width="94.5" height="94.5" rx="21.25" fill="none" stroke="#ffffff" stroke-opacity="0.10"/>
+  <rect x="20" y="34" width="56" height="28" rx="14" fill="none" stroke="url(#g)" stroke-width="4"/>
+  <circle cx="33" cy="48" r="3.2" fill="#bfe0ff"/>
+  <rect x="40" y="46" width="9" height="4" rx="2" fill="#bfe0ff"/>
+  <circle cx="56" cy="48" r="3.2" fill="#bfe0ff"/>
+  <rect x="62" y="46" width="9" height="4" rx="2" fill="#bfe0ff"/>
+</svg>

@@ -2,6 +2,7 @@
   "name": "perfect-sync",
   "private": true,
   "version": "0.1.0",
+  "description": "Desktop mod manager and launcher for modded Among Us. Installs BepInEx, manages mod profiles, and syncs a lobby's exact mod set between players with shareable codes.",
   "type": "module",
   "scripts": {
     "dev": "vite",

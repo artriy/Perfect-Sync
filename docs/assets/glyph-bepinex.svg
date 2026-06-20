@@ -1,0 +1,12 @@
+<svg width="96" height="96" viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Auto BepInEx">
+  <defs>
+    <linearGradient id="g" x1="24" y1="22" x2="72" y2="74" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5be3b0"/><stop offset="1" stop-color="#28b8d0"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="22" fill="#16102e"/>
+  <rect x="0.75" y="0.75" width="94.5" height="94.5" rx="21.25" fill="none" stroke="#ffffff" stroke-opacity="0.10"/>
+  <path d="M48 24 V52" stroke="url(#g)" stroke-width="6" stroke-linecap="round"/>
+  <path d="M36 42 L48 54 L60 42" stroke="url(#g)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M30 60 V66 A4 4 0 0 0 34 70 H62 A4 4 0 0 0 66 66 V60" stroke="url(#g)" stroke-width="6" stroke-linecap="round" fill="none"/>
+</svg>
