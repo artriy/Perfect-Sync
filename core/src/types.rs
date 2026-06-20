@@ -17,6 +17,17 @@ pub enum Store {
     Manual,
 }
 
+/// How an Among Us install is executed. Among Us is a Windows-only build, so on
+/// Linux it runs under Steam Proton and on macOS under CrossOver/Wine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Runtime {
+    Native,
+    Proton,
+    Wine,
+    Crossover,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModTag {

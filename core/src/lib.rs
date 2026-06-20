@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod codec;
+pub mod compat;
 pub mod deps;
 pub mod diff;
 pub mod game;

@@ -3,6 +3,7 @@
 
 export type Arch = "x86" | "x64";
 export type Store = "steam" | "epic" | "itch" | "msstore" | "manual";
+export type Runtime = "native" | "proton" | "wine" | "crossover";
 export type ModTag =
   | "role"
   | "all-client"
@@ -71,6 +72,8 @@ export interface GameInstall {
   path: string;
   store: Store;
   arch: Arch;
+  /** how the game runs: native (Windows) or via Proton/Wine/CrossOver */
+  runtime?: Runtime;
 }
 
 export interface PersonalMod {

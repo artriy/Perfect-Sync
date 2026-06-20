@@ -150,6 +150,7 @@ export function SettingsModal({
                   <div className="truncate text-[13.5px] text-ink">{game.path}</div>
                   <div className="text-[12px] text-ink-faint">
                     {game.store} · {game.arch}
+                    {game.runtime && game.runtime !== "native" ? ` · ${game.runtime}` : ""}
                   </div>
                 </div>
               ) : (

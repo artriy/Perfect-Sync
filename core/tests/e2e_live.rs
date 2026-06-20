@@ -7,7 +7,7 @@
 //! into a temp profile's BepInEx/plugins, and builds the Doorstop launch spec.
 
 use perfect_sync_core::resolver::Http;
-use perfect_sync_core::{catalog, loader, process, profile, resolver};
+use perfect_sync_core::{catalog, loader, profile, resolver};
 use std::path::Path;
 
 const CATALOG: &str = include_str!("../fixtures/catalog.sample.json");
@@ -106,7 +106,8 @@ fn live_end_to_end_reactor_install() {
         .unwrap();
     assert!(store.load("live").is_some());
 
-    let spec = process::build_launch(Path::new("C:/Games/Among Us"));
+    let game = Path::new("C:/Games/Among Us");
+    let spec = perfect_sync_core::compat::build_launch_spec(game, &perfect_sync_core::compat::resolve(game));
     assert!(spec.program.ends_with("Among Us.exe"));
     println!("launch: {:?}", spec.program);
 }
