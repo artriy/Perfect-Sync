@@ -45,6 +45,6 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Perfect-Sync ${{ github.ref_name }}'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: true
           args: ${{ matrix.args }}

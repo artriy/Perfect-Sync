@@ -680,6 +680,17 @@ pub async fn apply_lobby_code(code: String, arch: String) -> Result<ProfileRecor
     blocking(move || apply_lobby_code_impl(code, arch)).await
 }
 
+/// Stable short hash of a lobby code (FNV-1a), mixed into the imported profile id
+/// so two distinct codes never collide on one id and silently overwrite a profile.
+fn code_hash(code: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in code.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{:08x}", h as u32)
+}
+
 fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, String> {
     let manifest = codec::decode(&code).map_err(|e| e.to_string())?;
     let root = settings::profiles_root();
@@ -689,7 +700,8 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
 
     let display = manifest.name.clone().unwrap_or_else(|| "Imported lobby".to_string());
     let slug = display.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "-");
-    let id = format!("lobby-{slug}");
+    let hash = code_hash(&code);
+    let id = if slug.is_empty() { format!("lobby-{hash}") } else { format!("lobby-{slug}-{hash}") };
 
     let mut mods = Vec::new();
     for mm in &manifest.mods {
@@ -1015,19 +1027,22 @@ const REPO_SLUG: &str = "artriy/Perfect-Sync";
 #[tauri::command]
 pub async fn check_update() -> Option<UpdateInfo> {
     blocking(|| {
-        let url = format!("https://api.github.com/repos/{REPO_SLUG}/releases/latest");
+        // /releases/latest excludes prereleases, which is what this project ships;
+        // list the most recent release (prereleases included) instead.
+        let url = format!("https://api.github.com/repos/{REPO_SLUG}/releases?per_page=1");
         let text = http().get_text(&url).map_err(|e| e.to_string())?;
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        let tag = v["tag_name"].as_str().unwrap_or_default().to_string();
+        let rel = v.get(0).ok_or_else(|| "no releases".to_string())?;
+        let tag = rel["tag_name"].as_str().unwrap_or_default().to_string();
         if tag.is_empty() {
             return Err("no release tag".to_string());
         }
         if !perfect_sync_core::version::is_newer(&tag, env!("CARGO_PKG_VERSION")) {
             return Ok(None);
         }
-        let html = v["html_url"].as_str().unwrap_or("");
+        let html = rel["html_url"].as_str().unwrap_or("");
         let url = if html.is_empty() {
-            format!("https://github.com/{REPO_SLUG}/releases/latest")
+            format!("https://github.com/{REPO_SLUG}/releases")
         } else {
             html.to_string()
         };
@@ -1051,4 +1066,16 @@ pub fn open_url(url: String) -> Result<(), String> {
         std::process::Command::new("xdg-open").arg(&url).spawn()
     };
     spawned.map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_hash_is_stable_and_distinguishes_codes() {
+        assert_eq!(code_hash("abc"), code_hash("abc"));
+        assert_ne!(code_hash("abc"), code_hash("abd"));
+        assert_eq!(code_hash("anything").len(), 8);
+    }
 }

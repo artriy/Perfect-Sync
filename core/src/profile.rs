@@ -106,6 +106,7 @@ impl ProfileStore {
                 }
             }
         }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
         out
     }
 

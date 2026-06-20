@@ -101,4 +101,6 @@ export interface Settings {
   skipLaunchWarning?: boolean;
   /** storefront the game came from, picks the launch path (Steam/Epic) */
   store?: Store;
+  /** id of the profile to re-select on startup */
+  activeProfile?: string;
 }

@@ -71,7 +71,8 @@ export function App() {
         list = [starter];
       }
       setProfiles(list);
-      setActiveId(list[0].id);
+      const persisted = st.activeProfile;
+      setActiveId(persisted && list.some((p) => p.id === persisted) ? persisted : list[0].id);
       setLoaded(true);
       // show the cached catalog right away, then refresh from the hosted copy
       bridge.loadCatalog().then(setCatalog).catch(() => {});
@@ -86,6 +87,17 @@ export function App() {
       setLoaded(true);
     });
   }, []);
+
+  // Persist the active profile so the right mod set is restored on restart.
+  useEffect(() => {
+    if (!loaded || !activeId) return;
+    setSettings((prev) => {
+      if (prev.activeProfile === activeId) return prev;
+      const next = { ...prev, activeProfile: activeId };
+      bridge.saveSettings(next).catch(() => {});
+      return next;
+    });
+  }, [activeId, loaded]);
 
   useEffect(() => {
     bridge.checkUpdate().then(setUpdate).catch(() => {});
