@@ -887,16 +887,16 @@ fn launch_store(game_path: &str) -> Option<String> {
 const EPIC_STARTER_URL: &str =
     "https://github.com/whichtwix/EpicGamesStarter/releases/latest/download/EpicGamesStarter.exe.zip";
 
-/// Download + cache EpicGamesStarter.exe (once); returns its path.
-fn ensure_epic_starter(http: &dyn Http) -> Result<std::path::PathBuf, String> {
-    let dir = settings::cache_dir().join("epic");
-    let exe = dir.join("EpicGamesStarter.exe");
+/// Ensure EpicGamesStarter.exe sits in the game folder (download once if missing);
+/// returns its path. Running it from the folder mirrors a manual EpicGamesDowngrader
+/// setup, so it finds .egstore and handles its own Epic sign-in.
+fn ensure_epic_starter(http: &dyn Http, game_dir: &Path) -> Result<std::path::PathBuf, String> {
+    let exe = game_dir.join("EpicGamesStarter.exe");
     if exe.is_file() {
         return Ok(exe);
     }
     let bytes = http.get_bytes(EPIC_STARTER_URL).map_err(|e| e.to_string())?;
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    loader::extract_all(&bytes, &dir).map_err(|e| e.to_string())?;
+    loader::extract_all(&bytes, game_dir).map_err(|e| e.to_string())?;
     if exe.is_file() {
         Ok(exe)
     } else {
@@ -922,7 +922,7 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
                     return Ok(());
                 }
                 Some("epic") => {
-                    let starter = ensure_epic_starter(&http())?;
+                    let starter = ensure_epic_starter(&http(), game_dir)?;
                     std::process::Command::new(&starter)
                         .current_dir(game_dir)
                         .spawn()

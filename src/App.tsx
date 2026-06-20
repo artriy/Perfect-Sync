@@ -360,7 +360,12 @@ export function App() {
     try {
       setRunning(true);
       await bridge.launchProfile(gamePath ?? "", p.id);
-      notify(`Launching ${p.name}`);
+      const isEpic = (game?.store ?? settings.store) === "epic";
+      notify(
+        isEpic
+          ? `Launching ${p.name}. Epic may ask you to sign in the first time, that's normal.`
+          : `Launching ${p.name}`,
+      );
       if (!bridge.inTauri) setTimeout(() => setRunning(false), 2800);
     } catch (e) {
       setRunning(false);
