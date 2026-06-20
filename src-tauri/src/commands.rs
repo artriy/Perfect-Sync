@@ -902,6 +902,39 @@ fn launches_registered_install(game_dir: &Path) -> bool {
     }
 }
 
+/// Whether the Steam client is running (Windows: tasklist by image name).
+fn is_steam_running() -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq steam.exe", "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("steam.exe"))
+        .unwrap_or(false)
+}
+
+/// Start the Steam client to the tray and wait until it is up, so a direct
+/// launch can init Steamworks via steam_appid.txt. No-op if Steam is already
+/// running or not installed.
+fn ensure_steam_running() {
+    if is_steam_running() {
+        return;
+    }
+    let Some(exe) = game::steam_exe() else {
+        return;
+    };
+    if std::process::Command::new(&exe).arg("-silent").spawn().is_err() {
+        return;
+    }
+    // ponytail: poll for the process, then a fixed grace for login; swap for a
+    // real Steamworks-readiness probe if this proves flaky on slow/first logins.
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if is_steam_running() {
+            break;
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_secs(5));
+}
+
 const EPIC_STARTER_URL: &str =
     "https://github.com/whichtwix/EpicGamesStarter/releases/latest/download/EpicGamesStarter.exe.zip";
 
@@ -945,6 +978,7 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
                             .map_err(|e| format!("couldn't launch via Steam: {e}"))?;
                         return Ok(());
                     }
+                    ensure_steam_running();
                 }
                 Some("epic") => {
                     let starter = ensure_epic_starter(&http(), game_dir)?;

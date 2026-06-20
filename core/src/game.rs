@@ -92,6 +92,13 @@ pub fn steam_install_path() -> Option<PathBuf> {
     steam_roots().into_iter().find_map(|r| locate_steam(&r).map(|g| g.path))
 }
 
+/// The Steam client executable, used to start Steam before a direct launch that
+/// relies on `steam_appid.txt`. `None` when Steam isn't installed.
+pub fn steam_exe() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "steam.exe" } else { "steam" };
+    steam_roots().into_iter().map(|r| r.join(name)).find(|p| p.is_file())
+}
+
 /// Locate Among Us within a known Steam root by walking its library folders.
 pub fn locate_steam(steam_root: &Path) -> Option<GameInstall> {
     let vdf = fs::read_to_string(steam_root.join("steamapps").join("libraryfolders.vdf")).ok()?;
