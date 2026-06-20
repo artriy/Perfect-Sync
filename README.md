@@ -56,14 +56,19 @@ friends can paste to match you, same mods, same versions, one launch.
     </td>
     <td align="center" width="33%" valign="top">
       <img src="docs/assets/glyph-launch.svg" width="56" alt=""><br>
-      <b>Launch via Steam or Epic</b><br>
-      <sub>Syncs your profile, verifies BepInEx, and starts the modded game through the right store.</sub>
+      <b>One-click launch</b><br>
+      <sub>Syncs your profile, verifies BepInEx, and starts the modded game in a single click.</sub>
     </td>
   </tr>
 </table>
 
 Plus architecture auto-detect (x86 or x64 chosen from the real game executable) and personal
 always-include mods that get merged into every lobby code you apply.
+
+> [!TIP]
+> **Any store works.** Steam and Epic installs launch natively from the app. Other sources
+> (itch, Microsoft Store, and others) are supported too: Perfect-Sync sets up the mods in the
+> game folder, and you may just need to start the game yourself if it does not launch natively.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
@@ -77,8 +82,8 @@ always-include mods that get merged into every lobby code you apply.
 4. **Manage.** Toggle mods on and off, change versions, and create or switch named profiles.
 5. **Share or apply.** Export a profile as a `PERFECT-` code, or paste a friend's code to preview
    a per-mod diff with trust badges, then apply it.
-6. **Launch.** Click Launch to sync, verify BepInEx, and start via Steam or Epic. Or use Set up
-   mods to sync without launching.
+6. **Launch.** Click Launch to sync, verify BepInEx, and start the game (Steam and Epic launch
+   natively). Or use Set up mods to sync without launching and start it yourself.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
