@@ -862,6 +862,9 @@ fn prepare_profile(game_path: &str, profile_id: &str) -> Result<(), String> {
     ensure_loader_impl(game_path, profile_id, &arch)?;
     let _ = loader::ensure_steam_appid(game_dir);
     let _ = loader::write_console_off(game_dir);
+    if cfg!(windows) && launch_store(game_path).as_deref() == Some("epic") {
+        let _ = ensure_epic_starter(&http(), game_dir);
+    }
     loader::sync_profile_plugins(&settings::profiles_root(), profile_id, game_dir)
         .map_err(|e| e.to_string())
 }
@@ -880,6 +883,9 @@ fn launch_store(game_path: &str) -> Option<String> {
     }
     if game_path.replace('\\', "/").to_lowercase().contains("/steamapps/") {
         return Some("steam".to_string());
+    }
+    if Path::new(game_path).join(".egstore").is_dir() {
+        return Some("epic".to_string());
     }
     None
 }
