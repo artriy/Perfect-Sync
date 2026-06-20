@@ -175,6 +175,9 @@ fn ensure_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(
     if loader::has_loader(game_dir) {
         return Ok(());
     }
+    // prefer the real exe bitness over the caller's hint (selects the x86 vs x64 pack)
+    let exe_arch = game::exe_arch(&game_dir.join(process::GAME_EXE)).map(arch_str);
+    let arch = exe_arch.as_deref().unwrap_or(arch);
     // resolve newest BEFORE wiping, so an offline failure doesn't break a working install
     let h = http();
     let (id, url) = resolve_loader(&h, arch)?;

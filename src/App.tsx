@@ -7,6 +7,8 @@ import { AddModPanel } from "./components/AddModPanel";
 import { SettingsModal } from "./components/SettingsModal";
 import { ReleasePicker } from "./components/ReleasePicker";
 import { ShareModal } from "./components/ShareModal";
+import { SetupModal } from "./components/SetupModal";
+import { LaunchWarning } from "./components/LaunchWarning";
 import { Toast, type ToastState } from "./components/Toast";
 import * as bridge from "./lib/bridge";
 import { CATALOG } from "./data/mock";
@@ -23,6 +25,7 @@ export function App() {
   const [busyModId, setBusyModId] = useState<string | null>(null);
 
   const [game, setGame] = useState<GameInstall | null>(null);
+  const [games, setGames] = useState<GameInstall[]>([]);
   const [settings, setSettings] = useState<Settings>({});
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
 
@@ -31,6 +34,7 @@ export function App() {
   const [lobbyCode, setLobbyCode] = useState<string | undefined>(undefined);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [launchWarn, setLaunchWarn] = useState<Profile | null>(null);
   const [pickerTarget, setPickerTarget] = useState<{
     repo: string;
     name: string;
@@ -49,13 +53,14 @@ export function App() {
   // Load settings, detect the game, and read persisted profiles on startup.
   useEffect(() => {
     (async () => {
-      const [st, games, profs] = await Promise.all([
+      const [st, detectedGames, profs] = await Promise.all([
         bridge.getSettings(),
         bridge.detectGames(),
         bridge.loadProfiles(),
       ]);
       setSettings(st);
-      setGame(games[0] ?? null);
+      setGames(detectedGames);
+      setGame(detectedGames[0] ?? null);
       let list = profs;
       if (list.length === 0) {
         const starter: Profile = { id: "my-mods", name: "My mods", crewColor: CREW.violet, mods: [] };
@@ -95,7 +100,7 @@ export function App() {
 
   const arch: Arch = game?.arch ?? settings.arch ?? "x86";
   const gameStatus = { store: game?.store ?? "steam", arch, running };
-  const firstRun = loaded && !game && !settings.gamePath;
+  const firstRun = loaded && !settings.setupComplete;
 
   const active = profiles.find((p) => p.id === activeId) ?? profiles[0];
 
@@ -117,7 +122,7 @@ export function App() {
   // Install/verify the BepInEx loader for a profile, surfacing any failure.
   const ensureLoader = async (profileId: string) => {
     if (!bridge.inTauri) return;
-    const gamePath = game?.path ?? settings.gamePath;
+    const gamePath = settings.gamePath ?? game?.path;
     if (!gamePath) {
       notify("Set your Among Us folder in Settings so BepInEx can install.", "error");
       return;
@@ -323,12 +328,8 @@ export function App() {
     }
   };
 
-  const doLaunchProfile = async (p: Profile) => {
-    const gamePath = game?.path ?? settings.gamePath;
-    if (bridge.inTauri && !gamePath) {
-      notify("No game detected. Set the game path in Settings.", "error");
-      return;
-    }
+  const runLaunch = async (p: Profile) => {
+    const gamePath = settings.gamePath ?? game?.path;
     try {
       setRunning(true);
       await bridge.launchProfile(gamePath ?? "", p.id);
@@ -338,6 +339,42 @@ export function App() {
       setRunning(false);
       notify(String(e), "error");
     }
+  };
+
+  const doLaunchProfile = async (p: Profile) => {
+    const gamePath = settings.gamePath ?? game?.path;
+    if (bridge.inTauri && !gamePath) {
+      notify("No Among Us folder set. Open Settings to choose it.", "error");
+      return;
+    }
+    if (bridge.inTauri && gamePath && !settings.skipLaunchWarning) {
+      const status = await bridge.loaderStatus(gamePath, p.id).catch(() => null);
+      if (!status?.current) {
+        setLaunchWarn(p);
+        return;
+      }
+    }
+    await runLaunch(p);
+  };
+
+  const launchWarnInstall = async () => {
+    const p = launchWarn;
+    if (!p) return;
+    setLaunchWarn(null);
+    await ensureLoader(p.id);
+    await runLaunch(p);
+  };
+
+  const launchWarnAnyway = async (dontWarnAgain: boolean) => {
+    const p = launchWarn;
+    if (!p) return;
+    setLaunchWarn(null);
+    if (dontWarnAgain) {
+      const next: Settings = { ...settings, skipLaunchWarning: true };
+      setSettings(next);
+      bridge.saveSettings(next).catch((e) => notify(String(e), "error"));
+    }
+    await runLaunch(p);
   };
 
   const openLobbyFromSidebar = () => {
@@ -375,24 +412,24 @@ export function App() {
     }
   };
 
+  const completeSetup = async (gamePath?: string) => {
+    const next: Settings = { ...settings, setupComplete: true, ...(gamePath ? { gamePath } : {}) };
+    setSettings(next);
+    try {
+      await bridge.saveSettings(next);
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  };
+
   return (
     <div className="flex h-[100dvh] flex-col">
       <TopBar
-        game={gameStatus}
         onAddMod={() => setAddOpen(true)}
         onPasteCode={openLobbyFromCode}
         onOpenSettings={() => setSettingsOpen(true)}
       />
 
-      {firstRun && (
-        <button
-          type="button"
-          onClick={() => setSettingsOpen(true)}
-          className="ring-focus mx-3 mt-2 rounded-xl border border-[rgba(255,210,63,0.35)] bg-[rgba(255,210,63,0.12)] px-4 py-2 text-left text-[13px] text-[#ffe49a]"
-        >
-          No Among Us install detected. Click to open Settings and point Perfect-Sync at your game.
-        </button>
-      )}
 
       <div className="flex min-h-0 flex-1 p-3 pt-2.5">
         <div className="glass flex min-h-0 flex-1 overflow-hidden rounded-3xl">
@@ -463,6 +500,18 @@ export function App() {
         open={shareOpen}
         profile={active}
         onClose={() => setShareOpen(false)}
+      />
+      <SetupModal
+        open={firstRun}
+        detected={games}
+        profileId={active.id}
+        onFinish={completeSetup}
+      />
+      <LaunchWarning
+        open={launchWarn !== null}
+        onInstall={launchWarnInstall}
+        onLaunchAnyway={launchWarnAnyway}
+        onCancel={() => setLaunchWarn(null)}
       />
       <Toast toast={toast} />
     </div>

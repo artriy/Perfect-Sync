@@ -95,4 +95,8 @@ export interface Settings {
   arch?: Arch;
   catalogUrl?: string;
   personalMods?: PersonalMod[];
+  /** first-run onboarding finished */
+  setupComplete?: boolean;
+  /** don't warn on launch when BepInEx isn't fully installed */
+  skipLaunchWarning?: boolean;
 }

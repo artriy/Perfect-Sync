@@ -34,6 +34,10 @@ pub struct Settings {
     pub catalog_url: Option<String>,
     #[serde(default)]
     pub personal_mods: Vec<PersonalMod>,
+    #[serde(default)]
+    pub setup_complete: bool,
+    #[serde(default)]
+    pub skip_launch_warning: bool,
 }
 
 pub fn cache_dir() -> PathBuf {

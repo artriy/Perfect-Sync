@@ -143,28 +143,9 @@ export function SettingsModal({
             <h2 className="text-[20px] font-semibold text-ink">Settings</h2>
 
             <div className="scroll-region -mr-2 min-h-0 flex-1 overflow-y-auto pr-2">
-            <span className="mt-3 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
-              Detected game
-            </span>
-            <div className="glass flex items-center gap-3 rounded-xl px-3.5 py-3">
-              <GameController size={20} className="text-ink-dim" />
-              {game ? (
-                <div className="min-w-0">
-                  <div className="truncate text-[13.5px] text-ink">{game.path}</div>
-                  <div className="text-[12px] text-ink-faint">
-                    {game.store} · {game.arch}
-                    {game.runtime && game.runtime !== "native" ? ` · ${game.runtime}` : ""}
-                  </div>
-                </div>
-              ) : (
-                <div className="text-[13px] text-ink-dim">
-                  No Among Us install detected. Open the game once, or set the path manually later.
-                </div>
-              )}
-            </div>
 
             <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
-              Game folder (override)
+              Among Us folder
             </span>
             <div className="flex items-center gap-2">
               <label className="glass flex flex-1 items-center gap-2 rounded-xl px-3 py-2.5 text-ink-dim focus-within:text-ink">

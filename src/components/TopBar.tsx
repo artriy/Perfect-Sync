@@ -1,16 +1,14 @@
 import { useState } from "react";
 import { GearSix, MagnifyingGlass, Minus, Plus, Square, X } from "@phosphor-icons/react";
 import { extractLobbyCode, winClose, winMinimize, winToggleMaximize } from "../lib/bridge";
-import type { GameStatus } from "../lib/types";
 
 interface TopBarProps {
-  game: GameStatus;
   onAddMod: () => void;
   onPasteCode: (code: string) => void;
   onOpenSettings: () => void;
 }
 
-export function TopBar({ game, onAddMod, onPasteCode, onOpenSettings }: TopBarProps) {
+export function TopBar({ onAddMod, onPasteCode, onOpenSettings }: TopBarProps) {
   const [q, setQ] = useState("");
 
   const submit = () => {
@@ -38,19 +36,6 @@ export function TopBar({ game, onAddMod, onPasteCode, onOpenSettings }: TopBarPr
       </label>
 
       <div className="flex-1" />
-
-      <span
-        className="flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[12px]"
-        style={{
-          color: "#aef3d8",
-          background: "rgba(91,227,176,0.14)",
-          borderColor: "rgba(91,227,176,0.3)",
-        }}
-        title="Detected game install"
-      >
-        <span className="h-1.5 w-1.5 rounded-full bg-[#5be3b0]" />
-        {game.store[0].toUpperCase() + game.store.slice(1)} · {game.arch}
-      </span>
 
       <button
         type="button"
