@@ -113,6 +113,16 @@
       "trust": "trusted"
     },
     {
+      "id": "miniduikboot/Mini.RegionInstall",
+      "name": "Region Install",
+      "summary": "One-click installer for custom server regions, so you can join modded community servers.",
+      "repo": "miniduikboot/Mini.RegionInstall",
+      "tags": ["all-client"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "Mini.RegionInstall.dll" },
+      "trust": "trusted"
+    },
+    {
       "id": "DivaniNL/TownOfUsMiraDivaniModsAddOn",
       "name": "Divani's TOU-Mira Add-On",
       "summary": "Community add-on roles for Town of Us - Mira.",
