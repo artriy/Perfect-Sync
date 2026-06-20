@@ -101,7 +101,7 @@ export function LobbyCodeModal({ open, initialCode, installed, trustOf, personal
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.97, y: 8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="glass-strong relative flex max-h-[90vh] w-[560px] max-w-full flex-col rounded-3xl p-6"
+            className={`glass-strong relative flex max-h-[92vh] max-w-full flex-col rounded-3xl p-6 ${mode === "input" ? "w-[560px]" : "w-[820px]"}`}
           >
             <button
               type="button"
@@ -221,11 +221,11 @@ function ResultStep({
         Required mods + dependencies
       </span>
 
-      <div className="flex flex-col gap-2">
+      <div className="grid grid-cols-2 gap-2">
         {mode === "decoding"
           ? [0, 1, 2, 3].map((i) => <SkeletonRow key={i} />)
           : error
-            ? <p className="glass rounded-xl px-3.5 py-4 text-[13px] text-[#ff8a8a]">{error}</p>
+            ? <p className="col-span-2 glass rounded-xl px-3.5 py-4 text-[13px] text-[#ff8a8a]">{error}</p>
             : diff.map((d) => <DiffRow key={d.name} item={d} />)}
       </div>
 
@@ -246,7 +246,7 @@ function ResultStep({
           <span className="mt-4 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
             Always added (your mods)
           </span>
-          <div className="flex flex-col gap-2">
+          <div className="grid grid-cols-2 gap-2">
             {alwaysAdded.map((pm) => (
               <div key={pm.repo} className="glass flex items-center gap-3 rounded-xl px-3 py-2.5">
                 <span
