@@ -233,6 +233,10 @@ export function webLobbyLink(name: string, code: string): string {
   return `${LOBBY_WEB_BASE}${slug}#${code}`;
 }
 
+export function discordShare(name: string, code: string): string {
+  return `[${name}](${webLobbyLink(name, code)})`;
+}
+
 /** Pull a PERFECT- code out of a raw code, a deep link, or a markdown link. */
 export function extractLobbyCode(input: string): string | null {
   const m = input.match(/PERFECT-[A-Za-z0-9_-]+\.[0-9a-fA-F]{1,8}/);

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { Check, Copy, DiscordLogo, LinkSimple, X } from "@phosphor-icons/react";
 import type { Profile } from "../lib/types";
-import { encodeLobbyCode, lobbyDeepLink, webLobbyLink } from "../lib/bridge";
+import { discordShare, encodeLobbyCode, webLobbyLink } from "../lib/bridge";
 
 interface ShareModalProps {
   open: boolean;
@@ -49,14 +49,14 @@ export function ShareModal({ open, profile, onClose }: ShareModalProps) {
         },
         {
           label: "Link",
-          hint: "Opens Perfect-Sync straight onto this lobby.",
-          value: lobbyDeepLink(code),
+          hint: "Blue, clickable anywhere. Opens the app.",
+          value: webLobbyLink(profile.name, code),
           icon: <LinkSimple size={14} />,
         },
         {
           label: "Discord",
-          hint: "Blue, clickable link — opens the app via the web.",
-          value: webLobbyLink(profile.name, code),
+          hint: "Profile name becomes the clickable link.",
+          value: discordShare(profile.name, code),
           icon: <DiscordLogo size={14} />,
         },
       ]
@@ -131,8 +131,9 @@ export function ShareModal({ open, profile, onClose }: ShareModalProps) {
               )}
             </div>
             <p className="mt-3 px-1 text-[12px] leading-snug text-ink-faint">
-              The <strong>Discord</strong> link is a plain https link, so it shows up blue and clickable in
-              Discord. Clicking it opens Perfect-Sync on this lobby (or shows the code if the app isn't installed).
+              The <strong>Discord</strong> link puts your profile name as the clickable text. Discord only
+              renders that inside bot or webhook posts; in a normal message, paste the <strong>Link</strong> above
+              (it stays blue and opens the app).
             </p>
           </motion.div>
         </motion.div>
