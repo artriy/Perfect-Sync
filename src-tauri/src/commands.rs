@@ -685,6 +685,9 @@ fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, St
 
     // merge the user's personal "always-include" mods (if not already in the code)
     for pm in settings::load().personal_mods {
+        if !pm.enabled {
+            continue;
+        }
         let prepo = resolver::parse_repo(&pm.repo).unwrap_or_else(|| pm.repo.clone());
         if mods.iter().any(|m| m.package_id == prepo) {
             continue;

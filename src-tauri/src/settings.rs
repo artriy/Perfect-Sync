@@ -13,6 +13,12 @@ pub struct PersonalMod {
     pub asset: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub name: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -65,4 +71,16 @@ pub fn load() -> Settings {
 pub fn save(s: &Settings) -> std::io::Result<()> {
     fs::create_dir_all(app_data_dir())?;
     fs::write(settings_path(), serde_json::to_string_pretty(s)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn personal_mod_without_enabled_defaults_on() {
+        let pm: PersonalMod =
+            serde_json::from_str(r#"{"repo":"a/b","tag":"v1","asset":"x.dll"}"#).unwrap();
+        assert!(pm.enabled);
+    }
 }

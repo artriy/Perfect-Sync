@@ -23,13 +23,7 @@ export function TopBar({ game, onAddMod, onPasteCode, onOpenSettings }: TopBarPr
 
   return (
     <header data-tauri-drag-region className="glass-2 flex items-center gap-4 px-4 py-3">
-      <div className="flex items-center gap-2.5 font-semibold tracking-tight">
-        <span
-          className="h-[22px] w-[22px] rounded-[7px] accent-grad"
-          style={{ boxShadow: "0 0 14px rgba(123,150,255,0.6)" }}
-        />
-        Perfect-Sync
-      </div>
+      <div className="font-semibold tracking-tight">Perfect-Sync</div>
 
       <label className="glass relative flex max-w-[460px] min-w-[200px] flex-1 items-center gap-2 rounded-xl px-3 py-2 text-ink-dim focus-within:text-ink">
         <MagnifyingGlass size={16} className="shrink-0 opacity-70" />

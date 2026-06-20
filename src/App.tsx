@@ -244,6 +244,21 @@ export function App() {
     }
   };
 
+  const togglePersonal = async (repo: string, enabled: boolean) => {
+    const next: Settings = {
+      ...settings,
+      personalMods: (settings.personalMods ?? []).map((p) =>
+        p.repo === repo ? { ...p, enabled } : p,
+      ),
+    };
+    setSettings(next);
+    try {
+      await bridge.saveSettings(next);
+    } catch (e) {
+      notify(String(e));
+    }
+  };
+
   const pickRelease = async (tag: string, assetName: string) => {
     const target = pickerTarget;
     if (!target) return;
@@ -255,7 +270,7 @@ export function App() {
         ...settings,
         personalMods: [
           ...(settings.personalMods ?? []).filter((p) => p.repo !== target.repo),
-          { repo: target.repo, tag, asset: assetName, name: target.name },
+          { repo: target.repo, tag, asset: assetName, name: target.name, enabled: (settings.personalMods ?? []).find((p) => p.repo === target.repo)?.enabled ?? true },
         ],
       };
       setSettings(next);
@@ -413,6 +428,7 @@ export function App() {
         open={lobbyOpen}
         initialCode={lobbyCode}
         diff={SAMPLE_DIFF}
+        personalMods={settings.personalMods ?? []}
         onClose={() => setLobbyOpen(false)}
         onApply={applyLobby}
       />
@@ -425,6 +441,7 @@ export function App() {
         onSave={saveSettings}
         onAddPersonal={addPersonal}
         onRemovePersonal={removePersonal}
+        onTogglePersonal={togglePersonal}
       />
       <ReleasePicker
         open={pickerTarget !== null}

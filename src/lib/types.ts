@@ -78,6 +78,8 @@ export interface PersonalMod {
   tag: string;
   asset: string;
   name?: string;
+  /** when false, skipped from lobby merges; defaults to enabled */
+  enabled?: boolean;
 }
 
 export interface Settings {

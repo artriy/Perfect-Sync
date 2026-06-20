@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
   ArrowsClockwise,
+  CaretDown,
   CheckCircle,
   FolderOpen,
   GameController,
@@ -23,6 +24,7 @@ interface SettingsModalProps {
   onSave: (s: Settings) => void;
   onAddPersonal: (repo: string, name: string) => void;
   onRemovePersonal: (repo: string) => void;
+  onTogglePersonal: (repo: string, enabled: boolean) => void;
 }
 
 export function SettingsModal({
@@ -34,6 +36,7 @@ export function SettingsModal({
   onSave,
   onAddPersonal,
   onRemovePersonal,
+  onTogglePersonal,
 }: SettingsModalProps) {
   const reduce = useReducedMotion();
   const [token, setToken] = useState(settings.githubToken ?? "");
@@ -181,21 +184,6 @@ export function SettingsModal({
                 <FolderOpen size={15} /> Browse
               </button>
             </div>
-            <div className="mt-2 flex items-center gap-2">
-              <span className="text-[12px] text-ink-faint">Build:</span>
-              {(["x86", "x64"] as Arch[]).map((a) => (
-                <button
-                  key={a}
-                  type="button"
-                  onClick={() => setArch(a)}
-                  className={`ring-focus rounded-lg px-3 py-1 text-[12.5px] ${
-                    arch === a ? "accent-grad text-[#0d0820] font-semibold" : "glass text-ink-dim"
-                  }`}
-                >
-                  {a === "x86" ? "x86 (Steam/Epic/itch)" : "x64 (MS Store)"}
-                </button>
-              ))}
-            </div>
 
             <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
               GitHub token (optional)
@@ -223,23 +211,52 @@ export function SettingsModal({
               Your personal must-haves. Added to every lobby code you apply.
             </p>
             <div className="flex flex-col gap-1.5">
-              {(settings.personalMods ?? []).map((pm) => (
-                <div
-                  key={pm.repo}
-                  className="glass flex items-center gap-2 rounded-lg px-3 py-2 text-[12.5px]"
-                >
-                  <span className="min-w-0 flex-1 truncate text-ink">{pm.name ?? pm.repo}</span>
-                  <span className="font-mono text-[11.5px] text-ink-faint">{pm.tag}</span>
-                  <button
-                    type="button"
-                    onClick={() => onRemovePersonal(pm.repo)}
-                    aria-label={`Remove ${pm.repo}`}
-                    className="ring-focus grid h-7 w-7 place-items-center rounded-md text-ink-faint hover:bg-white/10 hover:text-[#ff8a8a]"
+              {(settings.personalMods ?? []).map((pm) => {
+                const on = pm.enabled !== false;
+                return (
+                  <div
+                    key={pm.repo}
+                    className="glass flex items-center gap-2 rounded-lg px-3 py-2 text-[12.5px]"
                   >
-                    <TrashSimple size={14} />
-                  </button>
-                </div>
-              ))}
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={on}
+                      aria-label={`${on ? "Disable" : "Enable"} ${pm.name ?? pm.repo}`}
+                      onClick={() => onTogglePersonal(pm.repo, !on)}
+                      className={`ring-focus relative h-5 w-9 shrink-0 rounded-full transition-colors ${
+                        on ? "accent-grad" : "bg-white/15"
+                      }`}
+                    >
+                      <span
+                        className={`absolute top-1/2 h-4 w-4 -translate-y-1/2 rounded-full bg-white transition-all ${
+                          on ? "left-[18px]" : "left-0.5"
+                        }`}
+                      />
+                    </button>
+                    <span className={`min-w-0 flex-1 truncate ${on ? "text-ink" : "text-ink-faint"}`}>
+                      {pm.name ?? pm.repo}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onAddPersonal(pm.repo, pm.name ?? pm.repo)}
+                      title="Change version"
+                      className="ring-focus glass-2 flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-mono text-[11.5px] text-ink-dim hover:text-ink"
+                    >
+                      {pm.tag}
+                      <CaretDown size={11} weight="bold" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onRemovePersonal(pm.repo)}
+                      aria-label={`Remove ${pm.repo}`}
+                      className="ring-focus grid h-7 w-7 place-items-center rounded-md text-ink-faint hover:bg-white/10 hover:text-[#ff8a8a]"
+                    >
+                      <TrashSimple size={14} />
+                    </button>
+                  </div>
+                );
+              })}
               {(settings.personalMods ?? []).length === 0 && (
                 <p className="px-1 text-[12px] text-ink-faint">None yet.</p>
               )}

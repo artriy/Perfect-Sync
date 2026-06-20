@@ -10,7 +10,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { Pill, primaryTag } from "./Pill";
-import type { DiffItem } from "../lib/types";
+import type { DiffItem, PersonalMod } from "../lib/types";
 import { extractLobbyCode, previewCode } from "../lib/bridge";
 
 type Mode = "input" | "decoding" | "diff";
@@ -19,11 +19,12 @@ interface LobbyCodeModalProps {
   open: boolean;
   initialCode?: string;
   diff: DiffItem[];
+  personalMods: PersonalMod[];
   onClose: () => void;
   onApply: (launch: boolean, code: string) => void;
 }
 
-export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: LobbyCodeModalProps) {
+export function LobbyCodeModal({ open, initialCode, diff, personalMods, onClose, onApply }: LobbyCodeModalProps) {
   const reduce = useReducedMotion();
   const [mode, setMode] = useState<Mode>("input");
   const [code, setCode] = useState("");
@@ -122,6 +123,7 @@ export function LobbyCodeModal({ open, initialCode, diff, onClose, onApply }: Lo
                 <ResultStep
                   mode={mode}
                   diff={rows}
+                  personalMods={personalMods}
                   name={name}
                   code={code || initialCode || ""}
                   onApply={(launch) => onApply(launch, code || initialCode || "")}
@@ -174,14 +176,17 @@ function ResultStep({
   diff,
   name,
   code,
+  personalMods,
   onApply,
 }: {
   mode: Mode;
   diff: DiffItem[];
   name: string;
   code: string;
+  personalMods: PersonalMod[];
   onApply: (launch: boolean) => void;
 }) {
+  const alwaysAdded = personalMods.filter((p) => p.enabled !== false);
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="scroll-region -mr-2 min-h-0 flex-1 overflow-y-auto pr-2">
@@ -211,6 +216,31 @@ function ResultStep({
           ? [0, 1, 2, 3].map((i) => <SkeletonRow key={i} />)
           : diff.map((d) => <DiffRow key={d.name} item={d} />)}
       </div>
+
+      {alwaysAdded.length > 0 && (
+        <>
+          <span className="mt-4 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
+            Always added (your mods)
+          </span>
+          <div className="flex flex-col gap-2">
+            {alwaysAdded.map((pm) => (
+              <div key={pm.repo} className="glass flex items-center gap-3 rounded-xl px-3 py-2.5">
+                <span
+                  className="grid h-[22px] w-[22px] shrink-0 place-items-center rounded-lg"
+                  style={{ color: "#d4c6ff", background: "rgba(155,123,255,0.3)" }}
+                >
+                  <DownloadSimple size={13} weight="bold" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[14px] font-semibold text-ink">{pm.name ?? pm.repo}</div>
+                  <div className="truncate text-[12px] text-ink-faint">Always added to your lobbies</div>
+                </div>
+                <span className="font-mono text-[12px] text-ink-dim">{pm.tag}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       <div
         className="mt-4 flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-[13px]"
