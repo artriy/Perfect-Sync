@@ -28,6 +28,9 @@ export function App() {
   const [games, setGames] = useState<GameInstall[]>([]);
   const [settings, setSettings] = useState<Settings>({});
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
+  const [update, setUpdate] = useState<bridge.UpdateInfo | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [startupError, setStartupError] = useState<string | null>(null);
 
   const [addOpen, setAddOpen] = useState(false);
   const [lobbyOpen, setLobbyOpen] = useState(false);
@@ -79,9 +82,13 @@ export function App() {
         .then(setCatalog)
         .catch(() => {});
     })().catch((e) => {
-      notify(String(e), "error");
+      setStartupError(String(e));
       setLoaded(true);
     });
+  }, []);
+
+  useEffect(() => {
+    bridge.checkUpdate().then(setUpdate).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -104,10 +111,30 @@ export function App() {
 
   const active = profiles.find((p) => p.id === activeId) ?? profiles[0];
 
-  if (!loaded || !active) {
+  if (!loaded) {
     return (
       <div className="grid h-[100dvh] place-items-center">
         <p className="subtitle text-ink-dim">Loading Perfect-Sync…</p>
+      </div>
+    );
+  }
+
+  if (!active) {
+    return (
+      <div className="grid h-[100dvh] place-items-center px-8 text-center">
+        <div>
+          <p className="text-[15px] font-semibold text-ink">Perfect-Sync couldn't start</p>
+          <p className="mt-1 max-w-[420px] text-[13px] text-ink-dim">
+            {startupError ?? "Failed to load your profiles."}
+          </p>
+          <button
+            type="button"
+            onClick={() => location.reload()}
+            className="ring-focus accent-grad mt-4 rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820]"
+          >
+            Retry
+          </button>
+        </div>
       </div>
     );
   }
@@ -412,8 +439,13 @@ export function App() {
     }
   };
 
-  const completeSetup = async (gamePath?: string) => {
-    const next: Settings = { ...settings, setupComplete: true, ...(gamePath ? { gamePath } : {}) };
+  const completeSetup = async (gamePath?: string, arch?: string) => {
+    const next: Settings = {
+      ...settings,
+      setupComplete: true,
+      ...(gamePath ? { gamePath } : {}),
+      ...(arch ? { arch: arch as Arch } : {}),
+    };
     setSettings(next);
     try {
       await bridge.saveSettings(next);
@@ -429,6 +461,27 @@ export function App() {
         onPasteCode={openLobbyFromCode}
         onOpenSettings={() => setSettingsOpen(true)}
       />
+
+      {update && !updateDismissed && (
+        <div className="mx-3 mt-2 flex items-center gap-3 rounded-xl border border-[rgba(123,150,255,0.35)] bg-[rgba(123,150,255,0.12)] px-4 py-2 text-[13px] text-[#cbd8ff]">
+          <span className="flex-1">Perfect-Sync {update.version} is available.</span>
+          <button
+            type="button"
+            onClick={() => bridge.openUrl(update.url)}
+            className="ring-focus accent-grad rounded-lg px-3 py-1.5 text-[12.5px] font-semibold text-[#0d0820]"
+          >
+            Download
+          </button>
+          <button
+            type="button"
+            onClick={() => setUpdateDismissed(true)}
+            aria-label="Dismiss update"
+            className="ring-focus rounded-lg px-2 py-1 text-ink-faint hover:text-ink"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
 
       <div className="flex min-h-0 flex-1 p-3 pt-2.5">

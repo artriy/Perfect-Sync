@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Perfect-Sync",
   "version": "0.1.0",
-  "identifier": "com.perfectsync.app",
+  "identifier": "com.artriy.perfectsync",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",

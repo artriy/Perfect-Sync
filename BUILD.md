@@ -47,3 +47,23 @@ pnpm dev                  # browser-only UI demo (mock data) at http://localhost
   from GitHub) once, then caches it under `%APPDATA%/Perfect-Sync`.
 - The mod catalog is fetched from GitHub at startup and cached, with a bundled
   copy as offline fallback.
+
+## Cross-platform builds (CI)
+
+Pushing a tag like `v0.1.0` triggers `.github/workflows/release.yml`, which builds
+Windows, Linux, and macOS (Apple Silicon + Intel) via `tauri-apps/tauri-action` and
+creates a **draft prerelease** on GitHub with the bundled artifacts attached. You can
+also run it manually from the Actions tab (workflow_dispatch). The local
+`pnpm run build:exe` remains the Windows-only path for quick testing.
+
+## Code signing & updates
+
+- **Windows** builds are currently **unsigned**, so SmartScreen shows a prompt on
+  first run (click **Run anyway**). To sign, add an Authenticode certificate and wire
+  it into CI through `tauri-action`/environment variables.
+- **macOS** artifacts need an Apple Developer ID plus notarization (set the `APPLE_*`
+  secrets) before they are distributable; until then they are unsigned and Gatekeeper
+  will block them.
+- The app already ships an in-app "update available" notifier that checks GitHub
+  Releases. A full signed auto-installer (`tauri-plugin-updater` with a signing
+  keypair) is future work.

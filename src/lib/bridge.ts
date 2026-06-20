@@ -217,6 +217,22 @@ export async function launchProfile(gamePath: string, profileId: string): Promis
   if (inTauri) await invoke("launch_profile", { gamePath, profileId });
 }
 
+export interface UpdateInfo {
+  version: string;
+  url: string;
+}
+
+/** Check GitHub Releases for a newer version (null if up to date or offline). */
+export async function checkUpdate(): Promise<UpdateInfo | null> {
+  if (!inTauri) return null;
+  return invoke<UpdateInfo | null>("check_update");
+}
+
+/** Open an https URL in the user's default browser. */
+export async function openUrl(url: string): Promise<void> {
+  if (inTauri) await invoke("open_url", { url });
+}
+
 // ----------------------------------------------------------- lobby sharing
 /** Custom URI scheme the Tauri shell registers for one-click lobby links. */
 export const LOBBY_SCHEME = "perfectsync";

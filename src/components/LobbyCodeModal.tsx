@@ -197,6 +197,7 @@ function ResultStep({
 }) {
   const alwaysAdded = personalMods.filter((p) => p.enabled !== false);
   const flaggedCount = diff.filter((d) => d.trust === "flagged").length;
+  const [ack, setAck] = useState(false);
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="scroll-region -mr-2 min-h-0 flex-1 overflow-y-auto pr-2">
@@ -239,6 +240,18 @@ function ResultStep({
             {flaggedCount} mod{flaggedCount > 1 ? "s are" : " is"} <strong>unverified</strong> (not in the trusted catalog). Only apply a code from someone you trust.
           </span>
         </div>
+      )}
+
+      {mode !== "decoding" && !error && flaggedCount > 0 && (
+        <label className="mt-2 flex cursor-pointer items-center gap-2 px-1 text-[12.5px] text-ink-dim">
+          <input
+            type="checkbox"
+            checked={ack}
+            onChange={(e) => setAck(e.target.checked)}
+            className="h-4 w-4 shrink-0 accent-[#9b7bff]"
+          />
+          I trust whoever shared this code and want to install the unverified mods.
+        </label>
       )}
 
       {alwaysAdded.length > 0 && (
@@ -289,7 +302,7 @@ function ResultStep({
         <button
           type="button"
           onClick={() => onApply(false)}
-          disabled={mode === "decoding" || !!error}
+          disabled={mode === "decoding" || !!error || (flaggedCount > 0 && !ack)}
           className="ring-focus glass rounded-xl px-4 py-2.5 text-[14px] text-ink disabled:opacity-50"
         >
           Apply only
@@ -297,7 +310,7 @@ function ResultStep({
         <button
           type="button"
           onClick={() => onApply(true)}
-          disabled={mode === "decoding" || !!error}
+          disabled={mode === "decoding" || !!error || (flaggedCount > 0 && !ack)}
           className="ring-focus accent-grad flex items-center gap-2 rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820] disabled:opacity-50"
           style={{ boxShadow: "0 8px 24px rgba(123,150,255,0.5)" }}
         >

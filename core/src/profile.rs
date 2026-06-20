@@ -162,7 +162,10 @@ pub fn install_plugin_bytes(
 ) -> io::Result<PathBuf> {
     let plugins = loader::profile_plugins_dir(profiles_root, id);
     fs::create_dir_all(&plugins)?;
-    let dest = plugins.join(file_name);
+    let name = std::path::Path::new(file_name)
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid plugin file name"))?;
+    let dest = plugins.join(name);
     fs::write(&dest, bytes)?;
     Ok(dest)
 }
@@ -459,5 +462,19 @@ mod tests {
         assert!(store.delete("..").is_err());
         assert!(tmp.path().is_dir());
         assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn install_plugin_bytes_basenames_and_rejects_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugins = loader::profile_plugins_dir(tmp.path(), "p1");
+
+        let dest = install_plugin_bytes(tmp.path(), "p1", "Cool.dll", b"x").unwrap();
+        assert_eq!(dest, plugins.join("Cool.dll"));
+        assert!(dest.exists());
+
+        let dest = install_plugin_bytes(tmp.path(), "p1", "../evil.dll", b"x").unwrap();
+        assert_eq!(dest, plugins.join("evil.dll"));
+        assert!(!plugins.parent().unwrap().join("evil.dll").exists());
     }
 }

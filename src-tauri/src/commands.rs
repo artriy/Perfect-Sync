@@ -262,7 +262,11 @@ fn display_catalog() -> Vec<CatalogListItem> {
     // trust is authoritative from the bundled catalog, not the cache or hosted list
     let bundled = bundled_catalog();
     for it in &mut list {
-        it.trust = bundled.get(&it.id).map(|e| e.trust).unwrap_or(Trust::Flagged);
+        it.trust = bundled
+            .get(&it.id)
+            .filter(|e| e.repo.as_deref().unwrap_or(&e.id) == it.repo)
+            .map(|e| e.trust)
+            .unwrap_or(Trust::Flagged);
     }
     list
 }
@@ -870,4 +874,56 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
         Ok(())
     })
     .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    pub version: String,
+    pub url: String,
+}
+
+const REPO_SLUG: &str = "artriy/Perfect-Sync";
+
+/// Check GitHub Releases for a newer version. Returns None on any error (offline,
+/// rate-limited, no release) so the UI just shows nothing.
+#[tauri::command]
+pub async fn check_update() -> Option<UpdateInfo> {
+    blocking(|| {
+        let url = format!("https://api.github.com/repos/{REPO_SLUG}/releases/latest");
+        let text = http().get_text(&url).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let tag = v["tag_name"].as_str().unwrap_or_default().to_string();
+        if tag.is_empty() {
+            return Err("no release tag".to_string());
+        }
+        if !perfect_sync_core::version::is_newer(&tag, env!("CARGO_PKG_VERSION")) {
+            return Ok(None);
+        }
+        let html = v["html_url"].as_str().unwrap_or("");
+        let url = if html.is_empty() {
+            format!("https://github.com/{REPO_SLUG}/releases/latest")
+        } else {
+            html.to_string()
+        };
+        Ok(Some(UpdateInfo { version: tag.trim_start_matches('v').to_string(), url }))
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Open an https URL in the user's default browser (used by the update notifier).
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("only https links allowed".to_string());
+    }
+    let spawned = if cfg!(windows) {
+        std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&url).spawn()
+    };
+    spawned.map(|_| ()).map_err(|e| e.to_string())
 }

@@ -58,7 +58,9 @@ pub fn run() {
       commands::set_mod_version,
       commands::remove_mod,
       commands::apply_lobby_code,
-      commands::launch_profile
+      commands::launch_profile,
+      commands::check_update,
+      commands::open_url
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
