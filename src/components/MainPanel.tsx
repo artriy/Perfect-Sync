@@ -17,6 +17,7 @@ interface MainPanelProps {
   onDelete: () => void;
   onLaunch: () => void;
   onAddMod: () => void;
+  onSetup: () => void;
   trustOf: (id: string) => Trust;
 }
 
@@ -167,6 +168,7 @@ export function MainPanel(props: MainPanelProps) {
         running={game.running}
         busy={busyModId !== null}
         onLaunch={props.onLaunch}
+        onSetup={props.onSetup}
       />
     </section>
   );

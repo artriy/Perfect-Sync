@@ -99,4 +99,6 @@ export interface Settings {
   setupComplete?: boolean;
   /** don't warn on launch when BepInEx isn't fully installed */
   skipLaunchWarning?: boolean;
+  /** storefront the game came from, picks the launch path (Steam/Epic) */
+  store?: Store;
 }

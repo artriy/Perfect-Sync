@@ -217,6 +217,11 @@ export async function launchProfile(gamePath: string, profileId: string): Promis
   if (inTauri) await invoke("launch_profile", { gamePath, profileId });
 }
 
+/** Set up the active profile's mods in the game folder without launching. */
+export async function syncProfile(gamePath: string, profileId: string): Promise<void> {
+  if (inTauri) await invoke("sync_profile", { gamePath, profileId });
+}
+
 export interface UpdateInfo {
   version: string;
   url: string;

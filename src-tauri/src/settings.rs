@@ -38,6 +38,8 @@ pub struct Settings {
     pub setup_complete: bool,
     #[serde(default)]
     pub skip_launch_warning: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub store: Option<String>,
 }
 
 pub fn cache_dir() -> PathBuf {

@@ -60,7 +60,8 @@ pub fn run() {
       commands::apply_lobby_code,
       commands::launch_profile,
       commands::check_update,
-      commands::open_url
+      commands::open_url,
+      commands::sync_profile
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

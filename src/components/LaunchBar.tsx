@@ -1,14 +1,15 @@
 import { motion, useReducedMotion } from "motion/react";
-import { Play } from "@phosphor-icons/react";
+import { Play, Wrench } from "@phosphor-icons/react";
 
 interface LaunchBarProps {
   profileName: string;
   running: boolean;
   busy?: boolean;
   onLaunch: () => void;
+  onSetup: () => void;
 }
 
-export function LaunchBar({ profileName, running, busy, onLaunch }: LaunchBarProps) {
+export function LaunchBar({ profileName, running, busy, onLaunch, onSetup }: LaunchBarProps) {
   const reduce = useReducedMotion();
   return (
     <div className="glass-2 flex items-center gap-4 px-5 py-3.5">
@@ -25,6 +26,15 @@ export function LaunchBar({ profileName, running, busy, onLaunch }: LaunchBarPro
 
       <div className="flex-1" />
 
+      <button
+        type="button"
+        onClick={onSetup}
+        disabled={busy}
+        className="ring-focus glass flex items-center gap-2 rounded-xl px-4 py-3 text-[14px] font-semibold text-ink-dim transition-colors hover:text-ink disabled:opacity-60"
+        title="Install BepInEx + this profile's mods into your Among Us folder without launching"
+      >
+        <Wrench size={16} /> Set up mods
+      </button>
       <motion.button
         type="button"
         onClick={onLaunch}

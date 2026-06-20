@@ -197,7 +197,8 @@ function ResultStep({
 }) {
   const alwaysAdded = personalMods.filter((p) => p.enabled !== false);
   const flaggedCount = diff.filter((d) => d.trust === "flagged").length;
-  const [ack, setAck] = useState(false);
+  const [confirm, setConfirm] = useState<boolean | null>(null);
+  const apply = (launch: boolean) => (flaggedCount > 0 ? setConfirm(launch) : onApply(launch));
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="scroll-region -mr-2 min-h-0 flex-1 overflow-y-auto pr-2">
@@ -240,18 +241,6 @@ function ResultStep({
             {flaggedCount} mod{flaggedCount > 1 ? "s are" : " is"} <strong>unverified</strong> (not in the trusted catalog). Only apply a code from someone you trust.
           </span>
         </div>
-      )}
-
-      {mode !== "decoding" && !error && flaggedCount > 0 && (
-        <label className="mt-2 flex cursor-pointer items-center gap-2 px-1 text-[12.5px] text-ink-dim">
-          <input
-            type="checkbox"
-            checked={ack}
-            onChange={(e) => setAck(e.target.checked)}
-            className="h-4 w-4 shrink-0 accent-[#9b7bff]"
-          />
-          I trust whoever shared this code and want to install the unverified mods.
-        </label>
       )}
 
       {alwaysAdded.length > 0 && (
@@ -301,22 +290,58 @@ function ResultStep({
       <div className="mt-4 flex justify-end gap-2.5 border-t border-white/10 pt-4">
         <button
           type="button"
-          onClick={() => onApply(false)}
-          disabled={mode === "decoding" || !!error || (flaggedCount > 0 && !ack)}
+          onClick={() => apply(false)}
+          disabled={mode === "decoding" || !!error}
           className="ring-focus glass rounded-xl px-4 py-2.5 text-[14px] text-ink disabled:opacity-50"
         >
           Apply only
         </button>
         <button
           type="button"
-          onClick={() => onApply(true)}
-          disabled={mode === "decoding" || !!error || (flaggedCount > 0 && !ack)}
+          onClick={() => apply(true)}
+          disabled={mode === "decoding" || !!error}
           className="ring-focus accent-grad flex items-center gap-2 rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820] disabled:opacity-50"
           style={{ boxShadow: "0 8px 24px rgba(123,150,255,0.5)" }}
         >
           <Play size={15} weight="fill" /> Apply &amp; Launch
         </button>
       </div>
+      {confirm !== null && (
+        <div
+          className="absolute inset-0 z-20 grid place-items-center rounded-3xl p-6"
+          style={{ background: "rgba(6,4,18,0.72)", backdropFilter: "blur(2px)" }}
+        >
+          <div className="glass-strong w-[380px] max-w-full rounded-2xl p-5">
+            <div className="flex items-center gap-2.5">
+              <Warning size={20} weight="fill" className="text-[#ffd9a8]" />
+              <h3 className="text-[16px] font-semibold text-ink">Install unverified mods?</h3>
+            </div>
+            <p className="mt-2 text-[13px] text-ink-dim">
+              This code includes {flaggedCount} mod{flaggedCount > 1 ? "s" : ""} not in the trusted catalog. Only continue if you trust whoever shared it.
+            </p>
+            <div className="mt-4 flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setConfirm(null)}
+                className="ring-focus glass rounded-xl px-4 py-2.5 text-[13.5px] text-ink"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const launch = confirm ?? false;
+                  setConfirm(null);
+                  onApply(launch);
+                }}
+                className="ring-focus accent-grad rounded-xl px-4 py-2.5 text-[13.5px] font-bold text-[#0d0820]"
+              >
+                Install anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -848,27 +848,91 @@ pub fn loader_status(game_path: String, profile_id: String) -> LoaderStatus {
     }
 }
 
+/// Install/verify BepInEx and copy the profile's plugins into the game dir,
+/// WITHOUT launching. Shared by launch and the standalone "set up mods" action.
+fn prepare_profile(game_path: &str, profile_id: &str) -> Result<(), String> {
+    if process::is_running() {
+        return Err("Among Us is running. Close it first.".into());
+    }
+    let game_dir = Path::new(game_path);
+    let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
+        .map(arch_str)
+        .or_else(|| settings::load().arch)
+        .unwrap_or_else(|| "x86".to_string());
+    ensure_loader_impl(game_path, profile_id, &arch)?;
+    let _ = loader::ensure_steam_appid(game_dir);
+    let _ = loader::write_console_off(game_dir);
+    loader::sync_profile_plugins(&settings::profiles_root(), profile_id, game_dir)
+        .map_err(|e| e.to_string())
+}
+
+/// Set up the mods in the game folder without launching, so the user can start
+/// the game themselves (or via Steam/Epic outside the app).
+#[tauri::command]
+pub async fn sync_profile(game_path: String, profile_id: String) -> Result<(), String> {
+    blocking(move || prepare_profile(&game_path, &profile_id)).await
+}
+
+/// Which store to launch through: persisted from setup, else inferred from the path.
+fn launch_store(game_path: &str) -> Option<String> {
+    if let Some(s) = settings::load().store {
+        return Some(s);
+    }
+    if game_path.replace('\\', "/").to_lowercase().contains("/steamapps/") {
+        return Some("steam".to_string());
+    }
+    None
+}
+
+const EPIC_STARTER_URL: &str =
+    "https://github.com/whichtwix/EpicGamesStarter/releases/latest/download/EpicGamesStarter.exe.zip";
+
+/// Download + cache EpicGamesStarter.exe (once); returns its path.
+fn ensure_epic_starter(http: &dyn Http) -> Result<std::path::PathBuf, String> {
+    let dir = settings::cache_dir().join("epic");
+    let exe = dir.join("EpicGamesStarter.exe");
+    if exe.is_file() {
+        return Ok(exe);
+    }
+    let bytes = http.get_bytes(EPIC_STARTER_URL).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    loader::extract_all(&bytes, &dir).map_err(|e| e.to_string())?;
+    if exe.is_file() {
+        Ok(exe)
+    } else {
+        Err("EpicGamesStarter.exe missing from download".to_string())
+    }
+}
+
 #[tauri::command]
 pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(), String> {
     blocking(move || {
-        if process::is_running() {
-            return Err("Among Us is running. Close it before launching.".into());
-        }
+        prepare_profile(&game_path, &profile_id)?;
         let game_dir = Path::new(&game_path);
-        let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
-            .map(arch_str)
-            .or_else(|| settings::load().arch)
-            .unwrap_or_else(|| "x86".to_string());
-        ensure_loader_impl(&game_path, &profile_id, &arch)?;
-        let _ = loader::ensure_steam_appid(game_dir);
-        let _ = loader::write_console_off(game_dir);
-        // copy this profile's enabled plugins into the game's BepInEx/plugins
-        loader::sync_profile_plugins(&settings::profiles_root(), &profile_id, game_dir)
-            .map_err(|e| e.to_string())?;
-        let ctx = compat::resolve(game_dir);
-        if let Some(prefix) = &ctx.prefix {
-            let _ = compat::register_winhttp_override(prefix);
+        // Windows store-specific launch: Steam starts Steam + the game; Epic uses
+        // EpicGamesStarter to pass the launcher's auth to the modded copy.
+        if cfg!(windows) {
+            match launch_store(&game_path).as_deref() {
+                Some("steam") => {
+                    let url = format!("steam://rungameid/{}", game::STEAM_APP_ID);
+                    std::process::Command::new("cmd")
+                        .args(["/C", "start", "", &url])
+                        .spawn()
+                        .map_err(|e| format!("couldn't launch via Steam: {e}"))?;
+                    return Ok(());
+                }
+                Some("epic") => {
+                    let starter = ensure_epic_starter(&http())?;
+                    std::process::Command::new(&starter)
+                        .current_dir(game_dir)
+                        .spawn()
+                        .map_err(|e| format!("couldn't run EpicGamesStarter: {e}"))?;
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
+        let ctx = compat::resolve(game_dir);
         let spec = compat::build_launch_spec(game_dir, &ctx);
         process::launch(&spec).map_err(|e| launch_err_msg(&ctx, &e))?;
         Ok(())

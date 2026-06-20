@@ -13,7 +13,7 @@ import { Toast, type ToastState } from "./components/Toast";
 import * as bridge from "./lib/bridge";
 import { CATALOG } from "./data/mock";
 import { CREW } from "./lib/palette";
-import type { Arch, CatalogItem, GameInstall, Profile, ProfileMod, Settings, Trust } from "./lib/types";
+import type { Arch, CatalogItem, GameInstall, Profile, ProfileMod, Settings, Store, Trust } from "./lib/types";
 
 const CREW_CYCLE = Object.values(CREW);
 
@@ -421,8 +421,13 @@ export function App() {
       setProfiles((ps) => [...ps.filter((p) => p.id !== built.id), built]);
       setActiveId(built.id);
       await ensureLoader(built.id);
-      if (doLaunch) await doLaunchProfile(built);
-      else notify(`Lobby profile ready: ${built.name}`);
+      if (doLaunch) {
+        await doLaunchProfile(built);
+      } else {
+        const gamePath = settings.gamePath ?? game?.path;
+        if (bridge.inTauri && gamePath) await bridge.syncProfile(gamePath, built.id);
+        notify(`Lobby profile ready: ${built.name}`);
+      }
     } catch (e) {
       notify(String(e), "error");
     }
@@ -439,18 +444,37 @@ export function App() {
     }
   };
 
-  const completeSetup = async (gamePath?: string, arch?: string) => {
+  const completeSetup = async (gamePath?: string, arch?: string, store?: string) => {
     const next: Settings = {
       ...settings,
       setupComplete: true,
       ...(gamePath ? { gamePath } : {}),
       ...(arch ? { arch: arch as Arch } : {}),
+      ...(store ? { store: store as Store } : {}),
     };
     setSettings(next);
     try {
       await bridge.saveSettings(next);
     } catch (e) {
       notify(String(e), "error");
+    }
+  };
+
+  const setupMods = async (p: Profile) => {
+    const gamePath = settings.gamePath ?? game?.path;
+    if (bridge.inTauri && !gamePath) {
+      notify("No Among Us folder set. Open Settings to choose it.", "error");
+      return;
+    }
+    notify("Setting up mods…");
+    setBusyModId("__setup__");
+    try {
+      await bridge.syncProfile(gamePath ?? "", p.id);
+      notify("Mods set up in your Among Us folder. Launch Among Us when ready.");
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setBusyModId(null);
     }
   };
 
@@ -506,6 +530,7 @@ export function App() {
             onDelete={deleteActiveProfile}
             onLaunch={() => doLaunchProfile(active)}
             onAddMod={() => setAddOpen(true)}
+            onSetup={() => setupMods(active)}
           />
         </div>
       </div>

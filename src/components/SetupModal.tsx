@@ -8,7 +8,7 @@ interface SetupModalProps {
   open: boolean;
   detected: GameInstall[];
   profileId: string;
-  onFinish: (gamePath?: string, arch?: string) => void;
+  onFinish: (gamePath?: string, arch?: string, store?: string) => void;
 }
 
 const LABEL = "mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase";
@@ -45,6 +45,7 @@ export function SetupModal({ open, detected, profileId, onFinish }: SetupModalPr
   }, [chosen, profileId]);
 
   const archOf = (path: string) => detected.find((d) => d.path === path)?.arch ?? "x86";
+  const storeOf = (path: string) => detected.find((d) => d.path === path)?.store;
 
   const browse = async () => {
     const p = await pickFolder();
@@ -192,7 +193,7 @@ export function SetupModal({ open, detected, profileId, onFinish }: SetupModalPr
               <button
                 type="button"
                 disabled={!chosen}
-                onClick={() => onFinish(chosen ?? undefined, chosen ? archOf(chosen) : undefined)}
+                onClick={() => onFinish(chosen ?? undefined, chosen ? archOf(chosen) : undefined, chosen ? storeOf(chosen) : undefined)}
                 className="ring-focus accent-grad rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820] disabled:opacity-50"
               >
                 {chosen && !status?.current ? "Finish without loader" : "Finish"}
