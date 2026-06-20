@@ -890,6 +890,18 @@ fn launch_store(game_path: &str) -> Option<String> {
     None
 }
 
+/// Whether `game_dir` is the exact install Steam launches for the Among Us appid.
+/// An unresolvable Steam install keeps the steam:// path (no behavior change).
+fn launches_registered_install(game_dir: &Path) -> bool {
+    match game::steam_install_path() {
+        Some(reg) => match (fs::canonicalize(&reg), fs::canonicalize(game_dir)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        },
+        None => true,
+    }
+}
+
 const EPIC_STARTER_URL: &str =
     "https://github.com/whichtwix/EpicGamesStarter/releases/latest/download/EpicGamesStarter.exe.zip";
 
@@ -920,12 +932,19 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
         if cfg!(windows) {
             match launch_store(&game_path).as_deref() {
                 Some("steam") => {
-                    let url = format!("steam://rungameid/{}", game::STEAM_APP_ID);
-                    std::process::Command::new("cmd")
-                        .args(["/C", "start", "", &url])
-                        .spawn()
-                        .map_err(|e| format!("couldn't launch via Steam: {e}"))?;
-                    return Ok(());
+                    // steam://rungameid launches Steam's REGISTERED install for the
+                    // appid, not necessarily the folder we just synced. Only defer to
+                    // Steam when game_dir IS that install; otherwise fall through and
+                    // launch this copy's exe directly (steam_appid.txt, written during
+                    // setup, lets it init Steamworks while Steam runs).
+                    if launches_registered_install(game_dir) {
+                        let url = format!("steam://rungameid/{}", game::STEAM_APP_ID);
+                        std::process::Command::new("cmd")
+                            .args(["/C", "start", "", &url])
+                            .spawn()
+                            .map_err(|e| format!("couldn't launch via Steam: {e}"))?;
+                        return Ok(());
+                    }
                 }
                 Some("epic") => {
                     let starter = ensure_epic_starter(&http(), game_dir)?;

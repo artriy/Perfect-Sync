@@ -85,6 +85,13 @@ pub fn parse_acf_installdir(acf: &str) -> Option<String> {
     re.captures(acf).map(|c| unescape_vdf(&c[1]))
 }
 
+/// The Among Us folder Steam actually launches for `STEAM_APP_ID` (its
+/// registered install), found across the host's known Steam roots. `None` when
+/// no Steam install of Among Us is registered.
+pub fn steam_install_path() -> Option<PathBuf> {
+    steam_roots().into_iter().find_map(|r| locate_steam(&r).map(|g| g.path))
+}
+
 /// Locate Among Us within a known Steam root by walking its library folders.
 pub fn locate_steam(steam_root: &Path) -> Option<GameInstall> {
     let vdf = fs::read_to_string(steam_root.join("steamapps").join("libraryfolders.vdf")).ok()?;
