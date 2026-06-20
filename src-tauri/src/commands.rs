@@ -931,6 +931,7 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
                     let starter = ensure_epic_starter(&http(), game_dir)?;
                     std::process::Command::new(&starter)
                         .current_dir(game_dir)
+                        .stdin(std::process::Stdio::null())
                         .spawn()
                         .map_err(|e| format!("couldn't run EpicGamesStarter: {e}"))?;
                     return Ok(());
