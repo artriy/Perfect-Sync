@@ -1,5 +1,6 @@
 use crate::catalog::Catalog;
 use crate::types::ModTag;
+use std::collections::HashSet;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Resolved {
@@ -9,22 +10,24 @@ pub struct Resolved {
     pub conflicts: Vec<String>,
 }
 
-fn visit(cat: &Catalog, id: &str, out: &mut Vec<String>) {
-    if out.iter().any(|x| x == id) {
+fn visit(cat: &Catalog, id: &str, out: &mut Vec<String>, stack: &mut HashSet<String>) {
+    if out.iter().any(|x| x == id) || !stack.insert(id.to_string()) {
         return;
     }
     if let Some(entry) = cat.get(id) {
         for dep in &entry.dependencies {
-            visit(cat, dep, out);
+            visit(cat, dep, out, stack);
         }
     }
+    stack.remove(id);
     out.push(id.to_string());
 }
 
 pub fn resolve(cat: &Catalog, selected: &[String]) -> Resolved {
     let mut ordered = Vec::new();
+    let mut stack = HashSet::new();
     for id in selected {
-        visit(cat, id, &mut ordered);
+        visit(cat, id, &mut ordered, &mut stack);
     }
     let role_mods: Vec<String> = selected
         .iter()
@@ -78,5 +81,18 @@ mod tests {
             ],
         );
         assert_eq!(r.conflicts.len(), 2);
+    }
+
+    #[test]
+    fn cyclic_dependencies_terminate() {
+        let json = r#"{"schema":1,"mods":[
+            {"id":"A","name":"A","summary":"","repo":null,"tags":[],"dependencies":["B"],"assetRules":{}},
+            {"id":"B","name":"B","summary":"","repo":null,"tags":[],"dependencies":["A"],"assetRules":{}}
+        ]}"#;
+        let cat = parse(json).unwrap();
+        let r = resolve(&cat, &["A".to_string()]);
+        assert!(r.ordered.iter().any(|x| x == "A"));
+        assert!(r.ordered.iter().any(|x| x == "B"));
+        assert_eq!(r.ordered.iter().filter(|x| *x == "A").count(), 1);
     }
 }

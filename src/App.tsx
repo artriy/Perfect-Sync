@@ -378,7 +378,29 @@ export function App() {
           ? `Launching ${p.name}. Epic may ask you to sign in the first time, that's normal.`
           : `Launching ${p.name}`,
       );
-      if (!bridge.inTauri) setTimeout(() => setRunning(false), 2800);
+      if (bridge.inTauri) {
+        // unlock when the game process exits, or after a grace if it never appears
+        const start = Date.now();
+        let seen = false;
+        const poll = setInterval(async () => {
+          let alive = false;
+          try {
+            alive = await bridge.gameRunning();
+          } catch {
+            return;
+          }
+          if (alive) {
+            seen = true;
+            return;
+          }
+          if (seen || Date.now() - start > 20000) {
+            clearInterval(poll);
+            setRunning(false);
+          }
+        }, 2000);
+      } else {
+        setTimeout(() => setRunning(false), 2800);
+      }
     } catch (e) {
       setRunning(false);
       notify(String(e), "error");

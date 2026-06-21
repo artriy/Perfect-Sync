@@ -62,7 +62,7 @@ fn is_github_host(url: &str) -> bool {
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url);
     let authority = after_scheme
-        .split(|c| c == '/' || c == '?' || c == '#')
+        .split(['/', '?', '#'])
         .next()
         .unwrap_or("");
     let hostport = authority.rsplit('@').next().unwrap_or(authority);

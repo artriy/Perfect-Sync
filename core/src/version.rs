@@ -24,7 +24,12 @@ pub fn parse(s: &str) -> Version {
 
 pub fn cmp(a: &str, b: &str) -> Ordering {
     let (va, vb) = (parse(a), parse(b));
-    va.parts.cmp(&vb.parts).then(va.be.cmp(&vb.be))
+    va.parts.cmp(&vb.parts).then_with(|| match (va.be, vb.be) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => x.cmp(&y),
+    })
 }
 
 /// True if `candidate` is a strictly newer release than `current`.
@@ -59,5 +64,17 @@ mod tests {
     fn bepinex_be_builds() {
         assert!(is_newer("6.0.0-be.735", "6.0.0-be.697"));
         assert_eq!(cmp("6.0.0-be.735", "6.0.0-be.735"), Ordering::Equal);
+    }
+
+    #[test]
+    fn stable_outranks_prerelease() {
+        assert!(is_newer("6.0.0", "6.0.0-be.764"));
+        assert!(!is_newer("6.0.0-be.764", "6.0.0"));
+    }
+
+    #[test]
+    fn bare_be_markers_order_numerically() {
+        assert!(is_newer("be.770", "be.764"));
+        assert_eq!(cmp("be.764", "be.764"), Ordering::Equal);
     }
 }

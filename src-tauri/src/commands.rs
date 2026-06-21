@@ -171,29 +171,39 @@ fn ensure_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(
     }
     let root = settings::profiles_root();
     loader::ensure_profile_layout(&root, profile_id).map_err(|e| e.to_string())?;
-    // a loader we installed is already present? leave it (no per-launch network).
-    if loader::has_loader(game_dir) {
-        return Ok(());
-    }
     // prefer the real exe bitness over the caller's hint (selects the x86 vs x64 pack)
     let exe_arch = game::exe_arch(&game_dir.join(process::GAME_EXE)).map(arch_str);
     let arch = exe_arch.as_deref().unwrap_or(arch);
-    // resolve newest BEFORE wiping, so an offline failure doesn't break a working install
     let h = http();
-    let (id, url) = resolve_loader(&h, arch)?;
+    let have = loader::has_loader(game_dir);
+    // Resolve the newest build to check freshness. If a working loader is already
+    // present but the network is unreachable, keep it so launching works offline.
+    let (id, url) = match resolve_loader(&h, arch) {
+        Ok(pair) => pair,
+        Err(_) if have => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // Up to date already? Otherwise reinstall the newer build: an Among Us update
+    // changes the IL2CPP metadata and the old BepInEx build stops loading.
+    if have && !loader::is_outdated(loader::installed_version(game_dir).as_deref(), &id) {
+        return Ok(());
+    }
+    // Download + extract into the cache BEFORE removing the installed loader, so a
+    // failed download can't leave the game with a half-removed loader.
+    let cache = settings::cache_dir().join("bepinex").join(&id).join(arch);
+    if loader::locate_pack_root(&cache).is_none() {
+        let bytes = h.get_bytes(&url).map_err(|e| e.to_string())?;
+        loader::extract_all(&bytes, &cache).map_err(|e| e.to_string())?;
+    }
+    let pack_root = loader::locate_pack_root(&cache)
+        .ok_or_else(|| "downloaded BepInEx pack is missing winhttp.dll".to_string())?;
     // remove any old/foreign loader bits (keep plugins) then install the current build
     let bep = game_dir.join("BepInEx");
     let _ = fs::remove_file(game_dir.join("winhttp.dll"));
     for d in ["core", "interop", "cache"] {
         let _ = fs::remove_dir_all(bep.join(d));
     }
-    let cache = settings::cache_dir().join("bepinex").join(&id).join(arch);
-    if let Some(pack_root) = loader::locate_pack_root(&cache) {
-        loader::install_pack(&pack_root, game_dir, &id).map_err(|e| e.to_string())?;
-    } else {
-        let bytes = h.get_bytes(&url).map_err(|e| e.to_string())?;
-        loader::install_pack_from_zip(&bytes, game_dir, &cache, &id).map_err(|e| e.to_string())?;
-    }
+    loader::install_pack(&pack_root, game_dir, &id).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -860,6 +870,18 @@ pub fn loader_status(game_path: String, profile_id: String) -> LoaderStatus {
     }
 }
 
+/// A game copy in a location apps can't write (Microsoft Store / Game Pass lives
+/// under the ACL-locked WindowsApps). Returns guidance instead of letting the
+/// install fail later with a raw permission error.
+fn protected_install_hint(game_dir: &Path) -> Option<String> {
+    let p = game_dir.to_string_lossy().replace('\\', "/").to_lowercase();
+    if p.contains("/windowsapps/") || p.ends_with("/windowsapps") {
+        Some("This Among Us copy is in the protected WindowsApps folder (Microsoft Store / Game Pass), which apps can't modify. Copy the \"Among Us\" folder to a normal location (e.g. your Documents), then point Perfect-Sync at that copy.".to_string())
+    } else {
+        None
+    }
+}
+
 /// Install/verify BepInEx and copy the profile's plugins into the game dir,
 /// WITHOUT launching. Shared by launch and the standalone "set up mods" action.
 fn prepare_profile(game_path: &str, profile_id: &str) -> Result<(), String> {
@@ -867,6 +889,9 @@ fn prepare_profile(game_path: &str, profile_id: &str) -> Result<(), String> {
         return Err("Among Us is running. Close it first.".into());
     }
     let game_dir = Path::new(game_path);
+    if let Some(hint) = protected_install_hint(game_dir) {
+        return Err(hint);
+    }
     let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
         .map(arch_str)
         .or_else(|| settings::load().arch)

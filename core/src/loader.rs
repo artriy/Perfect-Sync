@@ -24,11 +24,20 @@ pub const STEAM_APP_ID: &str = "945360";
 
 const LOADER_MARKER: &str = ".perfectsync_loader";
 
-/// True if a BepInEx loader installed by THIS app is present (winhttp + preloader
-/// + our marker). A foreign/old install lacking the marker reads false, so the
-/// app reinstalls the current build (auto-heals stale loaders like be.697).
+/// True if a BepInEx loader installed by THIS app is present (winhttp proxy,
+/// IL2CPP preloader, and our marker). A foreign/old install lacking the marker
+/// reads false, so the app reinstalls the current build (auto-heals stale loaders).
 pub fn has_loader(game_dir: &Path) -> bool {
     is_installed(game_dir) && game_dir.join("BepInEx").join(LOADER_MARKER).exists()
+}
+
+/// True if the recorded loader build is older than `latest` (so it should be
+/// reinstalled). A missing/blank record counts as outdated.
+pub fn is_outdated(installed: Option<&str>, latest: &str) -> bool {
+    match installed {
+        Some(cur) => crate::version::is_newer(latest, cur),
+        None => true,
+    }
 }
 
 /// The loader build id this app recorded (e.g. "be.764"), if any.
@@ -52,7 +61,7 @@ pub fn parse_latest_build(html: &str, arch: &str) -> Option<(String, String)> {
     for c in re.captures_iter(html) {
         let n: u64 = c[1].parse().unwrap_or(0);
         let path = format!("projects/bepinex_be/{}/{}", &c[1], &c[2]);
-        if best.as_ref().map_or(true, |(bn, _)| n > *bn) {
+        if best.as_ref().is_none_or(|(bn, _)| n > *bn) {
             best = Some((n, path));
         }
     }
@@ -205,8 +214,9 @@ pub fn is_installed(game_dir: &Path) -> bool {
             .exists()
 }
 
-/// Copy the active profile's enabled plugins into the game's `BepInEx/plugins`,
-/// removing any app-managed plugins from a previous profile first.
+/// Mirror the active profile's enabled plugins into the game's `BepInEx/plugins`,
+/// wiping any plugin DLLs already there first so the game loads exactly the
+/// profile, nothing else.
 pub fn sync_profile_plugins(
     profiles_root: &Path,
     profile_id: &str,
@@ -382,5 +392,31 @@ mod tests {
 
         assert_eq!(fs::read(dest.join("ok.txt")).unwrap(), b"good");
         assert!(!escape.exists(), "absolute zip entry escaped dest");
+    }
+
+    #[test]
+    fn sync_wipes_unmanaged_plugins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("game");
+        let profiles = tmp.path().join("profiles");
+        let game_plugins = game.join("BepInEx").join("plugins");
+        fs::create_dir_all(&game_plugins).unwrap();
+        fs::write(game_plugins.join("UserMod.dll"), b"user").unwrap();
+
+        let p1 = profile_plugins_dir(&profiles, "p1");
+        fs::create_dir_all(&p1).unwrap();
+        fs::write(p1.join("AppMod.dll"), b"app").unwrap();
+
+        sync_profile_plugins(&profiles, "p1", &game).unwrap();
+        assert!(game_plugins.join("AppMod.dll").exists());
+        assert!(!game_plugins.join("UserMod.dll").exists(), "only the profile loads");
+    }
+
+    #[test]
+    fn is_outdated_compares_build_ids() {
+        assert!(is_outdated(Some("be.764"), "be.770"));
+        assert!(!is_outdated(Some("be.770"), "be.764"));
+        assert!(!is_outdated(Some("be.764"), "be.764"));
+        assert!(is_outdated(None, "be.764"));
     }
 }

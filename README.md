@@ -66,9 +66,12 @@ Plus architecture auto-detect (x86 or x64 chosen from the real game executable) 
 always-include mods that get merged into every lobby code you apply.
 
 > [!TIP]
-> **Any store works.** Steam and Epic installs launch natively from the app. Other sources
-> (itch, Microsoft Store, and others) are supported too: Perfect-Sync sets up the mods in the
-> game folder, and you may just need to start the game yourself if it does not launch natively.
+> **Most stores work.** Steam and Epic installs launch natively from the app, and any writable
+> copy (itch, a manually placed folder, and others) is supported too: Perfect-Sync sets up the
+> mods in the game folder, and you may just need to start the game yourself if it does not launch
+> natively. Microsoft Store / Game Pass copies live in the protected `WindowsApps` folder that
+> apps can't modify, so copy "Among Us" to a normal folder (e.g. your Documents) and point
+> Perfect-Sync at that copy.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
