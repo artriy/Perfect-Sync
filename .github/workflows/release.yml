@@ -50,5 +50,5 @@ jobs:
             and breaking changes, and behavior may differ across Among Us versions and
             stores. Use at your own risk. See CHANGELOG.md for details and known limitations.
           releaseDraft: false
-          prerelease: true
+          prerelease: false
           args: ${{ matrix.args }}
