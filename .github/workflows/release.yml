@@ -45,6 +45,10 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Perfect-Sync ${{ github.ref_name }}'
+          releaseBody: |
+            Experimental release, nothing official or stable yet. Expect rough edges
+            and breaking changes, and behavior may differ across Among Us versions and
+            stores. Use at your own risk. See CHANGELOG.md for details and known limitations.
           releaseDraft: false
           prerelease: true
           args: ${{ matrix.args }}
