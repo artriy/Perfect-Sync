@@ -39,6 +39,10 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - run: pnpm install
+      - name: Type-check frontend
+        run: pnpm typecheck
+      - name: Test Rust workspace on runner
+        run: cargo test --workspace --all-targets
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -52,3 +56,12 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+      - name: Verify ad-hoc macOS bundle signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          target="${{ matrix.args }}"
+          app="target/${target#--target }/release/bundle/macos/Perfect-Sync.app"
+          test -d "$app"
+          codesign --verify --deep --strict "$app"
+          codesign --display --verbose=2 "$app"

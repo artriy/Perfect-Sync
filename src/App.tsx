@@ -13,7 +13,7 @@ import { Toast, type ToastState } from "./components/Toast";
 import * as bridge from "./lib/bridge";
 import { CATALOG } from "./data/mock";
 import { CREW } from "./lib/palette";
-import type { Arch, CatalogItem, GameInstall, Profile, ProfileMod, Settings, Store, Trust } from "./lib/types";
+import type { Arch, CatalogItem, GameInstall, Profile, ProfileMod, Runtime, Settings, Store, Trust } from "./lib/types";
 
 const CREW_CYCLE = Object.values(CREW);
 
@@ -63,7 +63,17 @@ export function App() {
       ]);
       setSettings(st);
       setGames(detectedGames);
-      setGame(detectedGames[0] ?? null);
+      const selectedGame =
+        detectedGames.find((candidate) => candidate.path === st.gamePath) ??
+        (st.gamePath
+          ? {
+              path: st.gamePath,
+              arch: st.arch ?? "x86",
+              store: st.store ?? "manual",
+              runtime: st.runtime,
+            }
+          : detectedGames[0] ?? null);
+      setGame(selectedGame);
       let list = profs;
       if (list.length === 0) {
         const starter: Profile = { id: "my-mods", name: "My mods", crewColor: CREW.violet, mods: [] };
@@ -158,18 +168,22 @@ export function App() {
   const trustOf = (id: string): Trust =>
     catalog.find((c) => c.id === id || c.repo === id)?.trust ?? "flagged";
 
-  // Install/verify the BepInEx loader for a profile, surfacing any failure.
-  const ensureLoader = async (profileId: string) => {
-    if (!bridge.inTauri) return;
+  // Install/verify the BepInEx files. Runtime setup may return non-fatal
+  // guidance because folder synchronization is intentionally Wine-independent.
+  const ensureLoader = async (profileId: string): Promise<boolean> => {
+    if (!bridge.inTauri) return true;
     const gamePath = settings.gamePath ?? game?.path;
     if (!gamePath) {
       notify("Set your Among Us folder in Settings so BepInEx can install.", "error");
-      return;
+      return false;
     }
     try {
-      await bridge.ensureLoader(gamePath, profileId, arch);
+      const warning = await bridge.ensureLoader(gamePath, profileId, arch);
+      if (warning) notify(warning);
+      return true;
     } catch (e) {
       notify(`BepInEx setup failed: ${e}`, "error");
+      return false;
     }
   };
 
@@ -415,7 +429,7 @@ export function App() {
     }
     if (bridge.inTauri && gamePath && !settings.skipLaunchWarning) {
       const status = await bridge.loaderStatus(gamePath, p.id).catch(() => null);
-      if (!status?.current) {
+      if (!status?.current || !status.runtimeReady) {
         setLaunchWarn(p);
         return;
       }
@@ -427,8 +441,7 @@ export function App() {
     const p = launchWarn;
     if (!p) return;
     setLaunchWarn(null);
-    await ensureLoader(p.id);
-    await runLaunch(p);
+    if (await ensureLoader(p.id)) await runLaunch(p);
   };
 
   const launchWarnAnyway = async (dontWarnAgain: boolean) => {
@@ -459,13 +472,18 @@ export function App() {
       const built = await bridge.applyLobbyCode(code, arch, buildLobbyProfile());
       setProfiles((ps) => [...ps.filter((p) => p.id !== built.id), built]);
       setActiveId(built.id);
-      await ensureLoader(built.id);
+      if (!(await ensureLoader(built.id))) return;
       if (doLaunch) {
         await doLaunchProfile(built);
       } else {
         const gamePath = settings.gamePath ?? game?.path;
-        if (bridge.inTauri && gamePath) await bridge.syncProfile(gamePath, built.id);
-        notify(`Lobby profile ready: ${built.name}`);
+        const warning =
+          bridge.inTauri && gamePath ? await bridge.syncProfile(gamePath, built.id) : null;
+        notify(
+          warning
+            ? `Lobby profile ready: ${built.name}. ${warning}`
+            : `Lobby profile ready: ${built.name}`,
+        );
       }
     } catch (e) {
       notify(String(e), "error");
@@ -483,15 +501,26 @@ export function App() {
     }
   };
 
-  const completeSetup = async (gamePath?: string, arch?: string, store?: string) => {
+  const completeSetup = async (gamePath?: string, arch?: string, store?: string, runtime?: Runtime) => {
     const next: Settings = {
       ...settings,
       setupComplete: true,
       ...(gamePath ? { gamePath } : {}),
       ...(arch ? { arch: arch as Arch } : {}),
       ...(store ? { store: store as Store } : {}),
+      ...(runtime ? { runtime } : {}),
     };
     setSettings(next);
+    if (gamePath) {
+      setGame(
+        games.find((candidate) => candidate.path === gamePath) ?? {
+          path: gamePath,
+          arch: (arch as Arch | undefined) ?? "x86",
+          store: (store as Store | undefined) ?? "manual",
+          runtime,
+        },
+      );
+    }
     try {
       await bridge.saveSettings(next);
     } catch (e) {
@@ -508,8 +537,12 @@ export function App() {
     notify("Setting up mods…");
     setBusyModId("__setup__");
     try {
-      await bridge.syncProfile(gamePath ?? "", p.id);
-      notify("Mods set up in your Among Us folder. Launch Among Us when ready.");
+      const warning = await bridge.syncProfile(gamePath ?? "", p.id);
+      notify(
+        warning
+          ? `Mods are synchronized in the Among Us folder. ${warning}`
+          : "Mods set up in your Among Us folder. Launch Among Us when ready.",
+      );
     } catch (e) {
       notify(String(e), "error");
     } finally {

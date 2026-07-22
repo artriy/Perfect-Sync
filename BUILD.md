@@ -1,17 +1,15 @@
 # Building Perfect-Sync into a real app
 
-Two ways to run it. Dev mode is for hacking; the build produces a normal Windows
-app you can install and double-click — no Node/Rust needed by the end user.
+Development mode runs the UI with hot reload. A release build produces a native
+Tauri desktop app; end users do not need Node or Rust.
 
 ## One-time prerequisites (build machine only)
 
-- **Rust** (stable): https://rustup.rs
-- **Node + pnpm**: `npm i -g pnpm`
-- **Microsoft C++ Build Tools** (MSVC) and **WebView2** (preinstalled on Win10/11)
-- Install JS deps once: `pnpm install`
-
-End users need **none** of this. WebView2 ships with Windows; everything else is
-bundled into the app.
+- **All hosts:** stable Rust, Node 20+, pnpm, then `pnpm install`.
+- **Windows:** Microsoft C++ Build Tools and WebView2 (included with current Windows).
+- **Linux:** WebKitGTK 4.1 and the other packages installed by
+  `.github/workflows/release.yml`.
+- **macOS:** Xcode command-line tools.
 
 ## Produce a testable exe (no dev server)
 
@@ -50,20 +48,28 @@ pnpm dev                  # browser-only UI demo (mock data) at http://localhost
 
 ## Cross-platform builds (CI)
 
-Pushing a tag like `v0.1.0` triggers `.github/workflows/release.yml`, which builds
-Windows, Linux, and macOS (Apple Silicon + Intel) via `tauri-apps/tauri-action` and
-creates a **draft prerelease** on GitHub with the bundled artifacts attached. You can
-also run it manually from the Actions tab (workflow_dispatch). The local
-`pnpm run build:exe` remains the Windows-only path for quick testing.
+Pushing a tag like `v0.1.0` or manually dispatching `.github/workflows/release.yml`
+builds Windows x64, Linux x86_64, macOS Apple Silicon, and macOS Intel artifacts.
+Every matrix job first runs the TypeScript check and default Rust workspace test
+suite, including the host-runtime filesystem smoke test, before Tauri packages and
+uploads the release artifacts.
+
+The local `pnpm run build:exe` command remains the Windows-only quick path.
 
 ## Code signing & updates
 
-- **Windows** builds are currently **unsigned**, so SmartScreen shows a prompt on
-  first run (click **Run anyway**). To sign, add an Authenticode certificate and wire
-  it into CI through `tauri-action`/environment variables.
-- **macOS** artifacts need an Apple Developer ID plus notarization (set the `APPLE_*`
-  secrets) before they are distributable; until then they are unsigned and Gatekeeper
-  will block them.
-- The app already ships an in-app "update available" notifier that checks GitHub
-  Releases. A full signed auto-installer (`tauri-plugin-updater` with a signing
-  keypair) is future work.
+- **Windows:** builds are unsigned, so SmartScreen prompts on first run. Trusted
+  Authenticode signing requires a certificate.
+- **macOS:** `tauri.conf.json` sets `bundle.macOS.signingIdentity` to `-`, producing
+  a free ad-hoc signature on both architectures. This verifies bundle consistency,
+  but it is not a Developer ID signature and cannot be notarized. Downloaded builds
+  can still require:
+
+  ```sh
+  xattr -dr com.apple.quarantine "/Applications/Perfect-Sync.app"
+  ```
+
+  A paid Developer ID certificate plus Apple notarization is still required for a
+  warning-free public install.
+- The app's update notifier checks GitHub Releases. A signed automatic updater is
+  future work.

@@ -2,13 +2,13 @@ import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { CheckCircle, FolderOpen, GameController, GearSix, Warning } from "@phosphor-icons/react";
 import { ensureLoader, loaderStatus, pickFolder, type LoaderStatus } from "../lib/bridge";
-import type { GameInstall } from "../lib/types";
+import type { GameInstall, Runtime } from "../lib/types";
 
 interface SetupModalProps {
   open: boolean;
   detected: GameInstall[];
   profileId: string;
-  onFinish: (gamePath?: string, arch?: string, store?: string) => void;
+  onFinish: (gamePath?: string, arch?: string, store?: string, runtime?: Runtime) => void;
 }
 
 const LABEL = "mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase";
@@ -57,10 +57,15 @@ export function SetupModal({ open, detected, profileId, onFinish }: SetupModalPr
     setInstalling(true);
     setMsg("Installing BepInEx… (downloads ~30 MB once)");
     try {
-      await ensureLoader(chosen, profileId, archOf(chosen));
+      const warning = await ensureLoader(chosen, profileId, archOf(chosen));
       const s = await loaderStatus(chosen, profileId);
       setStatus(s);
-      setMsg(s?.current ? "BepInEx installed." : "BepInEx still not detected. Try again, or skip for now.");
+      setMsg(
+        warning ??
+          (s?.current && s.runtimeReady
+            ? "BepInEx installed."
+            : "BepInEx still needs runtime setup. Launch Among Us once without mods, close it, then retry."),
+      );
     } catch (e) {
       setMsg(`Install failed: ${e}`);
     } finally {
@@ -154,9 +159,27 @@ export function SetupModal({ open, detected, profileId, onFinish }: SetupModalPr
                   <span className={`${LABEL} mt-5`}>Mod loader (BepInEx)</span>
                   {checking ? (
                     <div className="glass rounded-xl px-3.5 py-3 text-[13px] text-ink-faint">Checking…</div>
-                  ) : status?.current ? (
+                  ) : status?.current && status.runtimeReady ? (
                     <div className="glass flex items-center gap-2 rounded-xl px-3.5 py-3 text-[13px] text-[#aef3d8]">
                       <CheckCircle size={16} weight="fill" /> BepInEx is installed and ready.
+                    </div>
+                  ) : status?.current ? (
+                    <div
+                      className="rounded-xl px-3.5 py-3 text-[13px]"
+                      style={{ background: "rgba(255,210,63,0.12)", border: "1px solid rgba(255,210,63,0.32)", color: "#ffe49a" }}
+                    >
+                      <div className="flex items-center gap-2">
+                        <Warning size={16} weight="fill" /> BepInEx files are installed. {status.runtime} still needs its winhttp override.
+                      </div>
+                      <button
+                        type="button"
+                        onClick={install}
+                        disabled={installing}
+                        className="ring-focus accent-grad mt-3 flex items-center gap-1.5 rounded-lg px-3 py-2 text-[12.5px] font-semibold text-[#0d0820] disabled:opacity-50"
+                      >
+                        <GearSix size={14} className={installing ? "animate-spin" : ""} />
+                        {installing ? "Checking…" : "Retry runtime setup"}
+                      </button>
                     </div>
                   ) : (
                     <div
@@ -193,7 +216,14 @@ export function SetupModal({ open, detected, profileId, onFinish }: SetupModalPr
               <button
                 type="button"
                 disabled={!chosen}
-                onClick={() => onFinish(chosen ?? undefined, chosen ? archOf(chosen) : undefined, chosen ? storeOf(chosen) : undefined)}
+                onClick={() =>
+                  onFinish(
+                    chosen ?? undefined,
+                    chosen ? archOf(chosen) : undefined,
+                    chosen ? storeOf(chosen) : undefined,
+                    chosen ? detected.find((d) => d.path === chosen)?.runtime : undefined,
+                  )
+                }
                 className="ring-focus accent-grad rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820] disabled:opacity-50"
               >
                 {chosen && !status?.current ? "Finish without loader" : "Finish"}

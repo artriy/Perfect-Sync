@@ -100,6 +100,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-log",
  "tauri-plugin-single-instance",
+ "tempfile",
 ]
 
 [[package]]
@@ -2729,12 +2730,14 @@ dependencies = [
  "base64 0.22.1",
  "crc32fast",
  "flate2",
+ "plist",
  "regex",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "ureq",
+ "url",
  "zip",
 ]
 

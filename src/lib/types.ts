@@ -3,7 +3,7 @@
 
 export type Arch = "x86" | "x64";
 export type Store = "steam" | "epic" | "itch" | "msstore" | "manual";
-export type Runtime = "native" | "proton" | "wine" | "crossover";
+export type Runtime = "native" | "proton" | "wine" | "crossover" | "whisky" | "bottles";
 export type Trust = "trusted" | "community" | "flagged";
 export type ModTag =
   | "role"
@@ -101,6 +101,8 @@ export interface Settings {
   skipLaunchWarning?: boolean;
   /** storefront the game came from, picks the launch path (Steam/Epic) */
   store?: Store;
+  /** persisted runtime selected for this exact game path */
+  runtime?: Runtime;
   /** id of the profile to re-select on startup */
   activeProfile?: string;
 }

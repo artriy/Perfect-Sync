@@ -1,4 +1,4 @@
-import type { CatalogItem, DiffItem, GameInstall, Profile, ProfileMod, Settings } from "./types";
+import type { CatalogItem, DiffItem, GameInstall, Profile, ProfileMod, Runtime, Settings } from "./types";
 import { CATALOG, PROFILES, SAMPLE_CODE, SAMPLE_DIFF } from "../data/mock";
 
 /** True when running inside the Tauri shell (vs a plain browser via `pnpm dev`). */
@@ -197,6 +197,8 @@ export interface LoaderStatus {
   steamAppid: boolean;
   profilePlugins: number;
   gamePlugins: number;
+  runtime: Runtime;
+  runtimeReady: boolean;
 }
 
 export async function loaderStatus(gamePath: string, profileId: string): Promise<LoaderStatus | null> {
@@ -204,22 +206,25 @@ export async function loaderStatus(gamePath: string, profileId: string): Promise
   return invoke<LoaderStatus>("loader_status", { gamePath, profileId });
 }
 
-export async function ensureLoader(gamePath: string, profileId: string, arch: string): Promise<void> {
-  if (inTauri) await invoke("ensure_loader", { gamePath, profileId, arch });
+export async function ensureLoader(gamePath: string, profileId: string, arch: string): Promise<string | null> {
+  if (inTauri) return invoke<string | null>("ensure_loader", { gamePath, profileId, arch });
+  return null;
 }
 
 /** Force-wipe and reinstall the BepInEx engine (fixes a stale/broken loader). */
-export async function reinstallLoader(gamePath: string, profileId: string, arch: string): Promise<void> {
-  if (inTauri) await invoke("reinstall_loader", { gamePath, profileId, arch });
+export async function reinstallLoader(gamePath: string, profileId: string, arch: string): Promise<string | null> {
+  if (inTauri) return invoke<string | null>("reinstall_loader", { gamePath, profileId, arch });
+  return null;
 }
 
 export async function launchProfile(gamePath: string, profileId: string): Promise<void> {
   if (inTauri) await invoke("launch_profile", { gamePath, profileId });
 }
 
-/** Set up the active profile's mods in the game folder without launching. */
-export async function syncProfile(gamePath: string, profileId: string): Promise<void> {
-  if (inTauri) await invoke("sync_profile", { gamePath, profileId });
+/** Synchronize the active profile into the game folder. Returns optional runtime guidance. */
+export async function syncProfile(gamePath: string, profileId: string): Promise<string | null> {
+  if (inTauri) return invoke<string | null>("sync_profile", { gamePath, profileId });
+  return null;
 }
 
 export interface UpdateInfo {

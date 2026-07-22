@@ -1,5 +1,6 @@
-//! App settings + well-known paths under %APPDATA%/Perfect-Sync.
+//! App settings and persistent data under the host's standard application-data directory.
 
+use perfect_sync_core::types::Runtime;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -40,6 +41,8 @@ pub struct Settings {
     pub skip_launch_warning: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub store: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub runtime: Option<Runtime>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub active_profile: Option<String>,
 }
@@ -101,5 +104,13 @@ mod tests {
         let pm: PersonalMod =
             serde_json::from_str(r#"{"repo":"a/b","tag":"v1","asset":"x.dll"}"#).unwrap();
         assert!(pm.enabled);
+    }
+
+    #[test]
+    fn runtime_round_trips_in_settings() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"runtime":"whisky","setupComplete":true}"#).unwrap();
+        assert_eq!(settings.runtime, Some(Runtime::Whisky));
+        assert!(serde_json::to_string(&settings).unwrap().contains("\"runtime\":\"whisky\""));
     }
 }

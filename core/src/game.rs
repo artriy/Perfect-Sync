@@ -58,12 +58,14 @@ fn make_install(path: PathBuf, store: Store, runtime: Runtime) -> GameInstall {
     GameInstall { path, store, arch, runtime }
 }
 
-/// Steam installs run natively on Windows, under Proton everywhere else.
+/// Native on Windows, Proton on Linux, and Wine on other hosts.
 fn steam_runtime() -> Runtime {
-    if cfg!(windows) {
+    if cfg!(target_os = "windows") {
         Runtime::Native
-    } else {
+    } else if cfg!(target_os = "linux") {
         Runtime::Proton
+    } else {
+        Runtime::Wine
     }
 }
 
@@ -110,7 +112,7 @@ pub fn locate_steam(steam_root: &Path) -> Option<GameInstall> {
         };
         if let Some(installdir) = parse_acf_installdir(&acf_text) {
             let game = steamapps.join("common").join(&installdir);
-            if game.is_dir() {
+            if game.join(crate::process::GAME_EXE).is_file() {
                 return Some(make_install(game, Store::Steam, steam_runtime()));
             }
         }
@@ -145,7 +147,7 @@ pub fn locate_epic(manifests_dir: &Path) -> Option<GameInstall> {
         }
         if let Ok(text) = fs::read_to_string(entry.path()) {
             if let Some(loc) = parse_epic_manifest(&text) {
-                if loc.is_dir() {
+                if loc.join(crate::process::GAME_EXE).is_file() {
                     return Some(make_install(loc, Store::Epic, Runtime::Native));
                 }
             }
@@ -219,9 +221,22 @@ fn find_exe_dir(root: &Path, depth: usize) -> Option<PathBuf> {
     None
 }
 
+/// Infer the storefront from the actual game path instead of assigning every
+/// bottle the same store.
+fn store_for_path(path: &Path, fallback: Store) -> Store {
+    let p = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    if p.contains("/steamapps/") {
+        Store::Steam
+    } else if path.join(".egstore").is_dir() || p.contains("/epic games/") {
+        Store::Epic
+    } else {
+        fallback
+    }
+}
+
 /// Find Among Us inside a Wine/CrossOver prefix: known spots first, then a
 /// bounded search of `drive_c`.
-fn locate_in_prefix(prefix: &Path, store: Store, runtime: Runtime) -> Option<GameInstall> {
+fn locate_in_prefix(prefix: &Path, fallback_store: Store, runtime: Runtime) -> Option<GameInstall> {
     let drive_c = prefix.join("drive_c");
     for c in [
         "Program Files (x86)/Steam/steamapps/common/Among Us",
@@ -231,10 +246,91 @@ fn locate_in_prefix(prefix: &Path, store: Store, runtime: Runtime) -> Option<Gam
     ] {
         let dir = drive_c.join(c);
         if dir.join(crate::process::GAME_EXE).is_file() {
-            return Some(make_install(dir, store, runtime));
+            return Some(make_install(
+                dir.clone(),
+                store_for_path(&dir, fallback_store),
+                runtime,
+            ));
         }
     }
-    find_exe_dir(&drive_c, 5).map(|dir| make_install(dir, store, runtime))
+    find_exe_dir(&drive_c, 5).map(|dir| {
+        let store = store_for_path(&dir, fallback_store);
+        make_install(dir, store, runtime)
+    })
+}
+
+fn collect_plist_paths(value: &plist::Value, out: &mut Vec<PathBuf>) {
+    match value {
+        plist::Value::String(s) => {
+            let path = if let Ok(url) = url::Url::parse(s) {
+                if url.scheme() == "file" {
+                    url.to_file_path().ok()
+                } else {
+                    None
+                }
+            } else {
+                Some(PathBuf::from(s))
+            };
+            if let Some(path) = path {
+                if path.join("drive_c").is_dir() && !out.contains(&path) {
+                    out.push(path);
+                }
+            }
+        }
+        plist::Value::Array(values) => {
+            for value in values {
+                collect_plist_paths(value, out);
+            }
+        }
+        plist::Value::Dictionary(values) => {
+            for value in values.values() {
+                collect_plist_paths(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whisky's current default plus bottle URLs persisted in `BottleVM.plist`.
+/// Legacy locations remain candidates for users upgrading older Whisky builds.
+pub fn whisky_bottle_paths(home: &Path) -> Vec<PathBuf> {
+    let container = home.join("Library/Containers/com.isaacmarovitz.Whisky");
+    let mut paths = Vec::new();
+    if let Ok(value) = plist::Value::from_file(container.join("BottleVM.plist")) {
+        collect_plist_paths(&value, &mut paths);
+    }
+    for root in [
+        container.join("Bottles"),
+        container.join("Data/Documents/Bottles"),
+        home.join("Library/Application Support/com.isaacmarovitz.Whisky/Bottles"),
+        home.join("Library/Application Support/Whisky/Bottles"),
+    ] {
+        if root.is_dir() && !paths.contains(&root) {
+            paths.push(root);
+        }
+    }
+    paths
+}
+
+fn locate_bottles(
+    found: &mut Vec<GameInstall>,
+    root: &Path,
+    store: Store,
+    runtime: Runtime,
+) {
+    if root.join("drive_c").is_dir() {
+        if let Some(game) = locate_in_prefix(root, store, runtime) {
+            found.push(game);
+        }
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if let Some(game) = locate_in_prefix(&entry.path(), store, runtime) {
+                found.push(game);
+            }
+        }
+    }
 }
 
 /// Detection beyond Steam: Epic on Windows; Wine/CrossOver/Whisky/Bottles off it.
@@ -247,8 +343,8 @@ fn locate_other() -> Vec<GameInstall> {
                 .join("EpicGamesLauncher")
                 .join("Data")
                 .join("Manifests");
-            if let Some(g) = locate_epic(&epic) {
-                found.push(g);
+            if let Some(game) = locate_epic(&epic) {
+                found.push(game);
             }
         }
         return found;
@@ -256,36 +352,28 @@ fn locate_other() -> Vec<GameInstall> {
     let Some(home) = home_dir() else {
         return found;
     };
-    let mut bottle_roots: Vec<(PathBuf, Store, Runtime)> = Vec::new();
     if cfg!(target_os = "macos") {
-        bottle_roots.push((
-            home.join("Library/Application Support/CrossOver/Bottles"),
-            Store::Steam,
+        locate_bottles(
+            &mut found,
+            &home.join("Library/Application Support/CrossOver/Bottles"),
+            Store::Manual,
             Runtime::Crossover,
-        ));
-        bottle_roots.push((
-            home.join("Library/Application Support/com.isaacmarovitz.Whisky/Bottles"),
-            Store::Steam,
-            Runtime::Wine,
-        ));
-    } else {
-        if let Some(g) = locate_in_prefix(&home.join(".wine"), Store::Manual, Runtime::Wine) {
-            found.push(g);
+        );
+        for bottle in whisky_bottle_paths(&home) {
+            locate_bottles(&mut found, &bottle, Store::Manual, Runtime::Whisky);
         }
-        bottle_roots.push((
-            home.join(".var/app/com.usebottles.bottles/data/bottles/bottles"),
+    } else {
+        locate_bottles(
+            &mut found,
+            &home.join(".wine"),
             Store::Manual,
             Runtime::Wine,
-        ));
-    }
-    for (root, store, runtime) in bottle_roots {
-        if let Ok(rd) = fs::read_dir(&root) {
-            for b in rd.flatten() {
-                if let Some(g) = locate_in_prefix(&b.path(), store, runtime) {
-                    found.push(g);
-                    break;
-                }
-            }
+        );
+        for root in [
+            home.join(".var/app/com.usebottles.bottles/data/bottles/bottles"),
+            home.join(".local/share/bottles/bottles"),
+        ] {
+            locate_bottles(&mut found, &root, Store::Manual, Runtime::Bottles);
         }
     }
     found
@@ -350,6 +438,11 @@ mod tests {
         let root = tmp.path();
         let steamapps = root.join("steamapps");
         fs::create_dir_all(steamapps.join("common").join("Among Us")).unwrap();
+        fs::write(
+            steamapps.join("common").join("Among Us").join(crate::process::GAME_EXE),
+            b"MZ",
+        )
+        .unwrap();
         // libraryfolders.vdf points at this same root as library "0"
         let vdf = format!(
             "\"libraryfolders\"\n{{\n\"0\"\n{{\n\"path\" \"{}\"\n}}\n}}\n",
@@ -407,4 +500,18 @@ mod tests {
         assert_eq!(exe_arch(&x64), Some(Arch::X64));
         assert_eq!(exe_arch(&tmp.path().join("missing.exe")), None);
     }
+    #[test]
+    fn reads_whisky_persisted_bottle_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let bottle = tmp.path().join("Custom Whisky Bottle");
+        fs::create_dir_all(bottle.join("drive_c")).unwrap();
+        let container = home.join("Library/Containers/com.isaacmarovitz.Whisky");
+        fs::create_dir_all(&container).unwrap();
+        let url = url::Url::from_directory_path(&bottle).unwrap().to_string();
+        plist::to_file_xml(container.join("BottleVM.plist"), &vec![url]).unwrap();
+
+        assert_eq!(whisky_bottle_paths(&home), vec![bottle]);
+    }
+
 }

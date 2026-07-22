@@ -18,7 +18,7 @@ pub enum Store {
 }
 
 /// How an Among Us install is executed. Among Us is a Windows-only build, so on
-/// Linux it runs under Steam Proton and on macOS under CrossOver/Wine.
+/// non-Windows hosts it runs through Steam Proton or a Wine-based bottle manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Runtime {
@@ -26,6 +26,8 @@ pub enum Runtime {
     Proton,
     Wine,
     Crossover,
+    Whisky,
+    Bottles,
 }
 
 /// How vetted a mod is. Drives the trust badge and warns on unknown mods pulled

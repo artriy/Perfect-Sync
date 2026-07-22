@@ -10,7 +10,7 @@ use perfect_sync_core::catalog::{parse, AssetArchRule, AssetRules, Catalog};
 use perfect_sync_core::preview::{preview, Preview};
 use perfect_sync_core::profile::{InstalledMod, ProfileRecord, ProfileStore};
 use perfect_sync_core::resolver::{Http, Release, ResolvedDownload, UreqHttp};
-use perfect_sync_core::types::{Arch, ModSource, ModTag, Trust};
+use perfect_sync_core::types::{Arch, ModSource, ModTag, Runtime, Trust};
 use perfect_sync_core::{codec, compat, game, loader, process, profile, resolver};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -86,19 +86,94 @@ fn arch_str(a: Arch) -> String {
     }
 }
 
-/// Friendly guidance when a non-native launch can't start its runtime. The
-/// winhttp override is already written, so launching the game any other way works.
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn runtime_context(game_dir: &Path) -> compat::RuntimeContext {
+    let saved = settings::load();
+    let hint = saved
+        .game_path
+        .as_deref()
+        .filter(|path| same_path(Path::new(path), game_dir))
+        .and(saved.runtime);
+    compat::resolve_with_hint(game_dir, hint)
+}
+
+fn validate_game_dir(game_dir: &Path) -> Result<(), String> {
+    if !game_dir.is_dir() {
+        return Err(format!("game folder not found: {}", game_dir.display()));
+    }
+    let exe = game_dir.join(process::GAME_EXE);
+    if !exe.is_file() {
+        return Err(format!(
+            "This is not the Among Us folder: {} is missing",
+            exe.display()
+        ));
+    }
+    if let Some(hint) = protected_install_hint(game_dir) {
+        return Err(hint);
+    }
+    let probe = game_dir.join(format!(".perfectsync-write-test-{}", std::process::id()));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|e| {
+            format!(
+                "Perfect-Sync cannot modify the Among Us folder {}: {e}",
+                game_dir.display()
+            )
+        })?;
+    fs::remove_file(&probe).map_err(|e| {
+        format!(
+            "Perfect-Sync could not clean up its write probe {}: {e}",
+            probe.display()
+        )
+    })
+}
+
+fn configure_runtime_override(ctx: &compat::RuntimeContext) -> Result<(), String> {
+    if ctx.runtime == Runtime::Native {
+        return Ok(());
+    }
+    let prefix = ctx.prefix.as_ref().ok_or_else(|| {
+        "No Wine prefix could be derived for this game folder. Select the real folder inside the Wine/CrossOver/Whisky/Bottles prefix.".to_string()
+    })?;
+    compat::register_winhttp_override(prefix).map_err(|e| {
+        if ctx.runtime == Runtime::Proton && e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "Steam has not created the Among Us Proton prefix yet. Launch Among Us once without mods, close it, then retry. Folder setup is already safe to run. ({e})"
+            )
+        } else {
+            format!(
+                "Could not configure BepInEx's winhttp override in {}: {e}",
+                prefix.display()
+            )
+        }
+    })
+}
+
+/// Friendly guidance when a non-native launcher cannot be started.
 fn launch_err_msg(ctx: &compat::RuntimeContext, e: &std::io::Error) -> String {
-    use perfect_sync_core::types::Runtime;
     match ctx.runtime {
         Runtime::Proton => format!(
-            "Couldn't start Steam to launch via Proton ({e}). Launch Among Us from Steam; the BepInEx winhttp override is already set in your Proton prefix."
+            "Couldn't start Steam or Flatpak Steam for Proton ({e}). The Among Us folder is already synchronized; launch the game from Steam."
         ),
         Runtime::Wine => format!(
-            "Couldn't run Wine ({e}). Install Wine, or launch Among Us yourself; the winhttp override is set in the prefix so BepInEx loads."
+            "Couldn't run Wine ({e}). The Among Us folder is already synchronized; launch the game from your Wine frontend."
         ),
         Runtime::Crossover => format!(
-            "Couldn't run CrossOver's Wine ({e}). Launch Among Us from CrossOver; the winhttp override is set in the bottle so BepInEx loads."
+            "Couldn't run CrossOver's cxrun ({e}). The Among Us folder is already synchronized; launch it from CrossOver."
+        ),
+        Runtime::Whisky => format!(
+            "Couldn't run Whisky's Wine ({e}). The Among Us folder is already synchronized; launch it from Whisky."
+        ),
+        Runtime::Bottles => format!(
+            "Couldn't run bottles-cli ({e}). The Among Us folder is already synchronized; launch it from Bottles."
         ),
         Runtime::Native => format!("Failed to launch the game: {e}"),
     }
@@ -160,15 +235,7 @@ fn resolve_loader(http: &dyn Http, arch: &str) -> Result<(String, String), Strin
 /// caches the GitHub pack once per arch.
 fn ensure_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(), String> {
     let game_dir = Path::new(game_path);
-    if !game_dir.is_dir() {
-        return Err(format!("game folder not found: {game_path}"));
-    }
-    // Make the BepInEx Doorstop loadable under Wine/Proton/CrossOver by setting
-    // the winhttp DLL override in the prefix (no-op on native Windows).
-    let ctx = compat::resolve(game_dir);
-    if let Some(prefix) = &ctx.prefix {
-        let _ = compat::register_winhttp_override(prefix);
-    }
+    validate_game_dir(game_dir)?;
     let root = settings::profiles_root();
     loader::ensure_profile_layout(&root, profile_id).map_err(|e| e.to_string())?;
     // prefer the real exe bitness over the caller's hint (selects the x86 vs x64 pack)
@@ -212,6 +279,7 @@ fn ensure_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(
 /// BepInEx is stale (e.g. Cpp2IL metadata version mismatch).
 fn reinstall_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(), String> {
     let game = Path::new(game_path);
+    validate_game_dir(game)?;
     let _ = fs::remove_dir_all(settings::cache_dir().join("bepinex"));
     let _ = fs::remove_file(game.join("winhttp.dll"));
     let _ = fs::remove_file(game.join("BepInEx").join(".perfectsync_loader"));
@@ -234,7 +302,15 @@ pub fn get_settings() -> Settings {
 }
 
 #[tauri::command]
-pub fn save_settings(settings: Settings) -> Result<(), String> {
+pub fn save_settings(mut settings: Settings) -> Result<(), String> {
+    if let Some(path) = settings.game_path.as_deref() {
+        let game_dir = Path::new(path);
+        settings.runtime
+            .get_or_insert_with(|| compat::resolve(game_dir).runtime);
+        if let Some(arch) = game::exe_arch(&game_dir.join(process::GAME_EXE)) {
+            settings.arch = Some(arch_str(arch));
+        }
+    }
     settings::save(&settings).map_err(|e| e.to_string())
 }
 
@@ -817,8 +893,12 @@ pub async fn ensure_loader(
     game_path: String,
     profile_id: String,
     arch: String,
-) -> Result<(), String> {
-    blocking(move || ensure_loader_impl(&game_path, &profile_id, &arch)).await
+) -> Result<Option<String>, String> {
+    blocking(move || {
+        ensure_loader_impl(&game_path, &profile_id, &arch)?;
+        Ok(configure_runtime_override(&runtime_context(Path::new(&game_path))).err())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -826,8 +906,12 @@ pub async fn reinstall_loader(
     game_path: String,
     profile_id: String,
     arch: String,
-) -> Result<(), String> {
-    blocking(move || reinstall_loader_impl(&game_path, &profile_id, &arch)).await
+) -> Result<Option<String>, String> {
+    blocking(move || {
+        reinstall_loader_impl(&game_path, &profile_id, &arch)?;
+        Ok(configure_runtime_override(&runtime_context(Path::new(&game_path))).err())
+    })
+    .await
 }
 
 #[derive(Serialize)]
@@ -842,12 +926,15 @@ pub struct LoaderStatus {
     pub steam_appid: bool,
     pub profile_plugins: usize,
     pub game_plugins: usize,
+    pub runtime: Runtime,
+    pub runtime_ready: bool,
 }
 
 #[tauri::command]
 pub fn loader_status(game_path: String, profile_id: String) -> LoaderStatus {
     let game = Path::new(&game_path);
     let root = settings::profiles_root();
+    let ctx = runtime_context(game);
     let count_dll = |dir: std::path::PathBuf| {
         fs::read_dir(dir)
             .map(|it| {
@@ -857,6 +944,8 @@ pub fn loader_status(game_path: String, profile_id: String) -> LoaderStatus {
             })
             .unwrap_or(0)
     };
+    let runtime_ready = ctx.runtime == Runtime::Native
+        || ctx.prefix.as_deref().is_some_and(compat::has_winhttp_override);
     LoaderStatus {
         game_found: game.is_dir(),
         winhttp: game.join("winhttp.dll").exists(),
@@ -867,6 +956,8 @@ pub fn loader_status(game_path: String, profile_id: String) -> LoaderStatus {
         steam_appid: game.join("steam_appid.txt").exists(),
         profile_plugins: count_dll(loader::profile_plugins_dir(&root, &profile_id)),
         game_plugins: count_dll(game.join("BepInEx").join("plugins")),
+        runtime: ctx.runtime,
+        runtime_ready,
     }
 }
 
@@ -882,46 +973,54 @@ fn protected_install_hint(game_dir: &Path) -> Option<String> {
     }
 }
 
-/// Install/verify BepInEx and copy the profile's plugins into the game dir,
-/// WITHOUT launching. Shared by launch and the standalone "set up mods" action.
-fn prepare_profile(game_path: &str, profile_id: &str) -> Result<(), String> {
+/// Install/verify BepInEx and copy the profile into the selected Among Us
+/// folder without requiring Wine/Proton to be installed or initialized. A
+/// runtime warning is returned separately after all folder changes succeed.
+fn prepare_profile(game_path: &str, profile_id: &str) -> Result<Option<String>, String> {
     if process::is_running() {
         return Err("Among Us is running. Close it first.".into());
     }
     let game_dir = Path::new(game_path);
-    if let Some(hint) = protected_install_hint(game_dir) {
-        return Err(hint);
-    }
     let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
         .map(arch_str)
         .or_else(|| settings::load().arch)
         .unwrap_or_else(|| "x86".to_string());
     ensure_loader_impl(game_path, profile_id, &arch)?;
-    let _ = loader::ensure_steam_appid(game_dir);
-    let _ = loader::write_console_off(game_dir);
-    if cfg!(windows) && launch_store(game_path).as_deref() == Some("epic") {
-        let _ = ensure_epic_starter(&http(), game_dir);
-    }
+    loader::ensure_steam_appid(game_dir).map_err(|e| e.to_string())?;
+    loader::write_console_off(game_dir).map_err(|e| e.to_string())?;
     loader::sync_profile_plugins(&settings::profiles_root(), profile_id, game_dir)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(configure_runtime_override(&runtime_context(game_dir)).err())
 }
 
-/// Set up the mods in the game folder without launching, so the user can start
-/// the game themselves (or via Steam/Epic outside the app).
+/// Set up the mods in the selected game folder. Wine/Proton launcher setup is
+/// best-effort and returned as guidance, never allowed to block folder syncing.
 #[tauri::command]
-pub async fn sync_profile(game_path: String, profile_id: String) -> Result<(), String> {
+pub async fn sync_profile(
+    game_path: String,
+    profile_id: String,
+) -> Result<Option<String>, String> {
     blocking(move || prepare_profile(&game_path, &profile_id)).await
 }
 
 /// Which store to launch through: persisted from setup, else inferred from the path.
 fn launch_store(game_path: &str) -> Option<String> {
-    if let Some(s) = settings::load().store {
-        return Some(s);
+    let saved = settings::load();
+    if saved
+        .game_path
+        .as_deref()
+        .is_some_and(|path| same_path(Path::new(path), Path::new(game_path)))
+    {
+        if let Some(store) = saved.store {
+            return Some(store);
+        }
     }
     if game_path.replace('\\', "/").to_lowercase().contains("/steamapps/") {
         return Some("steam".to_string());
     }
-    if Path::new(game_path).join(".egstore").is_dir() {
+    if Path::new(game_path).join(".egstore").is_dir()
+        || game_path.replace('\\', "/").to_lowercase().contains("/epic games/")
+    {
         return Some("epic".to_string());
     }
     None
@@ -1030,7 +1129,14 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
                 _ => {}
             }
         }
-        let ctx = compat::resolve(game_dir);
+        let ctx = runtime_context(game_dir);
+        configure_runtime_override(&ctx)?;
+        if !cfg!(windows) && launch_store(&game_path).as_deref() == Some("epic") {
+            let starter = ensure_epic_starter(&http(), game_dir)?;
+            let spec = compat::build_program_spec(&starter, game_dir, &ctx);
+            process::launch(&spec).map_err(|e| launch_err_msg(&ctx, &e))?;
+            return Ok(());
+        }
         let spec = compat::build_launch_spec(game_dir, &ctx);
         process::launch(&spec).map_err(|e| launch_err_msg(&ctx, &e))?;
         Ok(())
@@ -1102,5 +1208,25 @@ mod tests {
         assert_eq!(code_hash("abc"), code_hash("abc"));
         assert_ne!(code_hash("abc"), code_hash("abd"));
         assert_eq!(code_hash("anything").len(), 8);
+    }
+
+    #[test]
+    fn selected_game_folder_must_contain_the_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = validate_game_dir(temp.path()).unwrap_err();
+        assert!(error.contains(process::GAME_EXE));
+    }
+
+    #[test]
+    fn writable_game_folder_validation_leaves_no_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(process::GAME_EXE), b"MZ").unwrap();
+        validate_game_dir(temp.path()).unwrap();
+        assert!(fs::read_dir(temp.path()).unwrap().flatten().all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".perfectsync-write-test-")
+        }));
     }
 }

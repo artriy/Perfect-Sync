@@ -1,11 +1,10 @@
 //! Cross-platform launch + loader compatibility.
 //!
 //! Among Us is a Windows-only Unity build, so the BepInEx Doorstop files we
-//! install are always the Windows pack. What changes per host is *how the game
-//! runs*: on Linux it is Steam Proton, on macOS CrossOver or Wine/Whisky. This
-//! module resolves the runtime for a game dir, registers the `winhttp` DLL
-//! override the Doorstop needs inside the Wine prefix (so BepInEx loads no
-//! matter how the user starts the game), and builds the launch invocation.
+//! install are always the Windows pack. What changes per host is how the game
+//! runs: native on Windows, through Steam Proton on Linux, or through a
+//! Wine-based bottle manager. Runtime classification is separate from launcher
+//! discovery so every host branch can be tested on every build machine.
 
 use crate::process::{LaunchSpec, GAME_EXE};
 use crate::types::Runtime;
@@ -16,42 +15,122 @@ use std::path::{Path, PathBuf};
 /// Among Us Steam app id (its Proton prefix lives at `compatdata/<id>/pfx`).
 pub const STEAM_APP_ID: &str = "945360";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPlatform {
+    Windows,
+    Linux,
+    Macos,
+    Other,
+}
+
+pub const fn current_host() -> HostPlatform {
+    if cfg!(target_os = "windows") {
+        HostPlatform::Windows
+    } else if cfg!(target_os = "linux") {
+        HostPlatform::Linux
+    } else if cfg!(target_os = "macos") {
+        HostPlatform::Macos
+    } else {
+        HostPlatform::Other
+    }
+}
+
 /// How (and where) a given game dir should be launched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeContext {
+    pub host: HostPlatform,
     pub runtime: Runtime,
     /// Wine prefix (the dir holding `user.reg`): Proton's `compatdata/<id>/pfx`
-    /// or a Wine/CrossOver bottle. `None` on native Windows.
+    /// or a Wine/CrossOver/Whisky/Bottles bottle. `None` on native Windows.
     pub prefix: Option<PathBuf>,
-    /// Binary used to start the game (steam / wine / CrossOver's wine).
-    /// `None` means run the exe directly (native).
+    /// Binary used to start the game (`steam`, `flatpak`, `wine`, `cxrun`, etc.).
+    /// `None` means use the runtime's normal command name as an error-producing
+    /// fallback, or run the exe directly for a native Windows context.
     pub launcher: Option<PathBuf>,
+    /// Arguments which select the launcher/bottle, before the game-specific args.
+    pub launcher_args: Vec<String>,
 }
 
-/// Resolve how a game dir should run on this host. Pure dispatch by `cfg!` plus
-/// path probing, so a manual game-path override still launches correctly.
+fn normalized(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+fn is_bottle_runtime(runtime: Runtime) -> bool {
+    matches!(
+        runtime,
+        Runtime::Wine | Runtime::Crossover | Runtime::Whisky | Runtime::Bottles
+    )
+}
+
+fn runtime_from_bottle_path(path: &Path) -> Runtime {
+    let p = normalized(path);
+    if p.contains("/crossover/bottles/") {
+        Runtime::Crossover
+    } else if p.contains("com.isaacmarovitz.whisky") || p.contains("/whisky/bottles/") {
+        Runtime::Whisky
+    } else if p.contains("com.usebottles.bottles") || p.contains("/bottles/bottles/") {
+        Runtime::Bottles
+    } else {
+        Runtime::Wine
+    }
+}
+
+/// Classify a path without probing installed launcher binaries. `hint` is the
+/// runtime persisted when the user picked an auto-detected install; structural
+/// bottle detection still wins over the generic `steamapps` marker.
+pub fn classify_runtime(
+    game_dir: &Path,
+    host: HostPlatform,
+    hint: Option<Runtime>,
+) -> (Runtime, Option<PathBuf>) {
+    if host == HostPlatform::Windows {
+        return (Runtime::Native, None);
+    }
+
+    // Canonicalization follows Wine's `dosdevices/c:` links when available.
+    // Nonexistent paths (including pure test fixtures) keep their original form.
+    let canonical = fs::canonicalize(game_dir).ok();
+    let structural = canonical.as_deref().unwrap_or(game_dir);
+    if let Some(prefix) = wine_prefix_from_game(structural) {
+        let detected = runtime_from_bottle_path(structural);
+        let runtime = hint.filter(|r| is_bottle_runtime(*r)).unwrap_or(detected);
+        return (runtime, Some(prefix));
+    }
+
+    let p = normalized(structural);
+    if host == HostPlatform::Linux && p.contains("/steamapps/") {
+        return (Runtime::Proton, proton_prefix_from_game(structural));
+    }
+
+    // macOS has no Steam Proton. A manually selected Windows game outside a
+    // recognizable bottle is treated as Wine and produces actionable guidance
+    // if no Wine launcher can be found.
+    let runtime = hint.filter(|r| is_bottle_runtime(*r)).unwrap_or(Runtime::Wine);
+    (runtime, None)
+}
+
+/// Resolve the current host with no persisted runtime hint.
 pub fn resolve(game_dir: &Path) -> RuntimeContext {
-    if cfg!(windows) {
-        return RuntimeContext { runtime: Runtime::Native, prefix: None, launcher: None };
+    resolve_with_hint(game_dir, None)
+}
+
+/// Resolve the current host, honoring a runtime saved for this exact game path.
+pub fn resolve_with_hint(game_dir: &Path, hint: Option<Runtime>) -> RuntimeContext {
+    resolve_for_host(game_dir, current_host(), hint)
+}
+
+/// Host-injectable resolver used by the real entrypoint and cross-platform tests.
+pub fn resolve_for_host(
+    game_dir: &Path,
+    host: HostPlatform,
+    hint: Option<Runtime>,
+) -> RuntimeContext {
+    let (runtime, mut prefix) = classify_runtime(game_dir, host, hint);
+    if runtime == Runtime::Wine && prefix.is_none() {
+        prefix = default_wine_prefix();
     }
-    let p = game_dir.to_string_lossy().replace('\\', "/");
-    // Steam library layout -> Proton (Steam manages the prefix + Proton version).
-    if p.contains("/steamapps/") {
-        return RuntimeContext {
-            runtime: Runtime::Proton,
-            prefix: proton_prefix_from_game(game_dir),
-            launcher: find_binary(&["steam"]),
-        };
-    }
-    let prefix = wine_prefix_from_game(game_dir);
-    if cfg!(target_os = "macos") && p.contains("/CrossOver/") {
-        return RuntimeContext {
-            runtime: Runtime::Crossover,
-            prefix,
-            launcher: find_crossover_wine().or_else(|| find_binary(&["wine"])),
-        };
-    }
-    RuntimeContext { runtime: Runtime::Wine, prefix, launcher: find_binary(&["wine64", "wine"]) }
+    let (launcher, launcher_args) = find_launcher(game_dir, runtime, prefix.as_deref());
+    RuntimeContext { host, runtime, prefix, launcher, launcher_args }
 }
 
 /// Proton prefix for a Steam game dir:
@@ -75,76 +154,219 @@ pub fn wine_prefix_from_game(game_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// First existing `name` across the `PATH` entries.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn default_wine_prefix() -> Option<PathBuf> {
+    std::env::var_os("WINEPREFIX")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".wine")))
+}
+
+/// First existing binary across PATH plus common GUI-app-safe system locations.
 fn find_binary(names: &[&str]) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in names {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    for dir in ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
         for name in names {
-            let cand = dir.join(name);
-            if cand.is_file() {
-                return Some(cand);
+            let candidate = Path::new(dir).join(name);
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
     }
     None
 }
 
-fn find_crossover_wine() -> Option<PathBuf> {
-    let p =
-        PathBuf::from("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine");
-    p.is_file().then_some(p)
+fn find_flatpak() -> Option<PathBuf> {
+    find_binary(&["flatpak"])
 }
 
-/// Build the concrete launch invocation for a resolved runtime. Pure: every
-/// branch is selected by `ctx.runtime` (a value), so all paths are testable on
-/// any host.
-pub fn build_launch_spec(game_dir: &Path, ctx: &RuntimeContext) -> LaunchSpec {
-    let exe = game_dir.join(GAME_EXE);
+fn steam_launcher(game_dir: &Path) -> (Option<PathBuf>, Vec<String>) {
+    let flatpak_install = normalized(game_dir).contains("/.var/app/com.valvesoftware.steam/");
+    if flatpak_install {
+        if let Some(flatpak) = find_flatpak() {
+            return (Some(flatpak), vec!["run".into(), "com.valvesoftware.Steam".into()]);
+        }
+    }
+    if let Some(steam) = find_binary(&["steam"]) {
+        return (Some(steam), Vec::new());
+    }
+    if let Some(flatpak) = find_flatpak() {
+        return (Some(flatpak), vec!["run".into(), "com.valvesoftware.Steam".into()]);
+    }
+    (None, Vec::new())
+}
+
+fn find_crossover_cxrun() -> Option<PathBuf> {
+    let mut candidates = vec![PathBuf::from(
+        "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxrun",
+    )];
+    if let Some(home) = home_dir() {
+        candidates.push(home.join(
+            "Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxrun",
+        ));
+    }
+    candidates.into_iter().find(|p| p.is_file()).or_else(|| find_binary(&["cxrun"]))
+}
+
+fn find_whisky_wine() -> Option<PathBuf> {
+    let home = home_dir()?;
+    [
+        home.join("Library/Containers/com.isaacmarovitz.Whisky/Data/Library/Application Support/com.isaacmarovitz.Whisky/Libraries/Wine/bin/wine64"),
+        home.join("Library/Application Support/com.isaacmarovitz.Whisky/Libraries/Wine/bin/wine64"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+fn bottle_name(prefix: Option<&Path>) -> Option<String> {
+    prefix?.file_name()?.to_str().map(str::to_owned)
+}
+
+fn find_launcher(
+    game_dir: &Path,
+    runtime: Runtime,
+    prefix: Option<&Path>,
+) -> (Option<PathBuf>, Vec<String>) {
+    match runtime {
+        Runtime::Native => (None, Vec::new()),
+        Runtime::Proton => steam_launcher(game_dir),
+        Runtime::Wine => (find_binary(&["wine", "wine64"]), Vec::new()),
+        Runtime::Crossover => {
+            let mut args = Vec::new();
+            if let Some(name) = bottle_name(prefix) {
+                args.extend(["--bottle".to_string(), name, "--".to_string()]);
+            }
+            (find_crossover_cxrun(), args)
+        }
+        Runtime::Whisky => (find_whisky_wine(), vec!["start".into(), "/unix".into()]),
+        Runtime::Bottles => {
+            let name = bottle_name(prefix).unwrap_or_else(|| "Among Us".to_string());
+            let flatpak_install = normalized(game_dir).contains("com.usebottles.bottles");
+            if flatpak_install {
+                if let Some(flatpak) = find_flatpak() {
+                    return (
+                        Some(flatpak),
+                        vec![
+                            "run".into(),
+                            "--command=bottles-cli".into(),
+                            "com.usebottles.bottles".into(),
+                            "run".into(),
+                            "-b".into(),
+                            name,
+                            "-e".into(),
+                        ],
+                    );
+                }
+            }
+            if let Some(cli) = find_binary(&["bottles-cli"]) {
+                return (Some(cli), vec!["run".into(), "-b".into(), name, "-e".into()]);
+            }
+            if let Some(flatpak) = find_flatpak() {
+                return (
+                    Some(flatpak),
+                    vec![
+                        "run".into(),
+                        "--command=bottles-cli".into(),
+                        "com.usebottles.bottles".into(),
+                        "run".into(),
+                        "-b".into(),
+                        name,
+                        "-e".into(),
+                    ],
+                );
+            }
+            (None, vec!["run".into(), "-b".into(), name, "-e".into()])
+        }
+    }
+}
+
+fn runtime_fallback(runtime: Runtime) -> &'static str {
+    match runtime {
+        Runtime::Native => GAME_EXE,
+        Runtime::Proton => "steam",
+        Runtime::Wine => "wine",
+        Runtime::Crossover => "cxrun",
+        Runtime::Whisky => "wine64",
+        Runtime::Bottles => "bottles-cli",
+    }
+}
+
+/// Build a concrete launch invocation for an arbitrary Windows executable in a
+/// game directory. Epic's authentication helper uses this same runtime path.
+pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> LaunchSpec {
     match ctx.runtime {
         Runtime::Native => LaunchSpec {
-            program: exe,
+            program: program.to_path_buf(),
             args: Vec::new(),
-            cwd: game_dir.to_path_buf(),
+            cwd: cwd.to_path_buf(),
             env: Vec::new(),
         },
-        // Let Steam pick the user's Proton + launch options; the winhttp override
-        // we wrote into the prefix is what makes the Doorstop load.
-        Runtime::Proton => LaunchSpec {
-            program: ctx.launcher.clone().unwrap_or_else(|| PathBuf::from("steam")),
-            args: vec!["-applaunch".to_string(), STEAM_APP_ID.to_string()],
-            cwd: game_dir.to_path_buf(),
-            env: Vec::new(),
-        },
-        Runtime::Wine | Runtime::Crossover => {
+        Runtime::Proton => {
+            let mut args = ctx.launcher_args.clone();
+            args.extend(["-applaunch".to_string(), STEAM_APP_ID.to_string()]);
+            LaunchSpec {
+                program: ctx
+                    .launcher
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(runtime_fallback(ctx.runtime))),
+                args,
+                cwd: cwd.to_path_buf(),
+                env: Vec::new(),
+            }
+        }
+        Runtime::Wine | Runtime::Crossover | Runtime::Whisky | Runtime::Bottles => {
             let mut env = vec![("WINEDLLOVERRIDES".to_string(), "winhttp=n,b".to_string())];
             if let Some(prefix) = &ctx.prefix {
-                env.push((
-                    "WINEPREFIX".to_string(),
-                    prefix.to_string_lossy().into_owned(),
-                ));
+                if ctx.runtime == Runtime::Crossover {
+                    if let Some(name) = bottle_name(Some(prefix)) {
+                        env.push(("CX_BOTTLE".to_string(), name));
+                    }
+                } else if ctx.runtime != Runtime::Bottles {
+                    env.push(("WINEPREFIX".to_string(), prefix.to_string_lossy().into_owned()));
+                }
             }
-            let fallback = if ctx.runtime == Runtime::Crossover { "wine" } else { "wine64" };
+            let mut args = ctx.launcher_args.clone();
+            args.push(program.to_string_lossy().into_owned());
             LaunchSpec {
-                program: ctx.launcher.clone().unwrap_or_else(|| PathBuf::from(fallback)),
-                args: vec![exe.to_string_lossy().into_owned()],
-                cwd: game_dir.to_path_buf(),
+                program: ctx
+                    .launcher
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(runtime_fallback(ctx.runtime))),
+                args,
+                cwd: cwd.to_path_buf(),
                 env,
             }
         }
     }
 }
 
+/// Build the concrete launch invocation for Among Us.
+pub fn build_launch_spec(game_dir: &Path, ctx: &RuntimeContext) -> LaunchSpec {
+    build_program_spec(&game_dir.join(GAME_EXE), game_dir, ctx)
+}
+
 const OVERRIDE_LINE: &str = "\"winhttp\"=\"native,builtin\"";
 const OVERRIDE_SECTION: &str = r"[Software\\Wine\\DllOverrides]";
 
-/// Ensure a Wine `user.reg` sets `winhttp` to load native-first (so the BepInEx
-/// Doorstop proxy is used instead of Wine's builtin). Returns the updated text,
-/// or `None` when the override is already correct (no write needed).
+/// Ensure a Wine `user.reg` sets `winhttp` to load native-first. Returns the
+/// updated text, or `None` when the override is already correct.
 pub fn merge_winhttp_override(existing: &str) -> Option<String> {
     if existing.contains(OVERRIDE_LINE) {
         return None;
     }
-    // A different winhttp override is set -> replace that whole line.
     if let Some(start) = existing.find("\"winhttp\"=") {
         let end = existing[start..].find('\n').map(|n| start + n).unwrap_or(existing.len());
         let mut out = String::with_capacity(existing.len());
@@ -153,7 +375,6 @@ pub fn merge_winhttp_override(existing: &str) -> Option<String> {
         out.push_str(&existing[end..]);
         return Some(out);
     }
-    // Section exists -> insert the value right after its header line.
     if let Some(idx) = existing.find(OVERRIDE_SECTION) {
         let after_header =
             existing[idx..].find('\n').map(|n| idx + n + 1).unwrap_or(existing.len());
@@ -164,7 +385,6 @@ pub fn merge_winhttp_override(existing: &str) -> Option<String> {
         out.push_str(&existing[after_header..]);
         return Some(out);
     }
-    // No section -> append one (with a registry header if the file was empty).
     let mut out = String::new();
     if existing.trim().is_empty() {
         out.push_str("WINE REGISTRY Version 2\n");
@@ -182,16 +402,35 @@ pub fn merge_winhttp_override(existing: &str) -> Option<String> {
     Some(out)
 }
 
-/// Write the winhttp override into a prefix's `user.reg` (idempotent,
-/// best-effort). No-op when the prefix dir does not exist yet.
+pub fn has_winhttp_override(prefix: &Path) -> bool {
+    fs::read_to_string(prefix.join("user.reg"))
+        .map(|registry| registry.contains(OVERRIDE_LINE))
+        .unwrap_or(false)
+}
+
+/// Write and verify the winhttp override in a prefix's `user.reg`.
+/// A missing prefix is an actionable error: Proton creates it on the game's
+/// first vanilla launch, and silently skipping here would produce a broken modded launch.
 pub fn register_winhttp_override(prefix: &Path) -> io::Result<()> {
     if !prefix.is_dir() {
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Wine/Proton prefix does not exist: {}", prefix.display()),
+        ));
     }
     let reg = prefix.join("user.reg");
-    let existing = fs::read_to_string(&reg).unwrap_or_default();
+    let existing = fs::read_to_string(&reg).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not read Wine registry {}: {e}", reg.display()),
+        )
+    })?;
     if let Some(updated) = merge_winhttp_override(&existing) {
         fs::write(&reg, updated)?;
+    }
+    let verified = fs::read_to_string(&reg)?;
+    if !verified.contains(OVERRIDE_LINE) {
+        return Err(io::Error::other("winhttp override did not persist in user.reg"));
     }
     Ok(())
 }
@@ -199,6 +438,16 @@ pub fn register_winhttp_override(prefix: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context(runtime: Runtime, launcher: &str) -> RuntimeContext {
+        RuntimeContext {
+            host: HostPlatform::Linux,
+            runtime,
+            prefix: None,
+            launcher: Some(PathBuf::from(launcher)),
+            launcher_args: Vec::new(),
+        }
+    }
 
     #[test]
     fn proton_prefix_derives_compatdata() {
@@ -219,9 +468,42 @@ mod tests {
     }
 
     #[test]
+    fn bottle_detection_precedes_steamapps() {
+        let mac = Path::new(
+            "/Users/u/Library/Application Support/CrossOver/Bottles/AU/drive_c/Program Files (x86)/Steam/steamapps/common/Among Us",
+        );
+        assert_eq!(
+            classify_runtime(mac, HostPlatform::Macos, None).0,
+            Runtime::Crossover
+        );
+        let linux = Path::new(
+            "/home/u/.wine/drive_c/Program Files (x86)/Steam/steamapps/common/Among Us",
+        );
+        assert_eq!(classify_runtime(linux, HostPlatform::Linux, None).0, Runtime::Wine);
+    }
+
+    #[test]
+    fn proton_is_linux_only() {
+        let game = Path::new("/games/steamapps/common/Among Us");
+        assert_eq!(classify_runtime(game, HostPlatform::Linux, None).0, Runtime::Proton);
+        assert_eq!(classify_runtime(game, HostPlatform::Macos, None).0, Runtime::Wine);
+    }
+
+    #[test]
+    fn persisted_bottle_runtime_handles_custom_locations() {
+        let game = Path::new("/custom/AU/drive_c/Games/Among Us");
+        assert_eq!(
+            classify_runtime(game, HostPlatform::Macos, Some(Runtime::Whisky)).0,
+            Runtime::Whisky
+        );
+    }
+
+    #[test]
     fn native_spec_runs_exe_directly() {
         let game = Path::new("/g/Among Us");
-        let ctx = RuntimeContext { runtime: Runtime::Native, prefix: None, launcher: None };
+        let mut ctx = context(Runtime::Native, "unused");
+        ctx.host = HostPlatform::Windows;
+        ctx.launcher = None;
         let spec = build_launch_spec(game, &ctx);
         assert!(spec.program.ends_with("Among Us.exe"));
         assert!(spec.args.is_empty());
@@ -231,24 +513,30 @@ mod tests {
     #[test]
     fn proton_spec_launches_via_steam() {
         let game = Path::new("/g/steamapps/common/Among Us");
-        let ctx = RuntimeContext {
-            runtime: Runtime::Proton,
-            prefix: Some(PathBuf::from("/g/steamapps/compatdata/945360/pfx")),
-            launcher: Some(PathBuf::from("/usr/bin/steam")),
-        };
+        let mut ctx = context(Runtime::Proton, "/usr/bin/steam");
+        ctx.prefix = Some(PathBuf::from("/g/steamapps/compatdata/945360/pfx"));
         let spec = build_launch_spec(game, &ctx);
         assert_eq!(spec.program, PathBuf::from("/usr/bin/steam"));
-        assert_eq!(spec.args, vec!["-applaunch".to_string(), "945360".to_string()]);
+        assert_eq!(spec.args, vec!["-applaunch", "945360"]);
+    }
+
+    #[test]
+    fn flatpak_steam_args_are_preserved() {
+        let game = Path::new("/g/steamapps/common/Among Us");
+        let mut ctx = context(Runtime::Proton, "/usr/bin/flatpak");
+        ctx.launcher_args = vec!["run".into(), "com.valvesoftware.Steam".into()];
+        let spec = build_launch_spec(game, &ctx);
+        assert_eq!(
+            spec.args,
+            vec!["run", "com.valvesoftware.Steam", "-applaunch", "945360"]
+        );
     }
 
     #[test]
     fn wine_spec_sets_overrides_and_prefix() {
         let game = Path::new("/b/drive_c/Among Us");
-        let ctx = RuntimeContext {
-            runtime: Runtime::Wine,
-            prefix: Some(PathBuf::from("/b")),
-            launcher: Some(PathBuf::from("/usr/bin/wine")),
-        };
+        let mut ctx = context(Runtime::Wine, "/usr/bin/wine");
+        ctx.prefix = Some(PathBuf::from("/b"));
         let spec = build_launch_spec(game, &ctx);
         assert_eq!(spec.program, PathBuf::from("/usr/bin/wine"));
         assert!(spec.args[0].ends_with("Among Us.exe"));
@@ -256,10 +544,46 @@ mod tests {
             .env
             .iter()
             .any(|(k, v)| k == "WINEDLLOVERRIDES" && v == "winhttp=n,b"));
+        assert!(spec.env.iter().any(|(k, v)| k == "WINEPREFIX" && v == "/b"));
+    }
+
+    #[test]
+    fn crossover_spec_selects_bottle() {
+        let game = Path::new("/CrossOver/Bottles/AU/drive_c/Games/Among Us");
+        let mut ctx = context(Runtime::Crossover, "/Applications/CrossOver.app/cxrun");
+        ctx.prefix = Some(PathBuf::from("/CrossOver/Bottles/AU"));
+        ctx.launcher_args = vec!["--bottle".into(), "AU".into(), "--".into()];
+        let spec = build_launch_spec(game, &ctx);
+        assert_eq!(&spec.args[..3], ["--bottle", "AU", "--"]);
+        assert!(spec.env.iter().any(|(k, v)| k == "CX_BOTTLE" && v == "AU"));
+    }
+
+    #[test]
+    fn whisky_spec_uses_start_unix_in_the_selected_prefix() {
+        let game = Path::new("/Whisky/Bottles/AU/drive_c/Games/Among Us");
+        let mut ctx = context(Runtime::Whisky, "/Whisky/Libraries/Wine/bin/wine64");
+        ctx.prefix = Some(PathBuf::from("/Whisky/Bottles/AU"));
+        ctx.launcher_args = vec!["start".into(), "/unix".into()];
+        let spec = build_launch_spec(game, &ctx);
+        assert_eq!(&spec.args[..2], ["start", "/unix"]);
+        assert!(spec.args[2].ends_with("Among Us.exe"));
         assert!(spec
             .env
             .iter()
-            .any(|(k, v)| k == "WINEPREFIX" && v == "/b"));
+            .any(|(key, value)| key == "WINEPREFIX" && value == "/Whisky/Bottles/AU"));
+    }
+
+    #[test]
+    fn bottles_spec_selects_the_detected_bottle() {
+        let game = Path::new("/bottles/bottles/AU/drive_c/Games/Among Us");
+        let mut ctx = context(Runtime::Bottles, "/usr/bin/bottles-cli");
+        ctx.prefix = Some(PathBuf::from("/bottles/bottles/AU"));
+        ctx.launcher_args =
+            vec!["run".into(), "-b".into(), "AU".into(), "-e".into()];
+        let spec = build_launch_spec(game, &ctx);
+        assert_eq!(&spec.args[..4], ["run", "-b", "AU", "-e"]);
+        assert!(spec.args[4].ends_with("Among Us.exe"));
+        assert!(!spec.env.iter().any(|(key, _)| key == "WINEPREFIX"));
     }
 
     #[test]
@@ -275,7 +599,6 @@ mod tests {
         let reg = "WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\DllOverrides] 1700000000\n\"other\"=\"builtin\"\n";
         let out = merge_winhttp_override(reg).unwrap();
         assert!(out.contains(OVERRIDE_LINE));
-        // existing value preserved
         assert!(out.contains("\"other\"=\"builtin\""));
     }
 
@@ -291,5 +614,38 @@ mod tests {
         let out = merge_winhttp_override(reg).unwrap();
         assert!(out.contains(OVERRIDE_LINE));
         assert!(!out.contains("\"winhttp\"=\"builtin\""));
+    }
+
+    #[test]
+    fn override_requires_an_existing_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        assert_eq!(
+            register_winhttp_override(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn override_write_is_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("user.reg"), "WINE REGISTRY Version 2\n").unwrap();
+        register_winhttp_override(tmp.path()).unwrap();
+        assert!(fs::read_to_string(tmp.path().join("user.reg"))
+            .unwrap()
+            .contains(OVERRIDE_LINE));
+    }
+
+    #[test]
+    fn current_host_classification_smoke() {
+        let game = Path::new("/games/steamapps/common/Among Us");
+        let runtime = classify_runtime(game, current_host(), None).0;
+        if cfg!(target_os = "windows") {
+            assert_eq!(runtime, Runtime::Native);
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(runtime, Runtime::Proton);
+        } else {
+            assert_eq!(runtime, Runtime::Wine);
+        }
     }
 }

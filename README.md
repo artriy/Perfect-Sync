@@ -4,7 +4,7 @@
 
 <br>
 
-[![Platform](https://img.shields.io/badge/platform-Windows-9b7bff?style=flat-square)](#install-and-run)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-9b7bff?style=flat-square)](#platform-support)
 [![Version](https://img.shields.io/badge/version-0.1.0%20beta-7a5bff?style=flat-square)](https://github.com/artriy/Perfect-Sync/releases)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-5bc0ff?style=flat-square)](https://tauri.app)
 [![License](https://img.shields.io/badge/license-MIT-5bc0ff?style=flat-square)](LICENSE)
@@ -66,12 +66,12 @@ Plus architecture auto-detect (x86 or x64 chosen from the real game executable) 
 always-include mods that get merged into every lobby code you apply.
 
 > [!TIP]
-> **Most stores work.** Steam and Epic installs launch natively from the app, and any writable
-> copy (itch, a manually placed folder, and others) is supported too: Perfect-Sync sets up the
-> mods in the game folder, and you may just need to start the game yourself if it does not launch
-> natively. Microsoft Store / Game Pass copies live in the protected `WindowsApps` folder that
-> apps can't modify, so copy "Among Us" to a normal folder (e.g. your Documents) and point
-> Perfect-Sync at that copy.
+> **The selected folder is the source of truth.** Perfect-Sync installs and synchronizes mods
+> directly in the writable folder containing `Among Us.exe`; Wine, Proton, CrossOver, Whisky,
+> and Bottles do not need to be running for that step. Steam and Epic have integrated launch
+> paths, but **Set up mods** is always available when you prefer to launch from the store or
+> compatibility frontend yourself. Microsoft Store / Game Pass copies must first be copied out
+> of the protected `WindowsApps` folder.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
@@ -100,12 +100,24 @@ always-include mods that get merged into every lobby code you apply.
 
 ## Install and run
 
-Windows is the supported platform.
+Download the artifact for your host from [Releases](https://github.com/artriy/Perfect-Sync/releases):
 
-1. Download the installer (`Perfect-Sync_<version>_x64-setup.exe`) or the portable `app.exe`
-   from [Releases](https://github.com/artriy/Perfect-Sync/releases).
-2. The build is unsigned, so Windows SmartScreen shows a warning on first run. Click
-   **More info**, then **Run anyway**.
+| Host | Artifact | First-run notes |
+| --- | --- | --- |
+| Windows 10/11 x64 | NSIS `setup.exe` or portable `app.exe` | Unsigned; use **More info → Run anyway** at the SmartScreen prompt. |
+| Linux x86_64 / Steam Deck | `.AppImage` | `chmod +x Perfect-Sync*.AppImage`; launch Among Us once in Steam first so Proton creates its prefix. |
+| macOS Apple Silicon | `aarch64.dmg` | Ad-hoc signed, not notarized; see the Gatekeeper command below if macOS blocks it. |
+| macOS Intel | `x64.dmg` | Ad-hoc signed, not notarized; see the Gatekeeper command below if macOS blocks it. |
+
+On macOS, drag the app to Applications. Free ad-hoc signing preserves the bundle signature but
+cannot establish Apple trust or notarize it. If Gatekeeper quarantines the downloaded app:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Perfect-Sync.app"
+```
+
+Use the native Linux/macOS Perfect-Sync build. Running the Windows `app.exe` itself under
+Wine/Proton is not a supported deployment path.
 
 ## Build from source
 
@@ -120,8 +132,20 @@ Stack: Tauri 2, React 19, TypeScript, Vite, Tailwind v4, with a Rust core crate.
 
 ## Platform support
 
-Windows is supported and tested. Linux (via Steam Proton) and macOS (via Wine and CrossOver)
-exist in the code but are experimental and have not been built or tested on those platforms.
+| Host and game runtime | Status |
+| --- | --- |
+| Windows 10/11 x64; native Steam, Epic, itch/manual | **Supported** |
+| Linux x86_64 / Steam Deck; native or Flatpak Steam + Proton | **Experimental** |
+| Linux x86_64; Wine or Bottles | **Experimental** |
+| macOS Intel / Apple Silicon; CrossOver, Whisky, or Wine | **Experimental** |
+| Windows Perfect-Sync executable under Wine/Proton | **Unsupported** — use the native host build |
+| Android, iOS, BSD, ChromeOS, Linux ARM64, Windows ARM64 | **Unsupported** |
+
+Release CI builds Windows, Ubuntu, macOS Intel, and macOS Apple Silicon artifacts and runs the
+frontend checks plus the Rust workspace tests in every matrix job. Cross-platform tests exercise
+real filesystem synchronization, runtime classification, prefix registry setup, and launch
+command construction. Linux/macOS game launching remains experimental until each compatibility
+frontend and store combination has broader real-machine coverage.
 
 ## Security note
 

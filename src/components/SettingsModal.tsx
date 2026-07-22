@@ -81,8 +81,8 @@ export function SettingsModal({
     setWorking(true);
     setMsg("");
     try {
-      await reinstallLoader(gamePath.trim(), profileId, arch);
-      setMsg("BepInEx reinstalled (latest).");
+      const warning = await reinstallLoader(gamePath.trim(), profileId, arch);
+      setMsg(warning ?? "BepInEx reinstalled (latest).");
     } catch (e) {
       setMsg(String(e));
     } finally {
@@ -98,13 +98,19 @@ export function SettingsModal({
     return () => document.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
-  const save = () =>
+  const save = () => {
+    const selectedPath = gamePath.trim() || game?.path;
+    const detected = game?.path === selectedPath ? game : null;
+    const unchanged = selectedPath === settings.gamePath;
     onSave({
       ...settings,
       githubToken: token.trim() || undefined,
-      gamePath: gamePath.trim() || game?.path || undefined,
+      gamePath: selectedPath,
       arch,
+      store: detected?.store ?? (unchanged ? settings.store : undefined),
+      runtime: detected?.runtime ?? (unchanged ? settings.runtime : undefined),
     });
+  };
 
   return (
     <AnimatePresence>
@@ -284,6 +290,12 @@ export function SettingsModal({
                   />
                   <StatusRow ok={status.dotnet} label=".NET runtime" />
                   <StatusRow ok={status.steamAppid} label="Steam launch fix" />
+                  {status.runtime !== "native" && (
+                    <StatusRow
+                      ok={status.runtimeReady}
+                      label={`${status.runtime} winhttp override`}
+                    />
+                  )}
                   <div className="mt-1 text-ink-faint">
                     plugins: {status.profilePlugins} in profile · {status.gamePlugins} synced to game
                   </div>
