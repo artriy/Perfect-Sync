@@ -162,7 +162,7 @@ fn steam_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if cfg!(windows) {
         // Registry: HKCU\Software\Valve\Steam\SteamPath
-        if let Ok(out) = std::process::Command::new("reg")
+        if let Ok(out) = crate::process::command("reg")
             .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
             .output()
         {

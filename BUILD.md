@@ -29,6 +29,12 @@ This compiles the Rust core + UI in release mode and bundles an installer.
 
 So to test without `tauri dev`: build once, then run `target/release/app.exe`.
 
+Production binaries use Tauri's `custom-protocol` feature and load the embedded
+`dist` assets; they never require `localhost:1420`. Use the Tauri build command
+above so the frontend is regenerated before Rust compilation. Plain
+`cargo build --release` embeds the existing `dist` directory and is not the
+recommended packaging command.
+
 ## Dev mode (hot reload, for development)
 
 ```powershell

@@ -187,8 +187,6 @@ export function App() {
     }
   };
 
-  const hasRoleMod = (mods: ProfileMod[]) => mods.some((m) => !m.managed && m.tags.includes("role"));
-
   const toggleMod = async (modId: string) => {
     const mod = active.mods.find((m) => m.packageId === modId);
     if (!mod) return;
@@ -231,10 +229,6 @@ export function App() {
   const addCatalog = (item: CatalogItem) => {
     if (active.mods.some((m) => m.packageId === item.id)) {
       notify(`${item.name} is already in this profile`, "error");
-      return;
-    }
-    if (item.tags.includes("role") && hasRoleMod(active.mods)) {
-      notify("Only one role mod per profile. Remove the current one first.", "error");
       return;
     }
     setAddOpen(false);

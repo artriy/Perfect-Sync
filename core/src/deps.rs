@@ -1,13 +1,10 @@
 use crate::catalog::Catalog;
-use crate::types::ModTag;
 use std::collections::HashSet;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Resolved {
     /// install order: each dependency appears before the mod that needs it
     pub ordered: Vec<String>,
-    /// ids of role mods when more than one is selected (cannot coexist)
-    pub conflicts: Vec<String>,
 }
 
 fn visit(cat: &Catalog, id: &str, out: &mut Vec<String>, stack: &mut HashSet<String>) {
@@ -29,17 +26,7 @@ pub fn resolve(cat: &Catalog, selected: &[String]) -> Resolved {
     for id in selected {
         visit(cat, id, &mut ordered, &mut stack);
     }
-    let role_mods: Vec<String> = selected
-        .iter()
-        .filter(|id| {
-            cat.get(id)
-                .map(|e| e.tags.contains(&ModTag::Role))
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
-    let conflicts = if role_mods.len() > 1 { role_mods } else { Vec::new() };
-    Resolved { ordered, conflicts }
+    Resolved { ordered }
 }
 
 #[cfg(test)]
@@ -60,7 +47,6 @@ mod tests {
         // Reactor before MiraAPI before TOU-Mira
         assert!(idx(&r.ordered, "NuclearPowered/Reactor") < idx(&r.ordered, "All-Of-Us-Mods/MiraAPI"));
         assert!(idx(&r.ordered, "All-Of-Us-Mods/MiraAPI") < idx(&r.ordered, "AU-Avengers/TOU-Mira"));
-        assert!(r.conflicts.is_empty());
     }
 
     #[test]
@@ -71,16 +57,21 @@ mod tests {
     }
 
     #[test]
-    fn flags_two_role_mods() {
+    fn keeps_multiple_role_mods_in_install_order() {
         let cat = parse(SAMPLE).unwrap();
-        let r = resolve(
-            &cat,
-            &[
-                "AU-Avengers/TOU-Mira".to_string(),
-                "EnhancedNetwork/TownofHost-Enhanced".to_string(),
-            ],
-        );
-        assert_eq!(r.conflicts.len(), 2);
+        let selected = [
+            "AU-Avengers/TOU-Mira".to_string(),
+            "EnhancedNetwork/TownofHost-Enhanced".to_string(),
+        ];
+        let resolved = resolve(&cat, &selected);
+        assert!(resolved
+            .ordered
+            .iter()
+            .any(|id| id == "AU-Avengers/TOU-Mira"));
+        assert!(resolved
+            .ordered
+            .iter()
+            .any(|id| id == "EnhancedNetwork/TownofHost-Enhanced"));
     }
 
     #[test]

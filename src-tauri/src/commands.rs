@@ -610,21 +610,6 @@ fn add_mod_impl(profile_id: String, repo: String, arch: String) -> Result<Profil
     let cat = catalog();
     let http = http();
 
-    // enforce one role mod per profile (two role mods cannot coexist)
-    let main_tags = cat.get(&repo).map(|e| e.tags.clone()).unwrap_or_default();
-    if main_tags.contains(&ModTag::Role) {
-        if let Some(existing) = rec
-            .mods
-            .iter()
-            .find(|m| !m.managed && m.package_id != repo && m.tags.contains(&ModTag::Role))
-        {
-            return Err(format!(
-                "Only one role mod per profile. Remove {} first.",
-                existing.name
-            ));
-        }
-    }
-
     rec.mods.retain(|m| m.package_id != repo);
     let ordered = vec![repo.clone()];
     for id in ordered {
@@ -1040,7 +1025,7 @@ fn launches_registered_install(game_dir: &Path) -> bool {
 
 /// Whether the Steam client is running (Windows: tasklist by image name).
 fn is_steam_running() -> bool {
-    std::process::Command::new("tasklist")
+    process::command("tasklist")
         .args(["/FI", "IMAGENAME eq steam.exe", "/NH"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("steam.exe"))
@@ -1057,7 +1042,7 @@ fn ensure_steam_running() {
     let Some(exe) = game::steam_exe() else {
         return;
     };
-    if std::process::Command::new(&exe).arg("-silent").spawn().is_err() {
+    if process::command(&exe).arg("-silent").spawn().is_err() {
         return;
     }
     // ponytail: poll for the process, then a fixed grace for login; swap for a
@@ -1108,7 +1093,7 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
                     // setup, lets it init Steamworks while Steam runs).
                     if launches_registered_install(game_dir) {
                         let url = format!("steam://rungameid/{}", game::STEAM_APP_ID);
-                        std::process::Command::new("cmd")
+                        process::command("cmd")
                             .args(["/C", "start", "", &url])
                             .spawn()
                             .map_err(|e| format!("couldn't launch via Steam: {e}"))?;
@@ -1118,7 +1103,7 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
                 }
                 Some("epic") => {
                     let starter = ensure_epic_starter(&http(), game_dir)?;
-                    std::process::Command::new(&starter)
+                    process::command(&starter)
                         .current_dir(game_dir)
                         .stdin(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
@@ -1190,11 +1175,11 @@ pub fn open_url(url: String) -> Result<(), String> {
         return Err("only https links allowed".to_string());
     }
     let spawned = if cfg!(windows) {
-        std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn()
+        process::command("cmd").args(["/C", "start", "", &url]).spawn()
     } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(&url).spawn()
+        process::command("open").arg(&url).spawn()
     } else {
-        std::process::Command::new("xdg-open").arg(&url).spawn()
+        process::command("xdg-open").arg(&url).spawn()
     };
     spawned.map(|_| ()).map_err(|e| e.to_string())
 }

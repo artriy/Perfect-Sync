@@ -20,6 +20,10 @@ versions and stores. Use it at your own risk, and please report what breaks.
   working loader when offline.
 - Mod catalog plus add-any-GitHub-repo, named profiles, lobby/share codes, trust
   badges, and profile synchronization before launch.
+- Suppress console windows for every helper process spawned by the Windows app.
+- Allow multiple role mods in the same profile.
+- Embed production frontend assets through Tauri's custom protocol so release
+  binaries never depend on the localhost development server.
 
 ### Known limitations
 - Windows builds are unsigned, so SmartScreen warns on first run.
