@@ -1,67 +1,361 @@
 name: release
+
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
 jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      release_commit: ${{ steps.release_identity.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy,rustfmt
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+      - name: Validate release identity and locked workspace versions
+        id: release_identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          release_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$(git rev-parse HEAD)" = "$release_commit"
+
+          cargo metadata --locked --format-version 1 --no-deps > "$RUNNER_TEMP/cargo-metadata.json"
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const packageVersion = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+          const tauriVersion = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8")).version;
+          const metadata = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/cargo-metadata.json`, "utf8"));
+          const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
+
+          if (typeof packageVersion !== "string" || !semver.test(packageVersion)) {
+            throw new Error(`package.json version is not exact SemVer: ${packageVersion}`);
+          }
+          if (process.env.RELEASE_TAG !== `v${packageVersion}`) {
+            throw new Error(`tag ${process.env.RELEASE_TAG} does not match v${packageVersion}`);
+          }
+          if (tauriVersion !== packageVersion) {
+            throw new Error(`Tauri version ${tauriVersion} does not match ${packageVersion}`);
+          }
+
+          const workspaceMembers = new Set(metadata.workspace_members);
+          const mismatches = metadata.packages
+            .filter(({ id }) => workspaceMembers.has(id))
+            .filter(({ version }) => version !== packageVersion)
+            .map(({ name, version }) => `${name}@${version}`);
+          if (mismatches.length !== 0) {
+            throw new Error(`workspace package versions do not match ${packageVersion}: ${mismatches.join(", ")}`);
+          }
+          NODE
+
+          echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Linux Tauri libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit frontend production dependencies
+        run: pnpm audit --prod --audit-level high
+
+      - name: Type-check frontend
+        run: pnpm typecheck
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Create draft prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft --prerelease
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --prerelease \
+              --title "Perfect-Sync $RELEASE_TAG" \
+              --notes-file - <<'NOTES'
+          Experimental release, nothing official or stable yet. Expect rough edges
+          and breaking changes, and behavior may differ across Among Us versions and
+          stores. Use at your own risk. See CHANGELOG.md for details and known limitations.
+          NOTES
+          fi
+
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .id)"
+          old_assets="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100")"
+          jq -r 'add | .[].id' <<<"$old_assets" |
+            while IFS= read -r asset_id; do
+              if [ -n "$asset_id" ]; then
+                gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+              fi
+            done
+
   build:
+    name: Build ${{ matrix.name }}
+    needs: validate
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
-          - platform: macos-latest
-            args: '--target x86_64-apple-darwin'
-          - platform: ubuntu-22.04
-            args: ''
-          - platform: windows-latest
-            args: ''
-    runs-on: ${{ matrix.platform }}
+          - name: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: windows
+            upload: |
+              target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+              target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          - name: Linux x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: linux
+            upload: |
+              target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+              target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
+              target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+          - name: macOS x64
+            os: macos-14
+            target: x86_64-apple-darwin
+            bundles: macos
+            upload: target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          - name: macOS arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            bundles: macos
+            upload: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.release_commit }}
+
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 9.15.9
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
-      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.target }}
+
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: './src-tauri -> target'
-      - name: install linux deps
-        if: matrix.platform == 'ubuntu-22.04'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - run: pnpm install
-      - name: Type-check frontend
-        run: pnpm typecheck
-      - name: Test Rust workspace on runner
-        run: cargo test --workspace --all-targets
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Perfect-Sync ${{ github.ref_name }}'
-          releaseBody: |
-            Experimental release, nothing official or stable yet. Expect rough edges
-            and breaking changes, and behavior may differ across Among Us versions and
-            stores. Use at your own risk. See CHANGELOG.md for details and known limitations.
-          releaseDraft: false
-          prerelease: false
-          args: ${{ matrix.args }}
-      - name: Verify ad-hoc macOS bundle signature
-        if: runner.os == 'macOS'
+          workspaces: '. -> target'
+          key: ${{ matrix.target }}
+
+      - name: Install Linux Tauri libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y file rpm libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test Rust workspace on build host
+        run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Build bundles
+        run: pnpm tauri build --target "${{ matrix.target }}" -- --locked
+
+      - name: Validate Windows bundles
+        if: matrix.bundles == 'windows'
+        shell: pwsh
+        run: |
+          $root = "target/${{ matrix.target }}/release/bundle"
+          $groups = @(
+            @{ Directory = "msi"; Pattern = "*.msi"; Magic = "D0CF11E0A1B11AE1" },
+            @{ Directory = "nsis"; Pattern = "*-setup.exe"; Magic = "4D5A" }
+          )
+          foreach ($group in $groups) {
+            $assets = @(Get-ChildItem -Path (Join-Path $root $group.Directory) -Filter $group.Pattern -File)
+            if ($assets.Count -eq 0) { throw "Missing $($group.Pattern) bundle" }
+            foreach ($asset in $assets) {
+              if ($asset.Length -eq 0) { throw "Empty bundle: $($asset.FullName)" }
+              $stream = [System.IO.File]::OpenRead($asset.FullName)
+              try {
+                $count = $group.Magic.Length / 2
+                $header = New-Object byte[] $count
+                if ($stream.Read($header, 0, $count) -ne $count) { throw "Truncated bundle: $($asset.FullName)" }
+                $actual = [Convert]::ToHexString($header)
+                if ($actual -ne $group.Magic) { throw "Invalid bundle header: $($asset.FullName)" }
+              } finally {
+                $stream.Dispose()
+              }
+              Get-FileHash -Algorithm SHA256 $asset.FullName
+            }
+          }
+
+      - name: Validate Linux bundles
+        if: matrix.bundles == 'linux'
         shell: bash
         run: |
-          target="${{ matrix.args }}"
-          app="target/${target#--target }/release/bundle/macos/Perfect-Sync.app"
-          test -d "$app"
-          codesign --verify --deep --strict "$app"
-          codesign --display --verbose=2 "$app"
+          set -euo pipefail
+          shopt -s nullglob
+          root="target/${{ matrix.target }}/release/bundle"
+          debs=("$root"/deb/*.deb)
+          rpms=("$root"/rpm/*.rpm)
+          appimages=("$root"/appimage/*.AppImage)
+          test ${#debs[@]} -gt 0
+          test ${#rpms[@]} -gt 0
+          test ${#appimages[@]} -gt 0
+          for asset in "${debs[@]}"; do
+            test -s "$asset"
+            dpkg-deb --info "$asset" >/dev/null
+            sha256sum "$asset"
+          done
+          for asset in "${rpms[@]}"; do
+            test -s "$asset"
+            rpm -qpi "$asset" >/dev/null
+            sha256sum "$asset"
+          done
+          for asset in "${appimages[@]}"; do
+            test -s "$asset"
+            file "$asset" | grep -q ELF
+            sha256sum "$asset"
+          done
+
+      - name: Validate macOS bundles and signature
+        if: matrix.bundles == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          root="target/${{ matrix.target }}/release/bundle"
+          apps=("$root"/macos/*.app)
+          dmgs=("$root"/dmg/*.dmg)
+          test ${#apps[@]} -gt 0
+          test ${#dmgs[@]} -gt 0
+          for app in "${apps[@]}"; do
+            codesign --verify --deep --strict --verbose=2 "$app"
+            codesign --display --verbose=2 "$app"
+          done
+          for dmg in "${dmgs[@]}"; do
+            test -s "$dmg"
+            hdiutil verify "$dmg"
+            shasum -a 256 "$dmg"
+          done
+
+      - name: Upload validated bundles to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: true
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: ${{ matrix.upload }}
+
+  publish:
+    name: Publish prerelease
+    needs:
+      - validate
+      - build
+    if: ${{ needs.validate.result == 'success' && needs.build.result == 'success' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.release_commit }}
+          fetch-depth: 0
+
+      - name: Verify release assets and publish prerelease
+        env:
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.release_commit }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
+          test "$(jq -r .draft <<<"$release_json")" = true
+          test "$(jq -r .prerelease <<<"$release_json")" = true
+          release_id="$(jq -r .id <<<"$release_json")"
+
+          assets="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100")"
+          jq -e '
+            add |
+            length == 7 and
+            ([.[] | .name | select(test("\\.msi$"))] | length == 1) and
+            ([.[] | .name | select(test("-setup\\.exe$"))] | length == 1) and
+            ([.[] | .name | select(test("\\.deb$"))] | length == 1) and
+            ([.[] | .name | select(test("\\.rpm$"))] | length == 1) and
+            ([.[] | .name | select(test("\\.AppImage$"))] | length == 1) and
+            ([.[] | .name | select(test("\\.dmg$"))] | length == 2)
+          ' <<<"$assets"
+
+          git fetch --force --no-tags origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          current_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$current_commit" = "$EXPECTED_COMMIT"
+
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease

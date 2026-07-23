@@ -12,7 +12,6 @@
     "core:window:allow-start-dragging",
     "core:window:allow-close",
     "dialog:default",
-    "deep-link:default",
-    "deep-link:allow-register"
+    "deep-link:allow-get-current"
   ]
 }

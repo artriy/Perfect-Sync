@@ -2,6 +2,9 @@
 members = ["core", "src-tauri"]
 resolver = "2"
 
+[workspace.package]
+rust-version = "1.88"
+
 [profile.release]
 strip = true
 lto = true

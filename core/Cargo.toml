@@ -2,6 +2,7 @@
 name = "perfect-sync-core"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Core logic for Perfect-Sync (catalog, lobby codec, resolver, loader)"
 license = "MIT"
 repository = "https://github.com/artriy/Perfect-Sync"
@@ -18,6 +19,9 @@ thiserror = "2"
 ureq = { version = "2", features = ["json"] }
 zip = "2"
 url = "2"
+semver = "1"
+percent-encoding = "2"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

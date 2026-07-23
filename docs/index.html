@@ -47,8 +47,12 @@
 <script>
   (function () {
     var params = new URLSearchParams(location.search);
-    var code = decodeURIComponent((location.hash || "").replace(/^#/, "")) || params.get("c") || "";
-    var name = params.get("lobby") || "";
+    var rawFragment = (location.hash || "").replace(/^#/, "");
+    var fragment = new URLSearchParams(rawFragment);
+    var legacyCode = rawFragment;
+    try { legacyCode = decodeURIComponent(rawFragment); } catch (_) {}
+    var code = fragment.get("code") || params.get("c") || (/^PERFECT-/.test(legacyCode) ? legacyCode : "");
+    var name = fragment.get("lobby") || params.get("lobby") || "";
     var deep = code ? "perfectsync://lobby/" + code : "";
     if (name) {
       document.getElementById("for").innerHTML = 'Lobby: <span class="lobby"></span>';

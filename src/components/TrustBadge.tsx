@@ -7,17 +7,19 @@ const STYLE = {
   flagged: { label: "Unverified", fg: "#ffd9a8", bg: "rgba(255,170,60,0.18)", Icon: Warning },
 } as const;
 
-/** Shows a mod's vetting tier. `compact` renders the icon only (with a tooltip). */
+/** Shows a mod's vetting tier. `compact` keeps the visible presentation to an icon. */
 export function TrustBadge({ trust, compact }: { trust: Trust; compact?: boolean }) {
   const s = STYLE[trust];
+  const accessibleLabel = `${s.label} trust tier`;
   return (
     <span
       className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-[3px] text-[11px] font-medium leading-none whitespace-nowrap"
       style={{ color: s.fg, background: s.bg }}
-      title={`${s.label} mod`}
+      title={accessibleLabel}
+      aria-label={accessibleLabel}
     >
-      <s.Icon size={11} weight="fill" />
-      {!compact && s.label}
+      <s.Icon size={11} weight="fill" aria-hidden="true" />
+      {compact ? <span className="sr-only">{accessibleLabel}</span> : s.label}
     </span>
   );
 }

@@ -6,12 +6,25 @@
 //! Records serialize in camelCase to match the frontend's TypeScript types
 //! (`packageId`, `crewColor`, `gameBuild`).
 
-use crate::loader;
 use crate::types::{LobbyManifest, ManifestMod, ModSource, ModTag};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io::{self, Cursor};
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Cursor, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+const MAX_PROFILE_ID_BYTES: usize = 64;
+const MAX_DLL_NAME_BYTES: usize = 180;
+const MAX_PROFILE_JSON_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_ZIP_ENTRIES: usize = 4_096;
+const MAX_ZIP_PATH_BYTES: usize = 1_024;
+const MAX_ZIP_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ZIP_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PLUGIN_BYTES: u64 = 256 * 1024 * 1024;
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +58,8 @@ pub struct ProfileRecord {
     pub crew_color: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub game_build: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub game_instance_id: Option<String>,
     #[serde(default)]
     pub mods: Vec<InstalledMod>,
 }
@@ -54,12 +69,187 @@ pub struct ProfileStore {
     pub root: PathBuf,
 }
 
-fn validate_id(id: &str) -> io::Result<()> {
-    let mut comps = Path::new(id).components();
-    let single_normal =
-        matches!(comps.next(), Some(std::path::Component::Normal(_))) && comps.next().is_none();
-    if id.is_empty() || id.contains('/') || id.contains('\\') || !single_normal {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid profile id"));
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name
+        .trim_end_matches(['.', ' '])
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+}
+
+/// Validate the one portable component used for every profile directory.
+pub fn validate_profile_id(id: &str) -> io::Result<()> {
+    if id.is_empty()
+        || id.len() > MAX_PROFILE_ID_BYTES
+        || !id.is_ascii()
+        || id.ends_with('.')
+        || id.ends_with(' ')
+        || is_windows_device_name(id)
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid("invalid profile id"));
+    }
+    let mut components = Path::new(id).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(invalid("invalid profile id"));
+    }
+    Ok(())
+}
+
+/// Validate a single ASCII-only portable DLL filename. Paths and disabled-name suffixes are not accepted.
+pub fn validate_dll_name(name: &str) -> io::Result<()> {
+    if !name.is_ascii() {
+        return Err(invalid(
+            "DLL file name must be an ASCII-only portable basename",
+        ));
+    }
+    if name.is_empty()
+        || name.len() > MAX_DLL_NAME_BYTES
+        || name.ends_with('.')
+        || name.ends_with(' ')
+        || name.chars().any(|c| {
+            c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        })
+        || is_windows_device_name(name)
+        || !name
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && ext.eq_ignore_ascii_case("dll"))
+    {
+        return Err(invalid("invalid DLL file name"));
+    }
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(invalid("invalid DLL file name"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+pub(crate) fn reject_reparse(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_reparse(&metadata) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing reparse-point path {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn unique_sibling(path: &Path, label: &str) -> io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("destination has no parent directory"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("destination has no portable file name"))?;
+    for _ in 0..128 {
+        let number = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{name}.{label}.{}.{number}", std::process::id()));
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary path",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn checked_profile_dir(root: &Path, id: &str, create: bool) -> io::Result<PathBuf> {
+    validate_profile_id(id)?;
+    reject_reparse(root)?;
+    let dir = root.join(id);
+    reject_reparse(&dir)?;
+    if create {
+        fs::create_dir_all(&dir)?;
+        reject_reparse(&dir)?;
+    }
+    Ok(dir)
+}
+
+fn validate_record(profile: &ProfileRecord) -> io::Result<()> {
+    validate_profile_id(&profile.id)?;
+    let mut files = HashSet::new();
+    for file in profile.mods.iter().filter_map(|m| m.file.as_deref()) {
+        validate_dll_name(file)?;
+        if !files.insert(file.to_ascii_lowercase()) {
+            return Err(invalid(
+                "profile contains duplicate or case-colliding DLL filenames",
+            ));
+        }
     }
     Ok(())
 }
@@ -69,52 +259,197 @@ impl ProfileStore {
         Self { root: root.into() }
     }
 
-    pub fn profile_dir(&self, id: &str) -> PathBuf {
-        self.root.join(id)
+    pub fn profile_dir(&self, id: &str) -> io::Result<PathBuf> {
+        checked_profile_dir(&self.root, id, false)
     }
 
-    fn manifest_path(&self, id: &str) -> PathBuf {
-        self.profile_dir(id).join("profile.json")
-    }
-
-    pub fn save(&self, profile: &ProfileRecord) -> io::Result<()> {
-        validate_id(&profile.id)?;
-        let dir = self.profile_dir(&profile.id);
-        fs::create_dir_all(&dir)?;
-        let json = serde_json::to_string_pretty(profile)?;
-        let tmp = dir.join("profile.json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, self.manifest_path(&profile.id))
-    }
-
-    pub fn load(&self, id: &str) -> Option<ProfileRecord> {
-        let text = fs::read_to_string(self.manifest_path(id)).ok()?;
-        serde_json::from_str(&text).ok()
-    }
-
-    pub fn list(&self) -> Vec<ProfileRecord> {
-        let mut out = Vec::new();
-        let Ok(entries) = fs::read_dir(&self.root) else {
-            return out;
+    fn reject_case_collision(&self, id: &str) -> io::Result<()> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
         };
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Some(p) = self.load(name) {
-                        out.push(p);
-                    }
+        for entry in entries {
+            let entry = entry?;
+            if let Some(other) = entry.file_name().to_str() {
+                if other != id && other.eq_ignore_ascii_case(id) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "profile id collides case-insensitively with an existing profile",
+                    ));
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn save(&self, profile: &ProfileRecord) -> io::Result<()> {
+        self.save_with_publisher(profile, atomic_replace)
+    }
+
+    fn save_with_publisher<F>(&self, profile: &ProfileRecord, publish: F) -> io::Result<()>
+    where
+        F: FnOnce(&Path, &Path) -> io::Result<()>,
+    {
+        validate_record(profile)?;
+        let json = serde_json::to_vec_pretty(profile)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if json.len() as u64 > MAX_PROFILE_JSON_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "profile manifest exceeds the size limit",
+            ));
+        }
+
+        let _guard = SAVE_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("profile save lock is poisoned"))?;
+        reject_reparse(&self.root)?;
+        fs::create_dir_all(&self.root)?;
+        reject_reparse(&self.root)?;
+        self.reject_case_collision(&profile.id)?;
+
+        let dir = checked_profile_dir(&self.root, &profile.id, false)?;
+        let created_dir = match fs::create_dir(&dir) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error),
+        };
+        let manifest = dir.join("profile.json");
+        let mut tmp = None;
+        let result = (|| {
+            reject_reparse(&dir)?;
+            reject_reparse(&manifest)?;
+            if manifest.exists() {
+                self.load(&profile.id)?;
+            }
+            let tmp_path = unique_sibling(&manifest, "tmp")?;
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)?;
+            tmp = Some(tmp_path.clone());
+            file.write_all(&json)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            sync_parent(&dir)?;
+            reject_reparse(&manifest)?;
+            publish(&tmp_path, &manifest)
+        })();
+        if result.is_err() {
+            if let Some(tmp) = tmp {
+                match fs::remove_file(tmp) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => {}
+                }
+            }
+            if created_dir && reject_reparse(&dir).is_ok() {
+                match fs::remove_dir_all(&dir) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => {}
+                }
+            }
+        }
+        result
+    }
+
+    /// `Ok(None)` means absent. Invalid, unreadable, or corrupt data is an error.
+    pub fn load(&self, id: &str) -> io::Result<Option<ProfileRecord>> {
+        let dir = checked_profile_dir(&self.root, id, false)?;
+        let manifest = dir.join("profile.json");
+        reject_reparse(&manifest)?;
+        let metadata = match fs::metadata(&manifest) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if metadata.len() > MAX_PROFILE_JSON_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "profile manifest exceeds the size limit",
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "profile manifest is not a regular file",
+            ));
+        }
+        let text = fs::read_to_string(&manifest)?;
+        let profile: ProfileRecord = serde_json::from_str(&text)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        validate_record(&profile)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        if profile.id != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted profile id does not match its directory",
+            ));
+        }
+        Ok(Some(profile))
+    }
+
+    pub fn list(&self) -> io::Result<Vec<ProfileRecord>> {
+        reject_reparse(&self.root)?;
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut ids = HashSet::new();
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "profile root contains a symlink or reparse point",
+                ));
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().into_string().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "non-Unicode profile id")
+            })?;
+            if !ids.insert(name.to_ascii_lowercase()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "profile ids collide case-insensitively",
+                ));
+            }
+            validate_profile_id(&name)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let profile = self.load(&name)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "profile directory has no manifest",
+                )
+            })?;
+            out.push(profile);
+        }
         out.sort_by(|a, b| a.id.cmp(&b.id));
-        out
+        Ok(out)
     }
 
     pub fn delete(&self, id: &str) -> io::Result<()> {
-        validate_id(id)?;
-        let dir = self.profile_dir(id);
-        if dir.is_dir() {
-            fs::remove_dir_all(dir)?;
+        let dir = checked_profile_dir(&self.root, id, false)?;
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) if is_reparse(&metadata) => {
+                return Err(invalid("refusing to delete a profile reparse point"));
+            }
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(dir)?,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "profile is not a directory",
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
         Ok(())
     }
@@ -142,82 +477,237 @@ pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
     }
 }
 
-/// Copy a bare mod DLL into a profile's plugins directory. Returns the path.
-pub fn install_plugin_dll(profiles_root: &Path, id: &str, dll_src: &Path) -> io::Result<PathBuf> {
-    let plugins = loader::profile_plugins_dir(profiles_root, id);
-    fs::create_dir_all(&plugins)?;
-    let file_name = dll_src
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no file name"))?;
-    let dest = plugins.join(file_name);
-    fs::copy(dll_src, &dest)?;
-    Ok(dest)
+fn checked_plugins_dir(profiles_root: &Path, id: &str, create: bool) -> io::Result<PathBuf> {
+    let profile = checked_profile_dir(profiles_root, id, create)?;
+    let bep = profile.join("BepInEx");
+    let plugins = bep.join("plugins");
+    for path in [&bep, &plugins] {
+        reject_reparse(path)?;
+    }
+    if create {
+        fs::create_dir_all(&plugins)?;
+        for path in [&bep, &plugins] {
+            reject_reparse(path)?;
+        }
+    }
+    Ok(plugins)
 }
 
-/// Write downloaded plugin bytes straight into a profile's plugins dir.
+fn reject_case_collision(dir: &Path, name: &str) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let other = entry.file_name().into_string().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "non-Unicode plugin filename")
+        })?;
+        if other != name && other.eq_ignore_ascii_case(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "plugin filename collides case-insensitively",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn publish_plugin<R: Read>(
+    profiles_root: &Path,
+    id: &str,
+    name: &str,
+    mut reader: R,
+) -> io::Result<PathBuf> {
+    validate_dll_name(name)?;
+    let plugins = checked_plugins_dir(profiles_root, id, true)?;
+    reject_case_collision(&plugins, name)?;
+    let destination = plugins.join(name);
+    reject_reparse(&destination)?;
+    let tmp = unique_sibling(&destination, "install")?;
+    let result = (|| {
+        let mut output = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        let written = io::copy(&mut reader.by_ref().take(MAX_PLUGIN_BYTES + 1), &mut output)?;
+        if written == 0 || written > MAX_PLUGIN_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "plugin DLL is empty or exceeds the expanded-size limit",
+            ));
+        }
+        output.sync_all()?;
+        sync_parent(&plugins)?;
+        reject_reparse(&destination)?;
+        atomic_replace(&tmp, &destination)?;
+        Ok(destination.clone())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Copy a bare mod DLL into a profile's plugins directory. Returns the path.
+pub fn install_plugin_dll(profiles_root: &Path, id: &str, dll_src: &Path) -> io::Result<PathBuf> {
+    reject_reparse(dll_src)?;
+    let metadata = fs::metadata(dll_src)?;
+    if !metadata.is_file() {
+        return Err(invalid("plugin source is not a regular file"));
+    }
+    let name = dll_src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| invalid("source has no portable file name"))?;
+    publish_plugin(profiles_root, id, name, File::open(dll_src)?)
+}
+
+/// Write downloaded plugin bytes into a profile's plugins directory atomically.
 pub fn install_plugin_bytes(
     profiles_root: &Path,
     id: &str,
     file_name: &str,
     bytes: &[u8],
 ) -> io::Result<PathBuf> {
-    let plugins = loader::profile_plugins_dir(profiles_root, id);
-    fs::create_dir_all(&plugins)?;
-    let name = std::path::Path::new(file_name)
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid plugin file name"))?;
-    let dest = plugins.join(name);
-    fs::write(&dest, bytes)?;
-    Ok(dest)
+    publish_plugin(profiles_root, id, file_name, Cursor::new(bytes))
 }
 
 /// Remove a plugin file (enabled or `.disabled`) from a profile.
 pub fn remove_plugin(profiles_root: &Path, id: &str, file_name: &str) -> io::Result<()> {
-    let plugins = loader::profile_plugins_dir(profiles_root, id);
-    for candidate in [plugins.join(file_name), plugins.join(format!("{file_name}.disabled"))] {
-        if candidate.exists() {
-            fs::remove_file(candidate)?;
+    validate_dll_name(file_name)?;
+    let plugins = checked_plugins_dir(profiles_root, id, false)?;
+    for candidate in [
+        plugins.join(file_name),
+        plugins.join(format!("{file_name}.disabled")),
+    ] {
+        reject_reparse(&candidate)?;
+        match fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())
 }
 
-/// Extract every plugin `.dll` from a release zip into the profile's plugins
-/// dir. Handles both bare-dll-in-zip and `.../BepInEx/plugins/*.dll` bundles.
-/// Returns the installed plugin file names.
-pub fn install_from_zip(profiles_root: &Path, id: &str, bytes: &[u8], only: Option<&str>) -> io::Result<Vec<String>> {
-    let plugins = loader::profile_plugins_dir(profiles_root, id);
-    fs::create_dir_all(&plugins)?;
+fn normalized_zip_name(name: &str) -> io::Result<(String, bool)> {
+    if name.len() > MAX_ZIP_PATH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ZIP entry path is too long",
+        ));
+    }
+    let normalized = name.replace('\\', "/");
+    let is_dir = normalized.ends_with('/');
+    let body = normalized.trim_end_matches('/');
+    if body.is_empty()
+        || normalized.starts_with('/')
+        || normalized.starts_with("//")
+        || body
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == ".." || part.contains(':'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsafe ZIP entry path",
+        ));
+    }
+    Ok((body.to_string(), is_dir))
+}
+
+/// Install exactly one plugin DLL selected from a release ZIP.
+pub fn install_from_zip(
+    profiles_root: &Path,
+    id: &str,
+    bytes: &[u8],
+    only: Option<&str>,
+) -> io::Result<Vec<String>> {
+    validate_profile_id(id)?;
+    if let Some(name) = only {
+        validate_dll_name(name)?;
+    }
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let mut installed = Vec::new();
-    for i in 0..archive.len() {
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ZIP has too many entries",
+        ));
+    }
+    let mut expanded = 0_u64;
+    let mut candidates = Vec::new();
+    let mut candidate_names = HashSet::new();
+    for index in 0..archive.len() {
+        let file = archive
+            .by_index(index)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let (name, is_dir) = normalized_zip_name(file.name())?;
+        if is_dir || file.is_dir() {
+            continue;
+        }
+        if file.size() > MAX_ZIP_ENTRY_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ZIP entry is too large",
+            ));
+        }
+        expanded = expanded
+            .checked_add(file.size())
+            .filter(|total| *total <= MAX_ZIP_EXPANDED_BYTES)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "ZIP expanded size is too large")
+            })?;
+        let lower = name.to_ascii_lowercase();
+        let plugin_path =
+            lower.ends_with(".dll") && (lower.contains("/plugins/") || !name.contains('/'));
+        if !plugin_path {
+            continue;
+        }
+        let base = name.rsplit('/').next().unwrap_or(&name).to_string();
+        validate_dll_name(&base)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        if only.is_some_and(|wanted| !base.eq_ignore_ascii_case(wanted)) {
+            continue;
+        }
+        if !candidate_names.insert(base.to_ascii_lowercase()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ZIP contains duplicate or case-colliding plugin DLLs",
+            ));
+        }
+        candidates.push((index, base, file.size()));
+    }
+    if candidates.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ZIP must contain exactly one selected installable plugin DLL",
+        ));
+    }
+    for index in 0..archive.len() {
         let mut file = archive
-            .by_index(i)
+            .by_index(index)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if file.is_dir() {
             continue;
         }
-        let name = file.name().replace('\\', "/");
-        let lower = name.to_lowercase();
-        let is_plugin = lower.ends_with(".dll") && (lower.contains("/plugins/") || !name.contains('/'));
-        if !is_plugin {
-            continue;
+        let expected = file.size();
+        let read = io::copy(
+            &mut file.by_ref().take(MAX_ZIP_ENTRY_BYTES + 1),
+            &mut io::sink(),
+        )?;
+        if read != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ZIP entry expanded size does not match its metadata",
+            ));
         }
-        let base = Path::new(&name)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| name.clone());
-        if let Some(want) = only {
-            if !base.eq_ignore_ascii_case(want) {
-                continue;
-            }
-        }
-        let mut out = fs::File::create(plugins.join(&base))?;
-        io::copy(&mut file, &mut out)?;
-        installed.push(base);
     }
-    Ok(installed)
+    let (index, base, expected_size) = candidates.pop().unwrap();
+    if expected_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "plugin DLL is empty",
+        ));
+    }
+    let file = archive
+        .by_index(index)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    publish_plugin(profiles_root, id, &base, file)?;
+    Ok(vec![base])
 }
 
 /// Enable/disable a plugin by toggling a `.disabled` suffix (BepInEx only loads `.dll`).
@@ -227,15 +717,57 @@ pub fn set_plugin_enabled(
     dll_name: &str,
     enabled: bool,
 ) -> io::Result<()> {
-    let plugins = loader::profile_plugins_dir(profiles_root, id);
+    validate_dll_name(dll_name)?;
+    let plugins = checked_plugins_dir(profiles_root, id, false)?;
     let active = plugins.join(dll_name);
     let disabled = plugins.join(format!("{dll_name}.disabled"));
-    if enabled {
-        if disabled.exists() {
-            fs::rename(disabled, active)?;
+    reject_reparse(&active)?;
+    reject_reparse(&disabled)?;
+    let active_exists = match fs::metadata(&active) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "plugin is not a regular file",
+            ))
         }
-    } else if active.exists() {
-        fs::rename(active, disabled)?;
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let disabled_exists = match fs::metadata(&disabled) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "disabled plugin is not a regular file",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if active_exists && disabled_exists {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "both enabled and disabled plugin files exist",
+        ));
+    }
+    sync_parent(&plugins)?;
+    if enabled {
+        if disabled_exists {
+            atomic_replace(&disabled, &active)?;
+        } else if !active_exists {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "plugin file not found",
+            ));
+        }
+    } else if active_exists {
+        atomic_replace(&active, &disabled)?;
+    } else if !disabled_exists {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "plugin file not found",
+        ));
     }
     Ok(())
 }
@@ -243,6 +775,7 @@ pub fn set_plugin_enabled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loader;
 
     fn sample_profile() -> ProfileRecord {
         ProfileRecord {
@@ -250,6 +783,7 @@ mod tests {
             name: "ToU night".into(),
             crew_color: "#9b7bff".into(),
             game_build: Some("17.0.1".into()),
+            game_instance_id: Some("steam".into()),
             mods: vec![InstalledMod {
                 package_id: "AU-Avengers/TOU-Mira".into(),
                 name: "Town of Us - Mira".into(),
@@ -275,8 +809,8 @@ mod tests {
         store.save(&p).unwrap();
 
         // round-trip
-        assert_eq!(store.load("tou-night").unwrap(), p);
-        let all = store.list();
+        assert_eq!(store.load("tou-night").unwrap().unwrap(), p);
+        let all = store.list().unwrap();
         assert_eq!(all.len(), 1);
 
         // serialized keys must match the TS types
@@ -284,11 +818,83 @@ mod tests {
         assert!(raw.contains("\"packageId\""));
         assert!(raw.contains("\"crewColor\""));
         assert!(raw.contains("\"gameBuild\""));
+        assert!(raw.contains("\"gameInstanceId\": \"steam\""));
         assert!(raw.contains("\"all-client\"")); // ModTag kebab
         assert!(raw.contains("\"github\"")); // ModSource lowercase
 
         store.delete("tou-night").unwrap();
-        assert!(store.load("tou-night").is_none());
+        assert!(store.load("tou-night").unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_first_save_removes_the_profile_directory_it_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(tmp.path());
+        let profile = sample_profile();
+        let profile_dir = tmp.path().join(&profile.id);
+
+        let error = store
+            .save_with_publisher(&profile, |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected publication failure",
+                ))
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!profile_dir.exists());
+    }
+
+    #[test]
+    fn failed_update_preserves_the_existing_profile_and_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(tmp.path());
+        let old_profile = sample_profile();
+        store.save(&old_profile).unwrap();
+        let profile_dir = tmp.path().join(&old_profile.id);
+        let manifest = profile_dir.join("profile.json");
+        let old_manifest = fs::read(&manifest).unwrap();
+        let marker = profile_dir.join("keep");
+        fs::write(&marker, b"existing profile data").unwrap();
+
+        let mut update = old_profile.clone();
+        update.name = "replacement".into();
+        let error = store
+            .save_with_publisher(&update, |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected publication failure",
+                ))
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(profile_dir.is_dir());
+        assert_eq!(fs::read(manifest).unwrap(), old_manifest);
+        assert_eq!(fs::read(marker).unwrap(), b"existing profile data");
+        assert_eq!(store.load(&old_profile.id).unwrap(), Some(old_profile));
+    }
+
+    #[test]
+    fn rejects_non_ascii_dll_names_as_non_portable() {
+        for name in ["Mód.dll", "\u{212a}ey.dll"] {
+            let error = validate_dll_name(name).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("ASCII-only portable basename"));
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(tmp.path());
+        let mut profile = sample_profile();
+        profile.mods[0].file = Some("\u{212a}ey.dll".into());
+        let error = store.save(&profile).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!tmp.path().join(&profile.id).exists());
+
+        let error = install_plugin_bytes(tmp.path(), "safe", "\u{212a}ey.dll", b"x").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!tmp.path().join("safe").exists());
     }
 
     #[test]
@@ -314,7 +920,7 @@ mod tests {
         assert_eq!(manifest.mods[0].id, "AU-Avengers/TOU-Mira");
         assert_eq!(manifest.mods[0].v, "1.6.3");
         // survives a codec round-trip
-        let code = crate::codec::encode(&manifest);
+        let code = crate::codec::encode(&manifest).unwrap();
         assert_eq!(crate::codec::decode(&code).unwrap(), manifest);
     }
 
@@ -339,7 +945,11 @@ mod tests {
         });
         let manifest = to_manifest(&p);
         assert_eq!(manifest.mods.len(), 2);
-        let reactor = manifest.mods.iter().find(|m| m.id == "NuclearPowered/Reactor").unwrap();
+        let reactor = manifest
+            .mods
+            .iter()
+            .find(|m| m.id == "NuclearPowered/Reactor")
+            .unwrap();
         assert_eq!(reactor.v, "2.3.0");
         assert_eq!(reactor.asset.as_deref(), Some("Reactor.dll"));
     }
@@ -352,6 +962,7 @@ mod tests {
             name: "Custom".into(),
             crew_color: "#fff".into(),
             game_build: None,
+            game_instance_id: None,
             mods: vec![InstalledMod {
                 package_id: "SomeUser/CoolMod".into(),
                 name: "CoolMod".into(),
@@ -395,7 +1006,8 @@ mod tests {
             let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
             let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
             use std::io::Write;
-            zw.start_file("BepInEx/plugins/TheOtherRoles.dll", opts).unwrap();
+            zw.start_file("BepInEx/plugins/TheOtherRoles.dll", opts)
+                .unwrap();
             zw.write_all(b"mod").unwrap();
             zw.start_file("README.md", opts).unwrap();
             zw.write_all(b"readme").unwrap();
@@ -474,8 +1086,75 @@ mod tests {
         assert_eq!(dest, plugins.join("Cool.dll"));
         assert!(dest.exists());
 
-        let dest = install_plugin_bytes(tmp.path(), "p1", "../evil.dll", b"x").unwrap();
-        assert_eq!(dest, plugins.join("evil.dll"));
+        assert!(install_plugin_bytes(tmp.path(), "p1", "../evil.dll", b"x").is_err());
         assert!(!plugins.parent().unwrap().join("evil.dll").exists());
+    }
+    #[test]
+    fn corrupt_or_mismatched_profiles_are_reported_and_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(tmp.path());
+        let profile_dir = tmp.path().join("safe");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let manifest = profile_dir.join("profile.json");
+        fs::write(&manifest, b"{broken").unwrap();
+        assert_eq!(
+            store.load("safe").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut replacement = sample_profile();
+        replacement.id = "safe".into();
+        assert!(store.save(&replacement).is_err());
+        assert_eq!(fs::read(&manifest).unwrap(), b"{broken");
+
+        fs::write(&manifest, serde_json::to_vec(&sample_profile()).unwrap()).unwrap();
+        assert_eq!(
+            store.load("safe").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(store.list().is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_ids_and_dll_names_without_touching_sentinel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = tmp.path().join("sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        for id in ["CON", "aux.txt", "bad.", "bad ", "C:\\escape", "/absolute"] {
+            assert!(install_plugin_bytes(tmp.path(), id, "Safe.dll", b"x").is_err());
+        }
+        for name in [
+            "CON.dll",
+            "bad.dll.",
+            "bad.dll ",
+            "dir/mod.dll",
+            "x.dll:stream",
+        ] {
+            assert!(install_plugin_bytes(tmp.path(), "safe", name, b"x").is_err());
+        }
+        assert_eq!(fs::read(sentinel).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn zip_requires_one_dll_and_preserves_existing_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_plugin_bytes(tmp.path(), "safe", "Mod.dll", b"old").unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            use std::io::Write;
+            writer
+                .start_file("BepInEx/plugins/Mod.dll", options)
+                .unwrap();
+            writer.write_all(b"new").unwrap();
+            writer
+                .start_file("BepInEx/plugins/Other.DLL", options)
+                .unwrap();
+            writer.write_all(b"other").unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(install_from_zip(tmp.path(), "safe", &bytes, None).is_err());
+        let plugin = loader::profile_plugins_dir(tmp.path(), "safe").join("Mod.dll");
+        assert_eq!(fs::read(plugin).unwrap(), b"old");
     }
 }

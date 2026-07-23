@@ -12,11 +12,11 @@ export const CREW = {
 
 /** tag -> {fg, bg} used by the Pill component. Locked to the Aurora accent family. */
 export const TAG_STYLE: Record<ModTag, { label: string; fg: string; bg: string }> = {
-  "all-client": { label: "all-client", fg: "#d4c6ff", bg: "rgba(155,123,255,0.26)" },
-  role: { label: "role", fg: "#d4c6ff", bg: "rgba(155,123,255,0.26)" },
-  "host-only": { label: "host-only", fg: "#ffe49a", bg: "rgba(255,210,63,0.20)" },
-  map: { label: "map", fg: "#aef3d8", bg: "rgba(91,227,176,0.24)" },
-  cosmetic: { label: "cosmetic", fg: "#a8c2ff", bg: "rgba(122,162,255,0.22)" },
-  library: { label: "library", fg: "#d7d2ee", bg: "rgba(255,255,255,0.12)" },
-  loader: { label: "loader", fg: "#d7d2ee", bg: "rgba(255,255,255,0.12)" },
+  "all-client": { label: "all-client", fg: "#e2dafe", bg: "#30234f" },
+  role: { label: "role", fg: "#e2dafe", bg: "#30234f" },
+  "host-only": { label: "host-only", fg: "#ffe7a8", bg: "#4a3509" },
+  map: { label: "map", fg: "#bdf7df", bg: "#123f35" },
+  cosmetic: { label: "cosmetic", fg: "#c7d7ff", bg: "#1c315c" },
+  library: { label: "library", fg: "#e3ddf4", bg: "#302b3e" },
+  loader: { label: "loader", fg: "#e3ddf4", bg: "#302b3e" },
 };

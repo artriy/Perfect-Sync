@@ -5,13 +5,13 @@
 <br>
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-9b7bff?style=flat-square)](#platform-support)
-[![Version](https://img.shields.io/badge/version-0.1.0%20beta-7a5bff?style=flat-square)](https://github.com/artriy/Perfect-Sync/releases)
+[![Version](https://img.shields.io/badge/version-0.1.0%20experimental-7a5bff?style=flat-square)](https://github.com/artriy/Perfect-Sync/releases)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-5bc0ff?style=flat-square)](https://tauri.app)
 [![License](https://img.shields.io/badge/license-MIT-5bc0ff?style=flat-square)](LICENSE)
 
-**A desktop mod manager and launcher for modded Among Us.** It installs BepInEx for you,
-keeps your mods in named profiles, and turns a lobby's exact mod set into a short code your
-friends can paste to match you, same mods, same versions, one launch.
+**An experimental desktop mod manager and launcher for modded Among Us.** It installs
+BepInEx, keeps Perfect-Sync-managed mods in named profiles, and lets friends preview
+and apply a shared lobby mod set.
 
 </div>
 
@@ -30,7 +30,7 @@ friends can paste to match you, same mods, same versions, one launch.
     <td align="center" width="33%" valign="top">
       <img src="docs/assets/glyph-bepinex.svg" width="56" alt=""><br>
       <b>One-click BepInEx</b><br>
-      <sub>Installs the mod loader into your game folder, then self-heals and updates it after game patches.</sub>
+      <sub>Installs and verifies the mod loader in a writable game copy, with rollback-safe replacement.</sub>
     </td>
     <td align="center" width="33%" valign="top">
       <img src="docs/assets/glyph-profiles.svg" width="56" alt=""><br>
@@ -40,14 +40,14 @@ friends can paste to match you, same mods, same versions, one launch.
     <td align="center" width="33%" valign="top">
       <img src="docs/assets/glyph-lobby.svg" width="56" alt=""><br>
       <b>Lobby codes</b><br>
-      <sub>Export a profile as a short PERFECT- code. Friends paste it and get the exact same mods.</sub>
+      <sub>Export a profile as a short PERFECT- code. Friends preview its requested mod set before applying it.</sub>
     </td>
   </tr>
   <tr>
     <td align="center" width="33%" valign="top">
       <img src="docs/assets/glyph-trust.svg" width="56" alt=""><br>
       <b>Trust tiers</b><br>
-      <sub>Every mod is labeled Trusted, Community, or Flagged, so you know how vetted it is before it installs.</sub>
+      <sub>Distinguishes curated catalog metadata, community listings, and unknown sources before installation.</sub>
     </td>
     <td align="center" width="33%" valign="top">
       <img src="docs/assets/glyph-catalog.svg" width="56" alt=""><br>
@@ -57,102 +57,138 @@ friends can paste to match you, same mods, same versions, one launch.
     <td align="center" width="33%" valign="top">
       <img src="docs/assets/glyph-launch.svg" width="56" alt=""><br>
       <b>One-click launch</b><br>
-      <sub>Syncs your profile, verifies BepInEx, and starts the modded game in a single click.</sub>
+      <sub>Publishes the selected managed profile, verifies BepInEx, and starts the modded game in a single click.</sub>
     </td>
   </tr>
 </table>
 
-Plus architecture auto-detect (x86 or x64 chosen from the real game executable) and personal
-always-include mods that get merged into every lobby code you apply.
+Plus architecture detection (x86 or x64 from the game executable), a global list of
+named Among Us instances with one assigned independently to each profile, and personal
+mods that can be reconciled with the dependencies in an applied lobby.
 
 > [!TIP]
-> **The selected folder is the source of truth.** Perfect-Sync installs and synchronizes mods
-> directly in the writable folder containing `Among Us.exe`; Wine, Proton, CrossOver, Whisky,
-> and Bottles do not need to be running for that step. Steam and Epic have integrated launch
-> paths, but **Set up mods** is always available when you prefer to launch from the store or
-> compatibility frontend yourself. Microsoft Store / Game Pass copies must first be copied out
-> of the protected `WindowsApps` folder.
+> **The app-data profile is the source of truth for Perfect-Sync-managed plugin DLLs.**
+> At setup or launch, Perfect-Sync publishes that profile into the writable game copy.
+> It deliberately replaces or removes DLLs recorded as Perfect-Sync-owned when the
+> profile changes. DLLs it does not own are preserved, and a managed DLL is not allowed
+> to overwrite an unmanaged file with the same name. Microsoft Store / Game Pass copies
+> in the protected `WindowsApps` tree must first be copied to a normal writable folder.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
 ## How it works
 
-1. **Set up.** On first run the wizard auto-detects your Steam or Epic install, or you browse to
-   the folder, then offers a one-time BepInEx install (about 30 MB).
-2. **Add mods.** Browse the built-in catalog or paste a GitHub repo URL into the active profile.
-3. **Pick a version.** A release picker lists recent releases so you choose the exact asset; the
-   app downloads it and installs the DLL.
-4. **Manage.** Toggle mods on and off, change versions, and create or switch named profiles.
-5. **Share or apply.** Export a profile as a `PERFECT-` code, or paste a friend's code to preview
-   a per-mod diff with trust badges, then apply it.
-6. **Launch.** Click Launch to sync, verify BepInEx, and start the game (Steam and Epic launch
-   natively). Or use Set up mods to sync without launching and start it yourself.
+1. **Set up.** On first run the wizard detects supported Steam or Epic locations, or
+   you select a writable folder containing `Among Us.exe`. Add and name other game
+   copies later in Settings. Native Game Pass files under `WindowsApps` must be copied
+   elsewhere first.
+2. **Add mods.** Browse the catalog or enter an exact HTTPS GitHub repository URL.
+3. **Pick a version.** Choose a release asset. Unknown repositories and assets require
+   an explicit confirmation before native code is installed.
+4. **Manage.** Toggle mods, change versions, create or switch profiles, and assign a
+   game instance to each profile. The profile and its managed DLLs live under the
+   host's application-data directory, not in the selected game folder.
+5. **Share or apply.** Export a `PERFECT-` code, or preview a per-mod diff and trust
+   classification before applying a friend's code. Unknown lobby mods require an
+   explicit confirmation.
+6. **Launch.** Perfect-Sync reconciles dependencies, transactionally publishes the
+   profile's owned DLLs, verifies BepInEx, and starts the Windows game. On Linux and
+   macOS the native Perfect-Sync app launches the Windows game through a configured
+   supported compatibility runtime. **Set up mods** performs publication without launch.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
-## Mod trust levels
+## Mod source classifications
 
 | Tier | Meaning |
 | --- | --- |
-| **Trusted** | Curated, known-good mods from the catalog. |
-| **Community** | Listed in the catalog, but not first-party curated. |
-| **Flagged / Unverified** | Anything off-catalog. Install at your own risk. |
+| **Trusted** | Metadata curated in Perfect-Sync's trusted catalog. This is not a publisher signature or a verification of the downloaded native code. |
+| **Community** | Catalog-listed metadata that is not in the curated trusted tier. |
+| **Flagged / Unverified** | An unknown direct repository, asset, or lobby mod. Explicit confirmation is required; install only if you trust the source. |
 
 ## Install and run
 
-Download the artifact for your host from [Releases](https://github.com/artriy/Perfect-Sync/releases):
+Download the bundle for your host from
+[Releases](https://github.com/artriy/Perfect-Sync/releases). The release page is also
+where the in-app update notification sends you: v0.1.0 does not download or install
+application updates automatically.
 
-| Host | Artifact | First-run notes |
-| --- | --- | --- |
-| Windows 10/11 x64 | NSIS `setup.exe` or portable `app.exe` | Unsigned; use **More info → Run anyway** at the SmartScreen prompt. |
-| Linux x86_64 / Steam Deck | `.AppImage` | `chmod +x Perfect-Sync*.AppImage`; launch Among Us once in Steam first so Proton creates its prefix. |
-| macOS Apple Silicon | `aarch64.dmg` | Ad-hoc signed, not notarized; see the Gatekeeper command below if macOS blocks it. |
-| macOS Intel | `x64.dmg` | Ad-hoc signed, not notarized; see the Gatekeeper command below if macOS blocks it. |
+| Perfect-Sync host | Package and first-run restriction |
+| --- | --- |
+| Windows 10/11 x64 | Windows installer; unsigned, so SmartScreen can require **More info → Run anyway**. |
+| Linux x86_64 | Native Linux bundle; the Windows game still runs through a supported Proton, Wine, or Bottles setup. |
+| macOS Apple Silicon | Native `aarch64` bundle; ad-hoc signed but not Apple-notarized, so Gatekeeper can block the download. |
+| macOS Intel | Native `x64` bundle; ad-hoc signed but not Apple-notarized, so Gatekeeper can block the download. |
 
-On macOS, drag the app to Applications. Free ad-hoc signing preserves the bundle signature but
-cannot establish Apple trust or notarize it. If Gatekeeper quarantines the downloaded app:
+On macOS, drag the app to Applications. Ad-hoc signing checks bundle consistency but
+does not establish a trusted developer identity. If you trust the download and
+Gatekeeper quarantines it, you may remove that quarantine:
 
 ```sh
 xattr -dr com.apple.quarantine "/Applications/Perfect-Sync.app"
 ```
 
-Use the native Linux/macOS Perfect-Sync build. Running the Windows `app.exe` itself under
-Wine/Proton is not a supported deployment path.
+Running the Windows `app.exe` itself under Wine/Proton is not supported; use the native
+Perfect-Sync build for the host.
 
 ## Build from source
 
-See [BUILD.md](BUILD.md). In short:
+See [BUILD.md](BUILD.md). The Windows NSIS quick path is:
 
 ```sh
-pnpm install
+pnpm install --frozen-lockfile
 pnpm run build:exe
 ```
+
+Linux and macOS use the target-specific `pnpm tauri build --target ...` commands in
+the build guide.
 
 Stack: Tauri 2, React 19, TypeScript, Vite, Tailwind v4, with a Rust core crate.
 
 ## Platform support
 
-| Host and game runtime | Status |
-| --- | --- |
-| Windows 10/11 x64; native Steam, Epic, itch/manual | **Supported** |
-| Linux x86_64 / Steam Deck; native or Flatpak Steam + Proton | **Experimental** |
-| Linux x86_64; Wine or Bottles | **Experimental** |
-| macOS Intel / Apple Silicon; CrossOver, Whisky, or Wine | **Experimental** |
-| Windows Perfect-Sync executable under Wine/Proton | **Unsupported** — use the native host build |
-| Android, iOS, BSD, ChromeOS, Linux ARM64, Windows ARM64 | **Unsupported** |
+| Perfect-Sync host | Windows Among Us runtime | Status |
+| --- | --- | --- |
+| Windows 10/11 x64 | Native Steam, Epic, or writable manual copy | **Primary supported target** |
+| Windows 10/11 x64 | Microsoft Store / Game Pass | Protected native folder is not writable; copy the game to a normal folder and select that copy |
+| Linux x86_64 / Steam Deck | Steam/Flatpak Steam + Proton, Wine, or Bottles | **Experimental**; native app build and CI coverage exist, but each real host/runtime/store combination still needs validation |
+| macOS Intel or Apple Silicon | CrossOver, Whisky, or Wine | **Experimental**; native app build and CI coverage exist, but each real host/runtime/store combination still needs validation |
+| Windows Perfect-Sync executable under Wine/Proton | Any | **Unsupported** — use the native host build |
+| Android, iOS, BSD, ChromeOS, Linux ARM64, Windows ARM64 | Any | **Unsupported** |
 
-Release CI builds Windows, Ubuntu, macOS Intel, and macOS Apple Silicon artifacts and runs the
-frontend checks plus the Rust workspace tests in every matrix job. Cross-platform tests exercise
-real filesystem synchronization, runtime classification, prefix registry setup, and launch
-command construction. Linux/macOS game launching remains experimental until each compatibility
-frontend and store combination has broader real-machine coverage.
+Release CI builds Windows x64, Linux x86_64, macOS Intel, and macOS Apple Silicon
+packages and runs the locked workspace tests on every build host before bundling.
+Its filesystem/runtime tests and bundle checks validate build portability, host-gated
+behavior, command construction, and package structure only. They do **not** establish
+that a package launches and modifies the game correctly on real hardware, under a
+particular store client, or through every compatibility frontend.
 
-## Security note
+## Security and ownership
 
-Applying a lobby code installs the mod DLLs that the code lists, and mods run as native code
-inside the game. Downloads come over HTTPS from their sources but are not signature-verified,
-so only add repos and apply codes from people you trust. Trusted and Community mods are vetted;
-Flagged mods are not.
+Mods are native code loaded inside the game. Perfect-Sync requires HTTPS. Within one
+install operation it checks the downloaded asset against the size and any SHA-256
+digest supplied by the release metadata fetched for that operation, and ZIP extraction
+enforces strict entry, path, per-file, and expanded-size limits. These controls detect
+corruption, truncated/replaced assets, path traversal, and some metadata/asset
+time-of-check/time-of-use races. They are **integrity checks, not authenticity**:
+metadata and downloads are not publisher-signed, and a compromised source can replace
+both. Only the **Trusted** catalog metadata tier is curated. Unknown direct
+repositories/assets and lobby mods require explicit confirmation; trust the source and
+the person sharing a lobby code.
+
+The Epic launch helper is a special case: Perfect-Sync pins the HTTPS archive's size and
+SHA-256, requires an exact one-file ZIP shape, and verifies the extracted executable's
+size and SHA-256 before publishing or reusing it.
+
+An optional GitHub token is stored in the host OS credential service (Windows
+Credential Manager, macOS Keychain, or Linux Secret Service), sent only to allowlisted
+GitHub HTTPS hosts, and never returned to the frontend. A legacy token found in
+`settings.json` is migrated to the OS keyring and scrubbed from the settings file.
+
+During synchronization, an ownership marker limits replacement/removal to
+Perfect-Sync-managed plugin DLLs. Unmanaged files in `BepInEx/plugins` are preserved;
+name collisions fail instead of overwriting them. Replacement of previously owned DLLs
+is deliberate when changing profiles or versions.
 
 ## Credits
 

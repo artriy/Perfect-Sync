@@ -138,7 +138,7 @@
       "summary": "Community role mod adding extra Town of Us roles.",
       "repo": "Mehzxzz/TownOfExtra",
       "tags": ["role", "all-client"],
-      "dependencies": [],
+      "dependencies": ["AU-Avengers/TOU-Mira"],
       "assetRules": {},
       "trust": "community"
     },
@@ -149,7 +149,7 @@
       "repo": "artriy/Perfect-Comms",
       "tags": ["all-client"],
       "dependencies": [],
-      "assetRules": {},
+      "assetRules": { "perArch": {}, "dllName": "PerfectComms.dll" },
       "trust": "community"
     },
     {

@@ -6,8 +6,8 @@
   --font-mono: "JetBrains Mono Variable", ui-monospace, "Cascadia Code", monospace;
 
   --color-ink: #f1ecff;
-  --color-ink-dim: #c8c0e8;
-  --color-ink-faint: #8d86b4;
+  --color-ink-dim: #eae4f8;
+  --color-ink-faint: #ded7f3;
 
   --color-accent: #9b7bff;
   --color-accent-2: #5bc0ff;
@@ -90,8 +90,11 @@ body {
 
 /* tidy scrollbars inside scroll regions */
 .scroll-region {
+  min-width: 0;
+  min-height: 0;
+  overscroll-behavior: contain;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  scrollbar-color: rgba(255, 255, 255, 0.3) transparent;
 }
 .scroll-region::-webkit-scrollbar {
   width: 10px;
@@ -101,6 +104,55 @@ body {
   border-radius: 99px;
   border: 3px solid transparent;
   background-clip: padding-box;
+}
+
+/* Let the document recover ownership when the effective viewport narrows from
+   a small window or zoom, while retaining the fixed desktop shell above. */
+@media (max-width: 960px), (max-height: 640px) {
+  html,
+  body,
+  #root {
+    height: auto;
+    min-height: 100%;
+  }
+
+  body {
+    overflow: auto;
+    background-attachment: scroll;
+  }
+
+  #root {
+    min-width: 0;
+    overflow-x: auto;
+  }
+
+  #root > div {
+    height: auto;
+    min-height: 100dvh;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .glass,
+  .glass-2 {
+    background: rgba(15, 10, 34, 0.96);
+    border-color: rgba(255, 255, 255, 0.52);
+  }
+
+  .glass-strong {
+    background: rgba(17, 11, 38, 0.98);
+    border-color: rgba(255, 255, 255, 0.68);
+  }
+
+  .hairline {
+    border-color: rgba(255, 255, 255, 0.42);
+  }
+
+  .ring-focus:focus-visible {
+    outline: 2px solid var(--color-accent-2);
+    outline-offset: 2px;
+    box-shadow: none;
+  }
 }
 
 /* ----- accessibility fallbacks ----- */
@@ -125,5 +177,65 @@ body {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
+  }
+}
+
+@media (forced-colors: active) {
+  body {
+    color: CanvasText;
+    background: Canvas;
+  }
+
+  .glass,
+  .glass-2,
+  .glass-strong {
+    color: CanvasText;
+    background: Canvas;
+    border-color: CanvasText;
+    box-shadow: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  .accent-grad {
+    color: HighlightText;
+    background: Highlight;
+  }
+
+  .hairline {
+    border-color: CanvasText;
+  }
+
+  .ring-focus:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+    box-shadow: none;
+  }
+
+  .scroll-region {
+    scrollbar-color: auto;
+  }
+
+  .tag-pill {
+    color: CanvasText !important;
+    background: Canvas !important;
+    border: 1px solid CanvasText;
+  }
+
+  .native-toggle {
+    color: ButtonText;
+    background: ButtonFace !important;
+    border: 1px solid ButtonText;
+  }
+
+  .native-toggle[aria-checked="true"] {
+    color: HighlightText;
+    background: Highlight !important;
+    border-color: Highlight;
+  }
+
+  .native-toggle-knob {
+    background: currentColor;
+    box-shadow: none;
   }
 }

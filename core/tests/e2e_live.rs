@@ -34,14 +34,26 @@ fn live_install_latest_bepinex_from_build_server() {
 
     loader::install_pack_from_zip(&bytes, &game, &cache, &id).unwrap();
 
-    assert!(game.join("winhttp.dll").exists(), "winhttp installed to game dir");
-    assert!(game.join("dotnet").join("coreclr.dll").exists(), "dotnet runtime installed");
     assert!(
-        game.join("BepInEx").join("core").join("BepInEx.Unity.IL2CPP.dll").exists(),
+        game.join("winhttp.dll").exists(),
+        "winhttp installed to game dir"
+    );
+    assert!(
+        game.join("dotnet").join("coreclr.dll").exists(),
+        "dotnet runtime installed"
+    );
+    assert!(
+        game.join("BepInEx")
+            .join("core")
+            .join("BepInEx.Unity.IL2CPP.dll")
+            .exists(),
         "preloader installed to game BepInEx/core"
     );
     assert!(loader::has_loader(&game));
-    assert_eq!(loader::installed_version(&game).as_deref(), Some(id.as_str()));
+    assert_eq!(
+        loader::installed_version(&game).as_deref(),
+        Some(id.as_str())
+    );
 }
 
 #[test]
@@ -88,6 +100,7 @@ fn live_end_to_end_reactor_install() {
             name: "Live test".into(),
             crew_color: "#5be3b0".into(),
             game_build: None,
+            game_instance_id: None,
             mods: vec![profile::InstalledMod {
                 package_id: "NuclearPowered/Reactor".into(),
                 name: "Reactor".into(),
@@ -104,10 +117,13 @@ fn live_end_to_end_reactor_install() {
             }],
         })
         .unwrap();
-    assert!(store.load("live").is_some());
+    assert!(store.load("live").unwrap().is_some());
 
     let game = Path::new("C:/Games/Among Us");
-    let spec = perfect_sync_core::compat::build_launch_spec(game, &perfect_sync_core::compat::resolve(game));
+    let spec = perfect_sync_core::compat::build_launch_spec(
+        game,
+        &perfect_sync_core::compat::resolve(game),
+    );
     assert!(spec.program.ends_with("Among Us.exe"));
     println!("launch: {:?}", spec.program);
 }

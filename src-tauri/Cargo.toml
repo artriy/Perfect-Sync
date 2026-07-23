@@ -6,7 +6,7 @@ authors = ["artriy"]
 license = "MIT"
 repository = "https://github.com/artriy/Perfect-Sync"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -31,6 +31,20 @@ tauri-plugin-dialog = "2"
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 perfect-sync-core = { path = "../core" }
+atomicwrites = "0.4.4"
+secrecy = "0.8"
+sha2 = "0.10"
+url = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "2.3.3", default-features = false, features = ["platform-windows"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "2.3.3", default-features = false, features = ["platform-macos"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "2.3.3", default-features = false, features = ["linux-secret-service"] }
 
 [dev-dependencies]
 tempfile = "3"

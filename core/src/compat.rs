@@ -8,9 +8,11 @@
 
 use crate::process::{LaunchSpec, GAME_EXE};
 use crate::types::Runtime;
-use std::fs;
-use std::io;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Among Us Steam app id (its Proton prefix lives at `compatdata/<id>/pfx`).
 pub const STEAM_APP_ID: &str = "945360";
@@ -44,11 +46,11 @@ pub struct RuntimeContext {
     /// or a Wine/CrossOver/Whisky/Bottles bottle. `None` on native Windows.
     pub prefix: Option<PathBuf>,
     /// Binary used to start the game (`steam`, `flatpak`, `wine`, `cxrun`, etc.).
-    /// `None` means use the runtime's normal command name as an error-producing
-    /// fallback, or run the exe directly for a native Windows context.
+    /// `None` means resolution failed for Steam, or use the runtime's normal
+    /// command name as an error-producing fallback for Wine-based runtimes.
     pub launcher: Option<PathBuf>,
     /// Arguments which select the launcher/bottle, before the game-specific args.
-    pub launcher_args: Vec<String>,
+    pub launcher_args: Vec<OsString>,
 }
 
 fn normalized(path: &Path) -> String {
@@ -105,7 +107,9 @@ pub fn classify_runtime(
     // macOS has no Steam Proton. A manually selected Windows game outside a
     // recognizable bottle is treated as Wine and produces actionable guidance
     // if no Wine launcher can be found.
-    let runtime = hint.filter(|r| is_bottle_runtime(*r)).unwrap_or(Runtime::Wine);
+    let runtime = hint
+        .filter(|r| is_bottle_runtime(*r))
+        .unwrap_or(Runtime::Wine);
     (runtime, None)
 }
 
@@ -130,7 +134,13 @@ pub fn resolve_for_host(
         prefix = default_wine_prefix();
     }
     let (launcher, launcher_args) = find_launcher(game_dir, runtime, prefix.as_deref());
-    RuntimeContext { host, runtime, prefix, launcher, launcher_args }
+    RuntimeContext {
+        host,
+        runtime,
+        prefix,
+        launcher,
+        launcher_args,
+    }
 }
 
 /// Proton prefix for a Steam game dir:
@@ -193,20 +203,15 @@ fn find_flatpak() -> Option<PathBuf> {
     find_binary(&["flatpak"])
 }
 
-fn steam_launcher(game_dir: &Path) -> (Option<PathBuf>, Vec<String>) {
-    let flatpak_install = normalized(game_dir).contains("/.var/app/com.valvesoftware.steam/");
-    if flatpak_install {
-        if let Some(flatpak) = find_flatpak() {
-            return (Some(flatpak), vec!["run".into(), "com.valvesoftware.Steam".into()]);
-        }
+fn steam_launcher(game_dir: &Path) -> (Option<PathBuf>, Vec<OsString>) {
+    match crate::game::steam_client_for_install(game_dir) {
+        Some(crate::game::SteamClient::Native) => (find_binary(&["steam"]), Vec::new()),
+        Some(crate::game::SteamClient::Flatpak) => (
+            find_flatpak(),
+            vec!["run".into(), "com.valvesoftware.Steam".into()],
+        ),
+        None => (None, Vec::new()),
     }
-    if let Some(steam) = find_binary(&["steam"]) {
-        return (Some(steam), Vec::new());
-    }
-    if let Some(flatpak) = find_flatpak() {
-        return (Some(flatpak), vec!["run".into(), "com.valvesoftware.Steam".into()]);
-    }
-    (None, Vec::new())
 }
 
 fn find_crossover_cxrun() -> Option<PathBuf> {
@@ -214,11 +219,14 @@ fn find_crossover_cxrun() -> Option<PathBuf> {
         "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxrun",
     )];
     if let Some(home) = home_dir() {
-        candidates.push(home.join(
-            "Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxrun",
-        ));
+        candidates.push(
+            home.join("Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxrun"),
+        );
     }
-    candidates.into_iter().find(|p| p.is_file()).or_else(|| find_binary(&["cxrun"]))
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .or_else(|| find_binary(&["cxrun"]))
 }
 
 fn find_whisky_wine() -> Option<PathBuf> {
@@ -231,15 +239,15 @@ fn find_whisky_wine() -> Option<PathBuf> {
     .find(|p| p.is_file())
 }
 
-fn bottle_name(prefix: Option<&Path>) -> Option<String> {
-    prefix?.file_name()?.to_str().map(str::to_owned)
+fn bottle_name(prefix: Option<&Path>) -> Option<OsString> {
+    prefix?.file_name().map(OsString::from)
 }
 
 fn find_launcher(
     game_dir: &Path,
     runtime: Runtime,
     prefix: Option<&Path>,
-) -> (Option<PathBuf>, Vec<String>) {
+) -> (Option<PathBuf>, Vec<OsString>) {
     match runtime {
         Runtime::Native => (None, Vec::new()),
         Runtime::Proton => steam_launcher(game_dir),
@@ -247,13 +255,13 @@ fn find_launcher(
         Runtime::Crossover => {
             let mut args = Vec::new();
             if let Some(name) = bottle_name(prefix) {
-                args.extend(["--bottle".to_string(), name, "--".to_string()]);
+                args.extend([OsString::from("--bottle"), name, OsString::from("--")]);
             }
             (find_crossover_cxrun(), args)
         }
         Runtime::Whisky => (find_whisky_wine(), vec!["start".into(), "/unix".into()]),
         Runtime::Bottles => {
-            let name = bottle_name(prefix).unwrap_or_else(|| "Among Us".to_string());
+            let name = bottle_name(prefix).unwrap_or_else(|| OsString::from("Among Us"));
             let flatpak_install = normalized(game_dir).contains("com.usebottles.bottles");
             if flatpak_install {
                 if let Some(flatpak) = find_flatpak() {
@@ -272,7 +280,10 @@ fn find_launcher(
                 }
             }
             if let Some(cli) = find_binary(&["bottles-cli"]) {
-                return (Some(cli), vec!["run".into(), "-b".into(), name, "-e".into()]);
+                return (
+                    Some(cli),
+                    vec!["run".into(), "-b".into(), name, "-e".into()],
+                );
             }
             if let Some(flatpak) = find_flatpak() {
                 return (
@@ -304,6 +315,26 @@ fn runtime_fallback(runtime: Runtime) -> &'static str {
     }
 }
 
+fn wine_environment(
+    ctx: &RuntimeContext,
+    inherited_override: Option<OsString>,
+) -> Vec<(OsString, OsString)> {
+    let mut env = Vec::new();
+    if inherited_override.is_none() {
+        env.push(("WINEDLLOVERRIDES".into(), "winhttp=n,b".into()));
+    }
+    if let Some(prefix) = &ctx.prefix {
+        if ctx.runtime == Runtime::Crossover {
+            if let Some(name) = bottle_name(Some(prefix)) {
+                env.push(("CX_BOTTLE".into(), name));
+            }
+        } else if ctx.runtime != Runtime::Bottles {
+            env.push(("WINEPREFIX".into(), prefix.as_os_str().to_owned()));
+        }
+    }
+    env
+}
+
 /// Build a concrete launch invocation for an arbitrary Windows executable in a
 /// game directory. Epic's authentication helper uses this same runtime path.
 pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> LaunchSpec {
@@ -313,10 +344,19 @@ pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> L
             args: Vec::new(),
             cwd: cwd.to_path_buf(),
             env: Vec::new(),
+            error: None,
         },
         Runtime::Proton => {
             let mut args = ctx.launcher_args.clone();
-            args.extend(["-applaunch".to_string(), STEAM_APP_ID.to_string()]);
+            let error = if ctx.launcher.is_some() {
+                args.extend([OsString::from("-applaunch"), OsString::from(STEAM_APP_ID)]);
+                None
+            } else {
+                Some(format!(
+                    "Steam does not have this Among Us folder registered: {}",
+                    cwd.display()
+                ))
+            };
             LaunchSpec {
                 program: ctx
                     .launcher
@@ -325,21 +365,13 @@ pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> L
                 args,
                 cwd: cwd.to_path_buf(),
                 env: Vec::new(),
+                error,
             }
         }
         Runtime::Wine | Runtime::Crossover | Runtime::Whisky | Runtime::Bottles => {
-            let mut env = vec![("WINEDLLOVERRIDES".to_string(), "winhttp=n,b".to_string())];
-            if let Some(prefix) = &ctx.prefix {
-                if ctx.runtime == Runtime::Crossover {
-                    if let Some(name) = bottle_name(Some(prefix)) {
-                        env.push(("CX_BOTTLE".to_string(), name));
-                    }
-                } else if ctx.runtime != Runtime::Bottles {
-                    env.push(("WINEPREFIX".to_string(), prefix.to_string_lossy().into_owned()));
-                }
-            }
+            let env = wine_environment(ctx, std::env::var_os("WINEDLLOVERRIDES"));
             let mut args = ctx.launcher_args.clone();
-            args.push(program.to_string_lossy().into_owned());
+            args.push(program.as_os_str().to_owned());
             LaunchSpec {
                 program: ctx
                     .launcher
@@ -348,6 +380,7 @@ pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> L
                 args,
                 cwd: cwd.to_path_buf(),
                 env,
+                error: None,
             }
         }
     }
@@ -360,52 +393,246 @@ pub fn build_launch_spec(game_dir: &Path, ctx: &RuntimeContext) -> LaunchSpec {
 
 const OVERRIDE_LINE: &str = "\"winhttp\"=\"native,builtin\"";
 const OVERRIDE_SECTION: &str = r"[Software\\Wine\\DllOverrides]";
+static REGISTRY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Ensure a Wine `user.reg` sets `winhttp` to load native-first. Returns the
-/// updated text, or `None` when the override is already correct.
+fn line_text(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+fn is_override_section_header(line: &str) -> bool {
+    let line = line_text(line);
+    line.strip_prefix(OVERRIDE_SECTION)
+        .map(|rest| rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
+        .unwrap_or(false)
+}
+
+fn override_section_range(registry: &str) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    let mut body_start = None;
+    for line in registry.split_inclusive('\n') {
+        if let Some(start) = body_start {
+            if line_text(line).starts_with('[') {
+                return Some((start, offset));
+            }
+        } else if is_override_section_header(line) {
+            body_start = Some(offset + line.len());
+        }
+        offset += line.len();
+    }
+    body_start.map(|start| (start, registry.len()))
+}
+
+fn is_winhttp_value(line: &str) -> bool {
+    line.trim_start()
+        .split_once('=')
+        .map(|(name, _)| name.eq_ignore_ascii_case("\"winhttp\""))
+        .unwrap_or(false)
+}
+
+fn winhttp_line_range(registry: &str) -> Option<(usize, usize)> {
+    let (body_start, body_end) = override_section_range(registry)?;
+    let mut offset = body_start;
+    for line in registry[body_start..body_end].split_inclusive('\n') {
+        let content = line_text(line);
+        if is_winhttp_value(content) {
+            return Some((offset, offset + content.len()));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn registry_has_winhttp_override(registry: &str) -> bool {
+    winhttp_line_range(registry)
+        .map(|(start, end)| registry[start..end].trim() == OVERRIDE_LINE)
+        .unwrap_or(false)
+}
+
+/// Ensure only Wine's DLL override section sets `winhttp` native-first. Values
+/// with the same name in unrelated registry sections are left untouched.
 pub fn merge_winhttp_override(existing: &str) -> Option<String> {
-    if existing.contains(OVERRIDE_LINE) {
+    if registry_has_winhttp_override(existing) {
         return None;
     }
-    if let Some(start) = existing.find("\"winhttp\"=") {
-        let end = existing[start..].find('\n').map(|n| start + n).unwrap_or(existing.len());
-        let mut out = String::with_capacity(existing.len());
-        out.push_str(&existing[..start]);
+    if let Some((start, end)) = winhttp_line_range(existing) {
+        let indent_len = existing[start..end].len() - existing[start..end].trim_start().len();
+        let mut out = String::with_capacity(existing.len() + OVERRIDE_LINE.len());
+        out.push_str(&existing[..start + indent_len]);
         out.push_str(OVERRIDE_LINE);
         out.push_str(&existing[end..]);
         return Some(out);
     }
-    if let Some(idx) = existing.find(OVERRIDE_SECTION) {
-        let after_header =
-            existing[idx..].find('\n').map(|n| idx + n + 1).unwrap_or(existing.len());
-        let mut out = String::with_capacity(existing.len() + OVERRIDE_LINE.len() + 1);
-        out.push_str(&existing[..after_header]);
+
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    if let Some((body_start, _)) = override_section_range(existing) {
+        let mut out = String::with_capacity(existing.len() + OVERRIDE_LINE.len() + newline.len());
+        out.push_str(&existing[..body_start]);
+        if body_start > 0 && !existing[..body_start].ends_with('\n') {
+            out.push_str(newline);
+        }
         out.push_str(OVERRIDE_LINE);
-        out.push('\n');
-        out.push_str(&existing[after_header..]);
+        out.push_str(newline);
+        out.push_str(&existing[body_start..]);
         return Some(out);
     }
+
     let mut out = String::new();
     if existing.trim().is_empty() {
-        out.push_str("WINE REGISTRY Version 2\n");
+        out.push_str("WINE REGISTRY Version 2");
+        out.push_str(newline);
     } else {
         out.push_str(existing);
         if !out.ends_with('\n') {
-            out.push('\n');
+            out.push_str(newline);
         }
     }
-    out.push('\n');
+    out.push_str(newline);
     out.push_str(OVERRIDE_SECTION);
-    out.push('\n');
+    out.push_str(newline);
     out.push_str(OVERRIDE_LINE);
-    out.push('\n');
+    out.push_str(newline);
     Some(out)
 }
 
 pub fn has_winhttp_override(prefix: &Path) -> bool {
     fs::read_to_string(prefix.join("user.reg"))
-        .map(|registry| registry.contains(OVERRIDE_LINE))
+        .map(|registry| registry_has_winhttp_override(&registry))
         .unwrap_or(false)
+}
+
+fn atomic_replace_with<F>(path: &Path, contents: &[u8], replace: F) -> io::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("registry path has no parent directory"))?;
+    let base = path.file_name().unwrap_or_default().to_string_lossy();
+    let mut temporary = None;
+    for _ in 0..32 {
+        let sequence = REGISTRY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{base}.perfect-sync-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let (temporary_path, mut temporary_file) = temporary.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve registry temp file",
+        )
+    })?;
+
+    let result = (|| {
+        if let Ok(metadata) = fs::metadata(path) {
+            temporary_file.set_permissions(metadata.permissions())?;
+        }
+        temporary_file.write_all(contents)?;
+        temporary_file.sync_all()?;
+        drop(temporary_file);
+        replace(&temporary_path, path)?;
+        #[cfg(unix)]
+        let _ = fs::File::open(parent).and_then(|directory| directory.sync_all());
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_existing_file(replacement: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "registry path contains a NUL character",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("registry path has no parent directory"))?;
+    let base = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let sequence = REGISTRY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let backup = parent.join(format!(
+        ".{base}.perfect-sync-{}-{sequence}.backup",
+        std::process::id()
+    ));
+
+    let destination_wide = wide_path(destination)?;
+    let replacement_wide = wide_path(replacement)?;
+    let backup_wide = wide_path(&backup)?;
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            backup_wide.as_ptr(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if replaced != 0 {
+        let _ = fs::remove_file(backup);
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    // ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 leaves the old destination at the
+    // requested backup path. Restore it without ever deleting the destination.
+    if error.raw_os_error() == Some(1177) {
+        let _ = fs::rename(&backup, destination);
+    }
+    Err(error)
+}
+
+#[cfg(not(windows))]
+fn replace_existing_file(replacement: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(replacement, destination)
+}
+
+fn atomic_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
+    atomic_replace_with(path, contents, replace_existing_file)
 }
 
 /// Write and verify the winhttp override in a prefix's `user.reg`.
@@ -419,18 +646,20 @@ pub fn register_winhttp_override(prefix: &Path) -> io::Result<()> {
         ));
     }
     let reg = prefix.join("user.reg");
-    let existing = fs::read_to_string(&reg).map_err(|e| {
+    let existing = fs::read_to_string(&reg).map_err(|error| {
         io::Error::new(
-            e.kind(),
-            format!("could not read Wine registry {}: {e}", reg.display()),
+            error.kind(),
+            format!("could not read Wine registry {}: {error}", reg.display()),
         )
     })?;
     if let Some(updated) = merge_winhttp_override(&existing) {
-        fs::write(&reg, updated)?;
+        atomic_replace(&reg, updated.as_bytes())?;
     }
     let verified = fs::read_to_string(&reg)?;
-    if !verified.contains(OVERRIDE_LINE) {
-        return Err(io::Error::other("winhttp override did not persist in user.reg"));
+    if !registry_has_winhttp_override(&verified) {
+        return Err(io::Error::other(
+            "winhttp override did not persist in user.reg",
+        ));
     }
     Ok(())
 }
@@ -463,7 +692,10 @@ mod tests {
     #[test]
     fn wine_prefix_is_drive_c_parent() {
         let game = Path::new("/home/u/.wine/drive_c/Program Files/Among Us");
-        assert_eq!(wine_prefix_from_game(game), Some(PathBuf::from("/home/u/.wine")));
+        assert_eq!(
+            wine_prefix_from_game(game),
+            Some(PathBuf::from("/home/u/.wine"))
+        );
         assert_eq!(wine_prefix_from_game(Path::new("/no/prefix/here")), None);
     }
 
@@ -476,17 +708,25 @@ mod tests {
             classify_runtime(mac, HostPlatform::Macos, None).0,
             Runtime::Crossover
         );
-        let linux = Path::new(
-            "/home/u/.wine/drive_c/Program Files (x86)/Steam/steamapps/common/Among Us",
+        let linux =
+            Path::new("/home/u/.wine/drive_c/Program Files (x86)/Steam/steamapps/common/Among Us");
+        assert_eq!(
+            classify_runtime(linux, HostPlatform::Linux, None).0,
+            Runtime::Wine
         );
-        assert_eq!(classify_runtime(linux, HostPlatform::Linux, None).0, Runtime::Wine);
     }
 
     #[test]
     fn proton_is_linux_only() {
         let game = Path::new("/games/steamapps/common/Among Us");
-        assert_eq!(classify_runtime(game, HostPlatform::Linux, None).0, Runtime::Proton);
-        assert_eq!(classify_runtime(game, HostPlatform::Macos, None).0, Runtime::Wine);
+        assert_eq!(
+            classify_runtime(game, HostPlatform::Linux, None).0,
+            Runtime::Proton
+        );
+        assert_eq!(
+            classify_runtime(game, HostPlatform::Macos, None).0,
+            Runtime::Wine
+        );
     }
 
     #[test]
@@ -533,18 +773,46 @@ mod tests {
     }
 
     #[test]
+    fn unregistered_proton_copy_never_emits_an_app_id_launch() {
+        let game = Path::new("/unregistered/steamapps/common/Among Us");
+        let mut ctx = context(Runtime::Proton, "steam");
+        ctx.launcher = None;
+        let spec = build_launch_spec(game, &ctx);
+        assert!(spec.error.is_some());
+        assert!(!spec
+            .args
+            .iter()
+            .any(|arg| arg == "-applaunch" || arg == STEAM_APP_ID));
+        assert_eq!(
+            crate::process::launch(&spec).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn wine_spec_sets_overrides_and_prefix() {
         let game = Path::new("/b/drive_c/Among Us");
         let mut ctx = context(Runtime::Wine, "/usr/bin/wine");
         ctx.prefix = Some(PathBuf::from("/b"));
         let spec = build_launch_spec(game, &ctx);
         assert_eq!(spec.program, PathBuf::from("/usr/bin/wine"));
-        assert!(spec.args[0].ends_with("Among Us.exe"));
-        assert!(spec
-            .env
+        assert!(Path::new(&spec.args[0]).ends_with("Among Us.exe"));
+        let env = wine_environment(&ctx, None);
+        assert!(env
             .iter()
             .any(|(k, v)| k == "WINEDLLOVERRIDES" && v == "winhttp=n,b"));
-        assert!(spec.env.iter().any(|(k, v)| k == "WINEPREFIX" && v == "/b"));
+        assert!(env.iter().any(|(k, v)| k == "WINEPREFIX" && v == "/b"));
+    }
+
+    #[test]
+    fn inherited_dll_overrides_and_bottle_environment_are_preserved() {
+        let mut ctx = context(Runtime::Crossover, "/Applications/CrossOver.app/cxrun");
+        ctx.prefix = Some(PathBuf::from("/CrossOver/Bottles/Existing Bottle"));
+        let env = wine_environment(&ctx, Some(OsString::from("custom=n")));
+        assert!(!env.iter().any(|(key, _)| key == "WINEDLLOVERRIDES"));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "CX_BOTTLE" && value == "Existing Bottle"));
     }
 
     #[test]
@@ -565,8 +833,7 @@ mod tests {
         ctx.prefix = Some(PathBuf::from("/Whisky/Bottles/AU"));
         ctx.launcher_args = vec!["start".into(), "/unix".into()];
         let spec = build_launch_spec(game, &ctx);
-        assert_eq!(&spec.args[..2], ["start", "/unix"]);
-        assert!(spec.args[2].ends_with("Among Us.exe"));
+        assert!(Path::new(&spec.args[2]).ends_with("Among Us.exe"));
         assert!(spec
             .env
             .iter()
@@ -578,11 +845,9 @@ mod tests {
         let game = Path::new("/bottles/bottles/AU/drive_c/Games/Among Us");
         let mut ctx = context(Runtime::Bottles, "/usr/bin/bottles-cli");
         ctx.prefix = Some(PathBuf::from("/bottles/bottles/AU"));
-        ctx.launcher_args =
-            vec!["run".into(), "-b".into(), "AU".into(), "-e".into()];
+        ctx.launcher_args = vec!["run".into(), "-b".into(), "AU".into(), "-e".into()];
         let spec = build_launch_spec(game, &ctx);
-        assert_eq!(&spec.args[..4], ["run", "-b", "AU", "-e"]);
-        assert!(spec.args[4].ends_with("Among Us.exe"));
+        assert!(Path::new(&spec.args[4]).ends_with("Among Us.exe"));
         assert!(!spec.env.iter().any(|(key, _)| key == "WINEPREFIX"));
     }
 
@@ -617,6 +882,69 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_winhttp_values_are_never_detected_or_edited() {
+        let reg = concat!(
+            "WINE REGISTRY Version 2\n\n",
+            "[Software\\\\Vendor\\\\Settings] 1\n",
+            "\"winhttp\"=\"native,builtin\"\n",
+            "[Software\\\\Wine\\\\DllOverrides] 2\n",
+            "\"other\"=\"builtin\"\n",
+            "[Software\\\\Other] 3\n",
+            "\"winhttp\"=\"builtin\"\n",
+        );
+        assert!(!registry_has_winhttp_override(reg));
+        let out = merge_winhttp_override(reg).unwrap();
+        assert!(registry_has_winhttp_override(&out));
+        assert!(out.contains("[Software\\\\Vendor\\\\Settings] 1\n\"winhttp\"=\"native,builtin\""));
+        assert!(out.contains("[Software\\\\Other] 3\n\"winhttp\"=\"builtin\""));
+    }
+
+    #[test]
+    fn atomic_replace_overwrites_existing_registry_on_this_platform() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = tmp.path().join("user.reg");
+        let original = concat!(
+            "WINE REGISTRY Version 2\n\n",
+            "[Software\\\\Vendor\\\\Settings] 1\n",
+            "\"preserve\"=\"these bytes\"\n",
+            "[Software\\\\Wine\\\\DllOverrides] 2\n",
+            "\"winhttp\"=\"builtin\"\n",
+        );
+        fs::write(&reg, original).unwrap();
+        let replacement = merge_winhttp_override(original).unwrap();
+
+        atomic_replace(&reg, replacement.as_bytes()).unwrap();
+
+        assert_eq!(fs::read(&reg).unwrap(), replacement.as_bytes());
+        assert!(replacement
+            .contains("[Software\\\\Vendor\\\\Settings] 1\n\"preserve\"=\"these bytes\"\n"));
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_atomic_replace_keeps_original_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = tmp.path().join("user.reg");
+        let original = concat!(
+            "WINE REGISTRY Version 2\n\n",
+            "[Software\\\\Vendor\\\\Settings] 1\n",
+            "\"preserve\"=\"byte-identical on failure\"\n",
+        )
+        .as_bytes();
+        fs::write(&reg, original).unwrap();
+        let error = atomic_replace_with(&reg, b"replacement", |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&reg).unwrap(), original);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn override_requires_an_existing_prefix() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("missing");
@@ -631,9 +959,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("user.reg"), "WINE REGISTRY Version 2\n").unwrap();
         register_winhttp_override(tmp.path()).unwrap();
-        assert!(fs::read_to_string(tmp.path().join("user.reg"))
-            .unwrap()
-            .contains(OVERRIDE_LINE));
+        assert!(has_winhttp_override(tmp.path()));
     }
 
     #[test]

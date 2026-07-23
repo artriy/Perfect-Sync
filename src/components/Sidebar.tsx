@@ -4,28 +4,30 @@ import type { Profile } from "../lib/types";
 interface SidebarProps {
   profiles: Profile[];
   activeId: string;
+  busy: boolean;
   onSelect: (id: string) => void;
   onNewProfile: () => void;
   onPasteCode: () => void;
 }
 
-export function Sidebar({ profiles, activeId, onSelect, onNewProfile, onPasteCode }: SidebarProps) {
+export function Sidebar({ profiles, activeId, busy, onSelect, onNewProfile, onPasteCode }: SidebarProps) {
   return (
-    <aside className="glass-2 flex w-[244px] shrink-0 flex-col gap-2 p-3.5">
+    <aside className="glass-2 flex min-h-0 w-[244px] shrink-0 flex-col gap-2 overflow-hidden p-3.5" aria-busy={busy}>
       <div className="flex items-center justify-between px-1 pb-1">
         <span className="text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
           Profiles
         </span>
         <button
           type="button"
+          disabled={busy}
           onClick={onNewProfile}
-          className="ring-focus flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[12px] font-semibold text-ink-dim hover:text-ink"
+          className="ring-focus flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[12px] font-semibold text-ink-dim hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
         >
           <Plus size={13} weight="bold" /> New
         </button>
       </div>
 
-      <nav className="flex flex-col gap-1.5">
+      <nav aria-label="Profiles" className="scroll-region flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto pr-1">
         {profiles.map((p) => {
           const active = p.id === activeId;
           const updates = p.mods.some((m) => m.update && !m.managed);
@@ -33,9 +35,11 @@ export function Sidebar({ profiles, activeId, onSelect, onNewProfile, onPasteCod
             <button
               key={p.id}
               type="button"
+              disabled={busy}
               onClick={() => onSelect(p.id)}
               aria-current={active}
-              className={`ring-focus flex items-center gap-2.5 rounded-xl px-2.5 py-2.5 text-left text-[14px] transition-colors ${
+              title={p.name}
+              className={`ring-focus flex shrink-0 items-center gap-2.5 rounded-xl px-2.5 py-2.5 text-left text-[14px] transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                 active
                   ? "border border-white/[0.18] bg-white/[0.13] text-ink"
                   : "text-ink-dim hover:bg-white/[0.06]"
@@ -56,12 +60,11 @@ export function Sidebar({ profiles, activeId, onSelect, onNewProfile, onPasteCod
         })}
       </nav>
 
-      <div className="flex-1" />
 
       <button
         type="button"
         onClick={onPasteCode}
-        className="ring-focus rounded-2xl border border-white/20 p-3.5 text-left transition-transform active:scale-[0.985]"
+        className="ring-focus shrink-0 rounded-2xl border border-white/20 p-3.5 text-left transition-transform active:scale-[0.985]"
         style={{
           background:
             "linear-gradient(135deg, rgba(155,123,255,0.28), rgba(91,192,255,0.18))",

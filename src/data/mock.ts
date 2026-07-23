@@ -1,5 +1,5 @@
 import { CREW } from "../lib/palette";
-import type { CatalogItem, DiffItem, GameStatus, Profile } from "../lib/types";
+import type { CatalogItem, GameStatus, Profile } from "../lib/types";
 
 // Loader + common dependencies, reused across profiles. Versions reflect the
 // ecosystem research (BepInEx 6.0.0-be.735, Reactor 2.5.0, MiraAPI 0.3.9).
@@ -116,9 +116,9 @@ export const PROFILES: Profile[] = [
     gameBuild: "17.0.1",
     mods: [
       {
-        packageId: "Dolfannn/LevelImposter",
+        packageId: "DigiWorm0/LevelImposter",
         name: "LevelImposter",
-        repo: "Dolfannn/LevelImposter",
+        repo: "DigiWorm0/LevelImposter",
         version: "0.7.2",
         versions: ["0.7.2", "0.7.0"],
         enabled: true,
@@ -134,21 +134,16 @@ export const PROFILES: Profile[] = [
 export const GAME: GameStatus = { store: "steam", arch: "x86", running: false };
 
 export const CATALOG: CatalogItem[] = [
-  { id: "AU-Avengers/TOU-Mira", name: "Town of Us - Mira", repo: "AU-Avengers/TOU-Mira", summary: "The Mira-API rebuild of Town of Us. Dozens of custom roles.", tags: ["role", "all-client"], latest: "1.6.3" },
-  { id: "TheOtherRolesAU/TheOtherRoles", name: "The Other Roles", repo: "TheOtherRolesAU/TheOtherRoles", summary: "Classic all-client role mod with a deep options menu.", tags: ["role", "all-client"], latest: "4.8.0" },
-  { id: "EnhancedNetwork/TownofHost-Enhanced", name: "Town of Host - Enhanced", repo: "EnhancedNetwork/TownofHost-Enhanced", summary: "Host-only chaos modes. Guests can stay vanilla.", tags: ["role", "host-only"], latest: "2.4.1" },
-  { id: "SubmergedAmongUs/Submerged", name: "Submerged", repo: "SubmergedAmongUs/Submerged", summary: "The underwater map, with elevators and verticality.", tags: ["map"], latest: "2025.11.20" },
-  { id: "All-Of-Us-Mods/LaunchpadReloaded", name: "Launchpad Reloaded", repo: "All-Of-Us-Mods/LaunchpadReloaded", summary: "A fresh roster of roles built on Mira API.", tags: ["role", "all-client"], latest: "0.3.8" },
-  { id: "Dolfannn/LevelImposter", name: "LevelImposter", repo: "Dolfannn/LevelImposter", summary: "Load community-built custom maps from files.", tags: ["map", "cosmetic"], latest: "0.7.2" },
+  { id: "AU-Avengers/TOU-Mira", name: "Town of Us - Mira", repo: "AU-Avengers/TOU-Mira", summary: "The Mira-API rebuild of Town of Us. Dozens of custom roles.", tags: ["role", "all-client"], latest: "1.6.3", trust: "trusted" },
+  { id: "TheOtherRolesAU/TheOtherRoles", name: "The Other Roles", repo: "TheOtherRolesAU/TheOtherRoles", summary: "Classic all-client role mod with a deep options menu.", tags: ["role", "all-client"], latest: "4.8.0", trust: "trusted" },
+  { id: "EnhancedNetwork/TownofHost-Enhanced", name: "Town of Host - Enhanced", repo: "EnhancedNetwork/TownofHost-Enhanced", summary: "Host-only chaos modes. Guests can stay vanilla.", tags: ["role", "host-only"], latest: "2.4.1", trust: "trusted" },
+  { id: "SubmergedAmongUs/Submerged", name: "Submerged", repo: "SubmergedAmongUs/Submerged", summary: "The underwater map, with elevators and verticality.", tags: ["map"], latest: "2025.11.20", trust: "trusted" },
+  { id: "All-Of-Us-Mods/LaunchpadReloaded", name: "Launchpad Reloaded", repo: "All-Of-Us-Mods/LaunchpadReloaded", summary: "A fresh roster of roles built on Mira API.", tags: ["role", "all-client"], latest: "0.3.8", trust: "trusted" },
+  { id: "DigiWorm0/LevelImposter", name: "LevelImposter", repo: "DigiWorm0/LevelImposter", summary: "Load community-built custom maps from files.", tags: ["map", "cosmetic"], latest: "0.7.2", trust: "trusted" },
+  { id: "NuclearPowered/Reactor", name: "Reactor", repo: "NuclearPowered/Reactor", summary: "Shared runtime library for Reactor-based Among Us mods.", tags: ["library"], latest: "2.5.0", trust: "trusted" },
+  { id: "All-Of-Us-Mods/MiraAPI", name: "MiraAPI", repo: "All-Of-Us-Mods/MiraAPI", summary: "Shared API and runtime library for Mira-based mods.", tags: ["library"], latest: "0.3.9", trust: "trusted" },
 ];
 
-// Pre-computed diff for the lobby-code demo (paste -> decode -> diff).
+// A valid checksum-bearing lobby code used when a static fixture is needed.
 export const SAMPLE_CODE =
-  "PERFECT-eyJ2IjoxLCJuYW1lIjoiVG93bk9mVXMgTmlnaHQiLCJtb2RzIjpb";
-
-export const SAMPLE_DIFF: DiffItem[] = [
-  { name: "Town of Us - Mira", repo: "AU-Avengers/TOU-Mira", tags: ["all-client"], action: "change", from: "1.6.2", to: "1.6.3", detail: "you have 1.6.2, lobby needs 1.6.3" },
-  { name: "Submerged", repo: "SubmergedAmongUs/Submerged", tags: ["map"], action: "install", to: "2025.11.20", detail: "not in this set yet" },
-  { name: "LevelImposter", repo: "Dolfannn/LevelImposter", tags: ["cosmetic"], action: "ok", to: "0.7.2", detail: "0.7.2, already cached" },
-  { name: "Reactor, MiraAPI, BepInEx", tags: ["library"], action: "ok", detail: "dependencies resolved automatically: 2.5.0, 0.3.9, be.735" },
-];
+  "PERFECT-H4sIAAAAAAAC_0WLTQuCMBiA_0q8Z33dFiV4M7oElYccHaKD4VoDt8Wm6yD-9yZIXZ-PEQIUNAHTaAEF1PZjqif3q7OSrx4SkJHvBtW1UdIcCdIItW09FLcR1IxLnpZBGCmcz-qKpyflmhiF-cAtrmFKlvIyPLRwUrSltkZyn_3A0jPCNkgpMvKf9kqqq3WaZEcRRHfQb-t74ZaDYI4Mpvv0BSvE0SvJAAAA.86b7";

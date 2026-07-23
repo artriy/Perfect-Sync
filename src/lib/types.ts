@@ -5,6 +5,10 @@ export type Arch = "x86" | "x64";
 export type Store = "steam" | "epic" | "itch" | "msstore" | "manual";
 export type Runtime = "native" | "proton" | "wine" | "crossover" | "whisky" | "bottles";
 export type Trust = "trusted" | "community" | "flagged";
+export type GithubTokenAction =
+  | { kind: "unchanged" }
+  | { kind: "set"; token: string }
+  | { kind: "clear" };
 export type ModTag =
   | "role"
   | "all-client"
@@ -31,6 +35,8 @@ export interface ProfileMod {
   update?: string;
   /** installed plugin file name (backend-tracked) */
   file?: string;
+  /** exact release asset selected for this installed mod */
+  asset?: string;
 }
 
 export interface Profile {
@@ -39,6 +45,8 @@ export interface Profile {
   crewColor: string;
   /** reference info only; the app does not change the game version in v1 */
   gameBuild?: string;
+  /** globally configured Among Us instance used by this profile */
+  gameInstanceId?: string;
   mods: ProfileMod[];
 }
 
@@ -61,6 +69,8 @@ export interface DiffItem {
   action: "install" | "change" | "ok";
   from?: string;
   to?: string;
+  /** exact release asset requested by the lobby manifest */
+  asset?: string;
   detail: string;
   trust?: Trust;
 }
@@ -80,6 +90,12 @@ export interface GameInstall {
   runtime?: Runtime;
 }
 
+export interface GameInstance extends GameInstall {
+  id: string;
+  name: string;
+  runtime: Runtime;
+}
+
 export interface PersonalMod {
   repo: string;
   tag: string;
@@ -90,19 +106,15 @@ export interface PersonalMod {
 }
 
 export interface Settings {
-  githubToken?: string;
-  gamePath?: string;
-  arch?: Arch;
-  catalogUrl?: string;
-  personalMods?: PersonalMod[];
-  /** first-run onboarding finished */
-  setupComplete?: boolean;
+  gameInstances: GameInstance[];
+  personalMods: PersonalMod[];
+  setupComplete: boolean;
   /** don't warn on launch when BepInEx isn't fully installed */
   skipLaunchWarning?: boolean;
-  /** storefront the game came from, picks the launch path (Steam/Epic) */
-  store?: Store;
-  /** persisted runtime selected for this exact game path */
-  runtime?: Runtime;
   /** id of the profile to re-select on startup */
   activeProfile?: string;
+  /** whether a GitHub token is stored in the native credential store */
+  hasGithubToken: boolean;
+  /** warning returned after malformed settings were quarantined */
+  recoveryWarning?: string;
 }

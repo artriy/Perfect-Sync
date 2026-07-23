@@ -12,6 +12,18 @@ use std::path::{Path, PathBuf};
 /// Steam application id for Among Us.
 pub const STEAM_APP_ID: &str = "945360";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SteamClient {
+    Native,
+    Flatpak,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SteamRoot {
+    path: PathBuf,
+    client: SteamClient,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GameInstall {
     pub path: PathBuf,
@@ -55,7 +67,12 @@ pub fn exe_arch(exe: &Path) -> Option<Arch> {
 fn make_install(path: PathBuf, store: Store, runtime: Runtime) -> GameInstall {
     let arch =
         exe_arch(&path.join(crate::process::GAME_EXE)).unwrap_or_else(|| arch_for_store(store));
-    GameInstall { path, store, arch, runtime }
+    GameInstall {
+        path,
+        store,
+        arch,
+        runtime,
+    }
 }
 
 /// Native on Windows, Proton on Linux, and Wine on other hosts.
@@ -87,37 +104,63 @@ pub fn parse_acf_installdir(acf: &str) -> Option<String> {
     re.captures(acf).map(|c| unescape_vdf(&c[1]))
 }
 
-/// The Among Us folder Steam actually launches for `STEAM_APP_ID` (its
-/// registered install), found across the host's known Steam roots. `None` when
-/// no Steam install of Among Us is registered.
-pub fn steam_install_path() -> Option<PathBuf> {
-    steam_roots().into_iter().find_map(|r| locate_steam(&r).map(|g| g.path))
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ if cfg!(windows) => normalized_path(left) == normalized_path(right),
+        _ => left == right,
+    }
 }
 
-/// The Steam client executable, used to start Steam before a direct launch that
-/// relies on `steam_appid.txt`. `None` when Steam isn't installed.
-pub fn steam_exe() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "steam.exe" } else { "steam" };
-    steam_roots().into_iter().map(|r| r.join(name)).find(|p| p.is_file())
+fn normalized_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
-/// Locate Among Us within a known Steam root by walking its library folders.
-pub fn locate_steam(steam_root: &Path) -> Option<GameInstall> {
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|existing| same_path(existing, &candidate)) {
+        paths.push(candidate);
+    }
+}
+
+fn steam_library_roots(steam_root: &Path) -> Option<Vec<PathBuf>> {
     let vdf = fs::read_to_string(steam_root.join("steamapps").join("libraryfolders.vdf")).ok()?;
-    for lib in parse_libraryfolders(&vdf) {
-        let steamapps = lib.join("steamapps");
+    let mut libraries = vec![steam_root.to_path_buf()];
+    for library in parse_libraryfolders(&vdf) {
+        push_unique_path(&mut libraries, library);
+    }
+    Some(libraries)
+}
+
+/// Locate every registered Among Us install reachable from one Steam root.
+pub fn locate_steam_all(steam_root: &Path) -> Vec<GameInstall> {
+    let Some(libraries) = steam_library_roots(steam_root) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for library in libraries {
+        let steamapps = library.join("steamapps");
         let acf = steamapps.join(format!("appmanifest_{STEAM_APP_ID}.acf"));
         let Ok(acf_text) = fs::read_to_string(&acf) else {
             continue;
         };
-        if let Some(installdir) = parse_acf_installdir(&acf_text) {
-            let game = steamapps.join("common").join(&installdir);
-            if game.join(crate::process::GAME_EXE).is_file() {
-                return Some(make_install(game, Store::Steam, steam_runtime()));
-            }
+        let Some(installdir) = parse_acf_installdir(&acf_text) else {
+            continue;
+        };
+        let game = steamapps.join("common").join(installdir);
+        if game.join(crate::process::GAME_EXE).is_file()
+            && !found
+                .iter()
+                .any(|install: &GameInstall| same_path(&install.path, &game))
+        {
+            found.push(make_install(game, Store::Steam, steam_runtime()));
         }
     }
-    None
+    found
+}
+
+/// Locate the first registered install within one Steam root.
+pub fn locate_steam(steam_root: &Path) -> Option<GameInstall> {
+    locate_steam_all(steam_root).into_iter().next()
 }
 
 #[derive(serde::Deserialize)]
@@ -156,10 +199,18 @@ pub fn locate_epic(manifests_dir: &Path) -> Option<GameInstall> {
     None
 }
 
-/// Candidate Steam roots for the current host (registry + defaults on Windows;
-/// the common XDG/Flatpak/Deck paths on Linux; the app-support path on macOS).
-fn steam_roots() -> Vec<PathBuf> {
+/// Candidate Steam roots for the current host, retaining whether each belongs
+/// to the native client or its Flatpak sandbox.
+fn steam_roots() -> Vec<SteamRoot> {
     let mut roots = Vec::new();
+    let mut push = |path: PathBuf, client: SteamClient| {
+        if !roots
+            .iter()
+            .any(|root: &SteamRoot| root.client == client && same_path(&root.path, &path))
+        {
+            roots.push(SteamRoot { path, client });
+        }
+    };
     if cfg!(windows) {
         // Registry: HKCU\Software\Valve\Steam\SteamPath
         if let Ok(out) = crate::process::command("reg")
@@ -167,27 +218,116 @@ fn steam_roots() -> Vec<PathBuf> {
             .output()
         {
             let text = String::from_utf8_lossy(&out.stdout);
-            if let Some(line) = text.lines().find(|l| l.contains("SteamPath")) {
-                if let Some(p) = line.split("REG_SZ").nth(1) {
-                    roots.push(PathBuf::from(p.trim()));
+            if let Some(line) = text.lines().find(|line| line.contains("SteamPath")) {
+                if let Some(path) = line.split("REG_SZ").nth(1) {
+                    push(PathBuf::from(path.trim()), SteamClient::Native);
                 }
             }
         }
-        for d in [r"C:\Program Files (x86)\Steam", r"C:\Program Files\Steam"] {
-            roots.push(PathBuf::from(d));
+        for path in [r"C:\Program Files (x86)\Steam", r"C:\Program Files\Steam"] {
+            push(PathBuf::from(path), SteamClient::Native);
         }
     } else if let Some(home) = home_dir() {
-        for rel in [
-            ".steam/steam",
-            ".steam/root",
-            ".local/share/Steam",
-            ".var/app/com.valvesoftware.Steam/data/Steam",
-            "Library/Application Support/Steam",
-        ] {
-            roots.push(home.join(rel));
+        if cfg!(target_os = "linux") {
+            for relative in [".steam/steam", ".steam/root", ".local/share/Steam"] {
+                push(home.join(relative), SteamClient::Native);
+            }
+            push(
+                home.join(".var/app/com.valvesoftware.Steam/data/Steam"),
+                SteamClient::Flatpak,
+            );
+        } else if cfg!(target_os = "macos") {
+            push(
+                home.join("Library/Application Support/Steam"),
+                SteamClient::Native,
+            );
         }
     }
     roots
+}
+
+fn steam_installs_from_roots(roots: &[SteamRoot]) -> Vec<(GameInstall, SteamClient)> {
+    let mut found = Vec::new();
+    for root in roots {
+        for install in locate_steam_all(&root.path) {
+            if !found
+                .iter()
+                .any(|(existing, client): &(GameInstall, SteamClient)| {
+                    *client == root.client && same_path(&existing.path, &install.path)
+                })
+            {
+                found.push((install, root.client));
+            }
+        }
+    }
+    found
+}
+
+fn steam_installs() -> Vec<(GameInstall, SteamClient)> {
+    steam_installs_from_roots(&steam_roots())
+}
+
+fn steam_client_for_install_from(
+    installs: &[(GameInstall, SteamClient)],
+    game_dir: &Path,
+) -> Option<SteamClient> {
+    let mut client = None;
+    for (install, candidate) in installs {
+        if !same_path(&install.path, game_dir) {
+            continue;
+        }
+        match client {
+            None => client = Some(*candidate),
+            Some(existing) if existing == *candidate => {}
+            Some(_) => return None,
+        }
+    }
+    client
+}
+
+/// Return the one Steam client which has this exact path registered. Ambiguous
+/// native/Flatpak registrations are rejected rather than choosing a client.
+pub(crate) fn steam_client_for_install(game_dir: &Path) -> Option<SteamClient> {
+    steam_client_for_install_from(&steam_installs(), game_dir)
+}
+
+fn steam_root_for_install_from<'a>(
+    roots: &'a [SteamRoot],
+    game_dir: &Path,
+) -> Option<&'a SteamRoot> {
+    let mut registration = None;
+    for root in roots {
+        if !locate_steam_all(&root.path)
+            .iter()
+            .any(|install| same_path(&install.path, game_dir))
+        {
+            continue;
+        }
+        match registration {
+            None => registration = Some(root),
+            Some(existing)
+                if existing.client == root.client && same_path(&existing.path, &root.path) => {}
+            Some(_) => return None,
+        }
+    }
+    registration
+}
+
+fn native_steam_client_for_install_from(roots: &[SteamRoot], game_dir: &Path) -> Option<PathBuf> {
+    let root = steam_root_for_install_from(roots, game_dir)?;
+    if root.client != SteamClient::Native {
+        return None;
+    }
+    let name = if cfg!(windows) { "steam.exe" } else { "steam" };
+    let client = root.path.join(name);
+    client.is_file().then_some(client)
+}
+
+/// Return the native Steam executable belonging to the unique Steam root that
+/// registered this exact game path. Flatpak and ambiguous registrations return
+/// `None` so launchers can use the runtime-specific compatibility path instead.
+pub fn native_steam_client_for_install(game_dir: &Path) -> Option<PathBuf> {
+    native_steam_client_for_install_from(&steam_roots(), game_dir)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -312,24 +452,39 @@ pub fn whisky_bottle_paths(home: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn locate_bottles(
-    found: &mut Vec<GameInstall>,
-    root: &Path,
-    store: Store,
-    runtime: Runtime,
-) {
+fn push_unique_install(found: &mut Vec<GameInstall>, install: GameInstall) {
+    if !found
+        .iter()
+        .any(|existing| same_path(&existing.path, &install.path))
+    {
+        found.push(install);
+    }
+}
+
+fn locate_bottles(found: &mut Vec<GameInstall>, root: &Path, store: Store, runtime: Runtime) {
     if root.join("drive_c").is_dir() {
         if let Some(game) = locate_in_prefix(root, store, runtime) {
-            found.push(game);
+            push_unique_install(found, game);
         }
         return;
     }
     if let Ok(entries) = fs::read_dir(root) {
         for entry in entries.flatten() {
             if let Some(game) = locate_in_prefix(&entry.path(), store, runtime) {
-                found.push(game);
+                push_unique_install(found, game);
             }
         }
+    }
+}
+
+fn locate_wine_prefixes(found: &mut Vec<GameInstall>, home: &Path, explicit_prefix: Option<&Path>) {
+    let mut prefixes = Vec::new();
+    if let Some(prefix) = explicit_prefix {
+        push_unique_path(&mut prefixes, prefix.to_path_buf());
+    }
+    push_unique_path(&mut prefixes, home.join(".wine"));
+    for prefix in prefixes {
+        locate_bottles(found, &prefix, Store::Manual, Runtime::Wine);
     }
 }
 
@@ -344,14 +499,19 @@ fn locate_other() -> Vec<GameInstall> {
                 .join("Data")
                 .join("Manifests");
             if let Some(game) = locate_epic(&epic) {
-                found.push(game);
+                push_unique_install(&mut found, game);
             }
         }
         return found;
     }
+    let explicit_prefix = std::env::var_os("WINEPREFIX").map(PathBuf::from);
     let Some(home) = home_dir() else {
+        if let Some(prefix) = explicit_prefix {
+            locate_bottles(&mut found, &prefix, Store::Manual, Runtime::Wine);
+        }
         return found;
     };
+    locate_wine_prefixes(&mut found, &home, explicit_prefix.as_deref());
     if cfg!(target_os = "macos") {
         locate_bottles(
             &mut found,
@@ -363,12 +523,6 @@ fn locate_other() -> Vec<GameInstall> {
             locate_bottles(&mut found, &bottle, Store::Manual, Runtime::Whisky);
         }
     } else {
-        locate_bottles(
-            &mut found,
-            &home.join(".wine"),
-            Store::Manual,
-            Runtime::Wine,
-        );
         for root in [
             home.join(".var/app/com.usebottles.bottles/data/bottles/bottles"),
             home.join(".local/share/bottles/bottles"),
@@ -382,13 +536,12 @@ fn locate_other() -> Vec<GameInstall> {
 /// Best-effort detection across stores + runtimes on the current machine.
 pub fn locate_all() -> Vec<GameInstall> {
     let mut found = Vec::new();
-    for root in steam_roots() {
-        if let Some(g) = locate_steam(&root) {
-            found.push(g);
-            break;
-        }
+    for (install, _) in steam_installs() {
+        push_unique_install(&mut found, install);
     }
-    found.extend(locate_other());
+    for install in locate_other() {
+        push_unique_install(&mut found, install);
+    }
     found
 }
 
@@ -396,6 +549,26 @@ pub fn locate_all() -> Vec<GameInstall> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn write_steam_registration(root: &Path, library: &Path, install_dir: &str) -> PathBuf {
+        let root_steamapps = root.join("steamapps");
+        fs::create_dir_all(&root_steamapps).unwrap();
+        let vdf = format!(
+            "\"libraryfolders\"\n{{\n\"0\"\n{{\n\"path\" \"{}\"\n}}\n}}\n",
+            library.to_string_lossy().replace('\\', "\\\\")
+        );
+        fs::write(root_steamapps.join("libraryfolders.vdf"), vdf).unwrap();
+        let steamapps = library.join("steamapps");
+        let game = steamapps.join("common").join(install_dir);
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join(crate::process::GAME_EXE), b"MZ").unwrap();
+        fs::write(
+            steamapps.join(format!("appmanifest_{STEAM_APP_ID}.acf")),
+            format!(r#""AppState" {{ "installdir" "{install_dir}" }}"#),
+        )
+        .unwrap();
+        game
+    }
 
     #[test]
     fn parses_library_paths_and_unescapes() {
@@ -428,7 +601,10 @@ mod tests {
     fn parses_epic_manifest_only_for_among_us() {
         let yes = r#"{"InstallLocation":"C:\\Games\\AmongUs","DisplayName":"Among Us"}"#;
         let no = r#"{"InstallLocation":"C:\\Games\\Fortnite","DisplayName":"Fortnite"}"#;
-        assert_eq!(parse_epic_manifest(yes), Some(PathBuf::from(r"C:\Games\AmongUs")));
+        assert_eq!(
+            parse_epic_manifest(yes),
+            Some(PathBuf::from(r"C:\Games\AmongUs"))
+        );
         assert_eq!(parse_epic_manifest(no), None);
     }
 
@@ -439,7 +615,10 @@ mod tests {
         let steamapps = root.join("steamapps");
         fs::create_dir_all(steamapps.join("common").join("Among Us")).unwrap();
         fs::write(
-            steamapps.join("common").join("Among Us").join(crate::process::GAME_EXE),
+            steamapps
+                .join("common")
+                .join("Among Us")
+                .join(crate::process::GAME_EXE),
             b"MZ",
         )
         .unwrap();
@@ -459,6 +638,87 @@ mod tests {
         assert_eq!(found.store, Store::Steam);
         assert_eq!(found.arch, Arch::X86);
         assert!(found.path.ends_with("Among Us"));
+    }
+
+    #[test]
+    fn enumerates_and_deduplicates_native_flatpak_and_external_libraries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let native_root = tmp.path().join("native Steam");
+        let flatpak_root = tmp.path().join("flatpak Steam");
+        let external = tmp.path().join("External Library");
+        let native_game = write_steam_registration(&native_root, &native_root, "Among Us Native");
+        let flatpak_game = write_steam_registration(&flatpak_root, &external, "Among Us Flatpak");
+        let client_name = if cfg!(windows) { "steam.exe" } else { "steam" };
+        let native_client = native_root.join(client_name);
+        fs::write(&native_client, b"native client").unwrap();
+        fs::write(flatpak_root.join(client_name), b"not a native client").unwrap();
+        let roots = vec![
+            SteamRoot {
+                path: native_root.clone(),
+                client: SteamClient::Native,
+            },
+            SteamRoot {
+                path: native_root,
+                client: SteamClient::Native,
+            },
+            SteamRoot {
+                path: flatpak_root,
+                client: SteamClient::Flatpak,
+            },
+        ];
+
+        let found = steam_installs_from_roots(&roots);
+        assert_eq!(found.len(), 2);
+        assert!(found
+            .iter()
+            .any(|(install, client)| same_path(&install.path, &native_game)
+                && *client == SteamClient::Native));
+        assert!(found
+            .iter()
+            .any(|(install, client)| same_path(&install.path, &flatpak_game)
+                && *client == SteamClient::Flatpak));
+        assert_eq!(
+            steam_client_for_install_from(&found, &native_game),
+            Some(SteamClient::Native)
+        );
+        assert_eq!(
+            steam_client_for_install_from(&found, &flatpak_game),
+            Some(SteamClient::Flatpak)
+        );
+        assert_eq!(
+            native_steam_client_for_install_from(&roots, &native_game),
+            Some(native_client)
+        );
+        assert_eq!(
+            native_steam_client_for_install_from(&roots, &flatpak_game),
+            None
+        );
+    }
+
+    #[test]
+    fn ambiguous_native_and_flatpak_registration_has_no_native_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let native_root = tmp.path().join("native");
+        let flatpak_root = tmp.path().join("flatpak");
+        let shared_library = tmp.path().join("shared");
+        let game = write_steam_registration(&native_root, &shared_library, "Shared Among Us");
+        write_steam_registration(&flatpak_root, &shared_library, "Shared Among Us");
+        let client_name = if cfg!(windows) { "steam.exe" } else { "steam" };
+        fs::write(native_root.join(client_name), b"native client").unwrap();
+        let roots = vec![
+            SteamRoot {
+                path: native_root,
+                client: SteamClient::Native,
+            },
+            SteamRoot {
+                path: flatpak_root,
+                client: SteamClient::Flatpak,
+            },
+        ];
+
+        assert!(steam_root_for_install_from(&roots, &game).is_none());
+        assert!(native_steam_client_for_install_from(&roots, &game).is_none());
+        assert!(steam_client_for_install_from(&steam_installs_from_roots(&roots), &game).is_none());
     }
 
     #[test]
@@ -514,4 +774,24 @@ mod tests {
         assert_eq!(whisky_bottle_paths(&home), vec![bottle]);
     }
 
+    #[test]
+    fn discovers_explicit_and_default_wine_prefixes_on_any_unix_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let default_prefix = home.join(".wine");
+        let custom_prefix = tmp.path().join("Custom macOS Wine Prefix");
+        for (prefix, name) in [
+            (&default_prefix, "Default Among Us"),
+            (&custom_prefix, "Custom Among Us"),
+        ] {
+            let game = prefix.join("drive_c/Games").join(name);
+            fs::create_dir_all(&game).unwrap();
+            fs::write(game.join(crate::process::GAME_EXE), b"MZ").unwrap();
+        }
+
+        let mut found = Vec::new();
+        locate_wine_prefixes(&mut found, &home, Some(&custom_prefix));
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|install| install.runtime == Runtime::Wine));
+    }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { TopBar } from "./components/TopBar";
 import { Sidebar } from "./components/Sidebar";
 import { MainPanel } from "./components/MainPanel";
@@ -11,22 +11,63 @@ import { SetupModal } from "./components/SetupModal";
 import { LaunchWarning } from "./components/LaunchWarning";
 import { Toast, type ToastState } from "./components/Toast";
 import * as bridge from "./lib/bridge";
-import { CATALOG } from "./data/mock";
 import { CREW } from "./lib/palette";
-import type { Arch, CatalogItem, GameInstall, Profile, ProfileMod, Runtime, Settings, Store, Trust } from "./lib/types";
+import type {
+  Arch,
+  CatalogItem,
+  GameInstall,
+  GameInstance,
+  GithubTokenAction,
+  Profile,
+  Runtime,
+  Settings,
+  Store,
+  Trust,
+} from "./lib/types";
 
 const CREW_CYCLE = Object.values(CREW);
+const OPERATION_BUSY = new Error("Another operation is already in progress.");
+
+const INSTANCE_NAMES: Record<Store, string> = {
+  steam: "Steam",
+  epic: "Epic Games",
+  itch: "itch.io",
+  msstore: "Microsoft Store",
+  manual: "Among Us",
+};
+
+const EMPTY_SETTINGS: Settings = {
+  gameInstances: [],
+  personalMods: [],
+  setupComplete: false,
+  hasGithubToken: false,
+};
+interface StartupResult {
+  settings: Settings;
+  games: GameInstall[];
+  catalog: CatalogItem[];
+  profiles: Profile[];
+  errors: string[];
+}
+
+function messageFrom(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 export function App() {
   const [loaded, setLoaded] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [activeId, setActiveId] = useState<string>("");
-  const [running, setRunning] = useState(false);
-  const [busyModId, setBusyModId] = useState<string | null>(null);
+  const [activeId, setActiveId] = useState("");
+  const [running, setRunningState] = useState(false);
+  const [operationBusy, setOperationBusy] = useState(false);
 
-  const [game, setGame] = useState<GameInstall | null>(null);
+  const operationRef = useRef(false);
+  const runningRef = useRef(false);
+  const launchSession = useRef(0);
+  const startupPromiseRef = useRef<Promise<StartupResult> | null>(null);
+
   const [games, setGames] = useState<GameInstall[]>([]);
-  const [settings, setSettings] = useState<Settings>({});
+  const [settings, setSettings] = useState<Settings>(EMPTY_SETTINGS);
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
   const [update, setUpdate] = useState<bridge.UpdateInfo | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
@@ -41,7 +82,9 @@ export function App() {
   const [pickerTarget, setPickerTarget] = useState<{
     repo: string;
     name: string;
+    trust: Trust;
     personal?: boolean;
+    returnToAdd?: boolean;
   } | null>(null);
 
   const [toast, setToast] = useState<ToastState | null>(null);
@@ -49,89 +92,221 @@ export function App() {
   const notify = (msg: string, kind: "success" | "error" = "success") => {
     toastId.current += 1;
     const id = toastId.current;
-    setToast({ id, msg, kind });
-    setTimeout(() => setToast((t) => (t?.id === id ? null : t)), 2600);
+    setToast((current) => (current?.kind === "error" && kind === "success" ? current : { id, msg, kind }));
+    if (kind === "success") {
+      window.setTimeout(() => setToast((current) => (current?.id === id ? null : current)), 2600);
+    }
   };
 
-  // Load settings, detect the game, and read persisted profiles on startup.
+  const setRunning = (value: boolean) => {
+    runningRef.current = value;
+    setRunningState(value);
+  };
+
+  const beginOperation = (): boolean => {
+    if (operationRef.current || runningRef.current) return false;
+    operationRef.current = true;
+    setOperationBusy(true);
+    return true;
+  };
+
+  const endOperation = () => {
+    operationRef.current = false;
+    setOperationBusy(false);
+  };
+
+  const exclusive = async <T,>(action: () => Promise<T>): Promise<T> => {
+    if (!beginOperation()) throw OPERATION_BUSY;
+    try {
+      return await action();
+    } finally {
+      endOperation();
+    }
+  };
+
+  // StrictMode replays effects. The startup promise is created synchronously
+  // once, so every replay observes the same reads and persistence work while
+  // only the currently mounted subscriber commits the result.
   useEffect(() => {
-    (async () => {
-      const [st, detectedGames, profs] = await Promise.all([
-        bridge.getSettings(),
-        bridge.detectGames(),
-        bridge.loadProfiles(),
-      ]);
-      setSettings(st);
-      setGames(detectedGames);
-      const selectedGame =
-        detectedGames.find((candidate) => candidate.path === st.gamePath) ??
-        (st.gamePath
-          ? {
-              path: st.gamePath,
-              arch: st.arch ?? "x86",
-              store: st.store ?? "manual",
-              runtime: st.runtime,
+    let current = true;
+    if (!startupPromiseRef.current) {
+      if (!beginOperation()) return;
+      startupPromiseRef.current = (async (): Promise<StartupResult> => {
+        const [loadedSettings, detectedGames, loadedProfiles, loadedCatalog] = await Promise.all([
+          bridge.getSettings(),
+          bridge.detectGames(),
+          bridge.loadProfiles(),
+          bridge.loadCatalog(),
+        ]);
+
+        let nextProfiles = loadedProfiles;
+        const defaultGameId = loadedSettings.gameInstances[0]?.id;
+        if (nextProfiles.length === 0) {
+          const starter = await bridge.saveProfile({
+            id: "my-mods",
+            name: "My mods",
+            crewColor: CREW.violet,
+            gameInstanceId: defaultGameId,
+            mods: [],
+          });
+          nextProfiles = [starter];
+        } else if (defaultGameId) {
+          const validGameIds = new Set(loadedSettings.gameInstances.map((instance) => instance.id));
+          const migrated: Profile[] = [];
+          for (const profile of nextProfiles) {
+            if (profile.gameInstanceId && validGameIds.has(profile.gameInstanceId)) {
+              migrated.push(profile);
+            } else {
+              migrated.push(await bridge.saveProfile({ ...profile, gameInstanceId: defaultGameId }));
             }
-          : detectedGames[0] ?? null);
-      setGame(selectedGame);
-      let list = profs;
-      if (list.length === 0) {
-        const starter: Profile = { id: "my-mods", name: "My mods", crewColor: CREW.violet, mods: [] };
-        await bridge.saveProfile(starter);
-        list = [starter];
-      }
-      setProfiles(list);
-      const persisted = st.activeProfile;
-      setActiveId(persisted && list.some((p) => p.id === persisted) ? persisted : list[0].id);
-      setLoaded(true);
-      // show the cached catalog right away, then refresh from the hosted copy
-      bridge.loadCatalog().then(setCatalog).catch(() => {});
-      bridge
-        .refreshCatalog()
-        .catch(() => {})
-        .then(() => bridge.loadCatalog())
-        .then(setCatalog)
-        .catch(() => {});
-    })().catch((e) => {
-      setStartupError(String(e));
-      setLoaded(true);
-    });
+          }
+          nextProfiles = migrated;
+        }
+
+        const errors: string[] = [];
+        let nextCatalog = loadedCatalog;
+        try {
+          await bridge.refreshCatalog();
+          nextCatalog = await bridge.loadCatalog();
+        } catch (error) {
+          errors.push(`Catalog refresh failed: ${messageFrom(error)}`);
+        }
+
+        const refreshedProfiles: Profile[] = [];
+        for (const profile of nextProfiles) {
+          const instance =
+            loadedSettings.gameInstances.find((candidate) => candidate.id === profile.gameInstanceId) ??
+            loadedSettings.gameInstances[0];
+          if (!instance) {
+            refreshedProfiles.push(profile);
+            continue;
+          }
+          try {
+            refreshedProfiles.push(await bridge.checkModUpdates(profile.id, instance.arch));
+          } catch (error) {
+            refreshedProfiles.push(profile);
+            errors.push(`Could not check updates for ${profile.name}: ${messageFrom(error)}`);
+          }
+        }
+
+        return {
+          settings: loadedSettings,
+          games: detectedGames,
+          catalog: nextCatalog,
+          profiles: refreshedProfiles,
+          errors,
+        };
+      })().finally(endOperation);
+    }
+
+    void startupPromiseRef.current
+      .then((result) => {
+        if (!current) return;
+        setSettings(result.settings);
+        setGames(result.games);
+        setCatalog(result.catalog);
+        setProfiles(result.profiles);
+        const persisted = result.settings.activeProfile;
+        setActiveId(
+          persisted && result.profiles.some((profile) => profile.id === persisted)
+            ? persisted
+            : result.profiles[0].id,
+        );
+        setLoaded(true);
+        if (result.settings.recoveryWarning) notify(result.settings.recoveryWarning, "error");
+        for (const error of result.errors) notify(error, "error");
+      })
+      .catch((error) => {
+        if (!current) return;
+        setStartupError(messageFrom(error));
+        setLoaded(true);
+      });
+
+    return () => {
+      current = false;
+    };
   }, []);
 
-  // Persist the active profile so the right mod set is restored on restart.
   useEffect(() => {
-    if (!loaded || !activeId) return;
-    setSettings((prev) => {
-      if (prev.activeProfile === activeId) return prev;
-      const next = { ...prev, activeProfile: activeId };
-      bridge.saveSettings(next).catch(() => {});
-      return next;
-    });
-  }, [activeId, loaded]);
-
-  useEffect(() => {
-    bridge.checkUpdate().then(setUpdate).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let current = true;
     bridge
-      .onLobbyLink((code) => {
+      .checkUpdate()
+      .then((available) => {
+        if (current) setUpdate(available);
+      })
+      .catch((error) => {
+        if (current) notify(`Update check failed: ${messageFrom(error)}`, "error");
+      });
+    return () => {
+      current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    let current = true;
+    let unlisten: (() => void) | undefined;
+    let pendingCode: string | null = null;
+    let dialogObserver: MutationObserver | null = null;
+
+    const openPendingLink = () => {
+      if (!current || !pendingCode || document.querySelector('[aria-modal="true"]')) return;
+      const code = pendingCode;
+      pendingCode = null;
+      dialogObserver?.disconnect();
+      dialogObserver = null;
+      setLobbyCode(code);
+      setLobbyOpen(true);
+    };
+    const receiveLink = (code: string) => {
+      if (!document.querySelector('[aria-modal="true"]')) {
         setLobbyCode(code);
         setLobbyOpen(true);
-      })
-      .then((u) => {
-        if (typeof u === "function") unlisten = u;
-      })
-      .catch(() => {});
-    return () => unlisten?.();
-  }, []);
+        return;
+      }
+      pendingCode = code;
+      if (!dialogObserver) {
+        dialogObserver = new MutationObserver(openPendingLink);
+        dialogObserver.observe(document.body, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["aria-modal"],
+        });
+      }
+    };
 
-  const arch: Arch = game?.arch ?? settings.arch ?? "x86";
-  const gameStatus = { store: game?.store ?? "steam", arch, running };
+    bridge
+      .onLobbyLink((code) => {
+        if (current) receiveLink(code);
+      })
+      .then((stop) => {
+        if (!current) stop?.();
+        else if (typeof stop === "function") unlisten = stop;
+      })
+      .catch((error) => {
+        if (current) notify(`Lobby link failed: ${messageFrom(error)}`, "error");
+      });
+    return () => {
+      current = false;
+      dialogObserver?.disconnect();
+      unlisten?.();
+    };
+  }, [loaded]);
+
+  const active = profiles.find((profile) => profile.id === activeId) ?? profiles[0];
+  const installedSnapshot = useMemo(
+    () => active?.mods.map((mod) => [mod.packageId, mod.version] as [string, string]) ?? [],
+    [active?.mods],
+  );
+  const gameInstances = settings.gameInstances;
+  const gameForProfile = (profile: Profile | undefined): GameInstance | null =>
+    gameInstances.find((instance) => instance.id === profile?.gameInstanceId) ?? gameInstances[0] ?? null;
+  const activeGame = gameForProfile(active);
+  const arch: Arch = activeGame?.arch ?? "x86";
+  const gameStatus = { store: activeGame?.store ?? "manual", arch, running };
+  const busy = operationBusy || running;
   const firstRun = loaded && !settings.setupComplete;
-
-  const active = profiles.find((p) => p.id === activeId) ?? profiles[0];
 
   if (!loaded) {
     return (
@@ -161,395 +336,550 @@ export function App() {
     );
   }
 
-  const patchProfile = (updated: Profile) =>
-    setProfiles((ps) => ps.map((p) => (p.id === updated.id ? updated : p)));
+  const patchProfile = (updated: Profile) => {
+    setProfiles((current) =>
+      current.some((profile) => profile.id === updated.id)
+        ? current.map((profile) => (profile.id === updated.id ? updated : profile))
+        : current,
+    );
+  };
 
-  // a mod's vetting tier, resolved against the (bundled-authoritative) catalog
-  const trustOf = (id: string): Trust =>
-    catalog.find((c) => c.id === id || c.repo === id)?.trust ?? "flagged";
+  const trustOf = (id: string): Trust => {
+    const identity = id.toLowerCase();
+    if (identity === "bepinex/bepinex") return "trusted";
+    return catalog.find(
+      (item) => item.id.toLowerCase() === identity || item.repo.toLowerCase() === identity,
+    )?.trust ?? "flagged";
+  };
 
-  // Install/verify the BepInEx files. Runtime setup may return non-fatal
-  // guidance because folder synchronization is intentionally Wine-independent.
-  const ensureLoader = async (profileId: string): Promise<boolean> => {
-    if (!bridge.inTauri) return true;
-    const gamePath = settings.gamePath ?? game?.path;
-    if (!gamePath) {
-      notify("Set your Among Us folder in Settings so BepInEx can install.", "error");
-      return false;
-    }
+  const refreshProfileUpdates = async (profile: Profile): Promise<Profile> => {
+    const instance = gameForProfile(profile);
+    if (!instance) throw new Error("Assign an Among Us instance before checking mod updates.");
+    return bridge.checkModUpdates(profile.id, instance.arch);
+  };
+
+  const ensureLoaderInternal = async (profile: Profile): Promise<string | null> => {
+    const instance = gameForProfile(profile);
+    if (!instance) throw new Error("Add an Among Us folder in Settings before installing BepInEx.");
+    return bridge.ensureLoader(instance.path, profile.id, instance.arch);
+  };
+
+  const selectProfile = async (id: string) => {
+    if (id === active.id) return;
     try {
-      const warning = await bridge.ensureLoader(gamePath, profileId, arch);
-      if (warning) notify(warning);
-      return true;
-    } catch (e) {
-      notify(`BepInEx setup failed: ${e}`, "error");
-      return false;
+      await exclusive(async () => {
+        const normalized = await bridge.saveSettings({ ...settings, activeProfile: id });
+        setSettings(normalized);
+        setActiveId(id);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }
   };
 
   const toggleMod = async (modId: string) => {
-    const mod = active.mods.find((m) => m.packageId === modId);
-    if (!mod) return;
     try {
-      patchProfile(await bridge.setModEnabled(active, modId, !mod.enabled));
-    } catch (e) {
-      notify(String(e), "error");
+      await exclusive(async () => {
+        const profile = profiles.find((candidate) => candidate.id === active.id);
+        const mod = profile?.mods.find((candidate) => candidate.packageId === modId);
+        if (!profile || !mod) return;
+        patchProfile(await bridge.setModEnabled(profile, modId, !mod.enabled));
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }
   };
 
-  const removeMod = async (modId: string) => {
-    const name = active.mods.find((m) => m.packageId === modId)?.name ?? "mod";
+  const removeMod = async (modId: string): Promise<void> => {
     try {
-      patchProfile(await bridge.removeMod(active, modId));
-      notify(`Removed ${name}`);
-    } catch (e) {
-      notify(String(e), "error");
+      await exclusive(async () => {
+        const profile = profiles.find((candidate) => candidate.id === active.id);
+        if (!profile) return;
+        const name = profile.mods.find((mod) => mod.packageId === modId)?.name ?? "mod";
+        patchProfile(await bridge.removeMod(profile, modId));
+        notify(`Removed ${name}`);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
     }
   };
 
   const newProfile = async () => {
-    const n = profiles.filter((p) => p.name.startsWith("New profile")).length + 1;
-    const id = `new-${Date.now()}`;
-    const profile: Profile = {
-      id,
-      name: `New profile ${n}`,
-      crewColor: CREW_CYCLE[profiles.length % CREW_CYCLE.length],
-      mods: [],
-    };
-    setProfiles((ps) => [...ps, profile]);
-    setActiveId(id);
     try {
-      await bridge.saveProfile(profile);
-    } catch (e) {
-      notify(String(e), "error");
+      await exclusive(async () => {
+        const number = profiles.filter((profile) => profile.name.startsWith("New profile")).length + 1;
+        const proposed: Profile = {
+          id: `new-${Date.now()}`,
+          name: `New profile ${number}`,
+          crewColor: CREW_CYCLE[profiles.length % CREW_CYCLE.length],
+          gameInstanceId: activeGame?.id,
+          mods: [],
+        };
+        const saved = await bridge.saveProfile(proposed);
+        const normalized = await bridge.saveSettings({ ...settings, activeProfile: saved.id });
+        setSettings(normalized);
+        setProfiles((current) => [...current, saved]);
+        setActiveId(saved.id);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }
   };
 
-  // adding a mod opens the release/file picker so the user chooses the exact dll
-  const addCatalog = (item: CatalogItem) => {
-    if (active.mods.some((m) => m.packageId === item.id)) {
+  const addCatalog = async (item: CatalogItem): Promise<void> => {
+    if (operationRef.current || runningRef.current) return;
+    if (active.mods.some((mod) => mod.packageId === item.id)) {
       notify(`${item.name} is already in this profile`, "error");
       return;
     }
-    setAddOpen(false);
-    setPickerTarget({ repo: item.repo, name: item.name });
+    setPickerTarget({ repo: item.repo, name: item.name, trust: item.trust ?? "flagged", returnToAdd: true });
   };
 
-  const addUrl = (url: string) => {
-    const m = url.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
-    const repo = m ? `${m[1]}/${m[2]}` : url;
-    const name = m ? m[2] : "Mod";
-    if (active.mods.some((mod) => mod.packageId === repo)) {
+  const addUrl = async (url: string): Promise<void> => {
+    if (operationRef.current || runningRef.current) return;
+    const match = url.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
+    const repo = match ? `${match[1]}/${match[2]}` : url;
+    const name = match ? match[2] : "Mod";
+    if (active.mods.some((mod) => mod.packageId === repo || mod.repo === repo)) {
       notify(`${name} is already in this profile`, "error");
       return;
     }
-    setAddOpen(false);
-    setPickerTarget({ repo, name });
+    setPickerTarget({ repo, name, trust: trustOf(repo), returnToAdd: true });
   };
 
   const renameProfile = async (name: string) => {
-    const updated = { ...active, name };
-    patchProfile(updated);
     try {
-      await bridge.saveProfile(updated);
-    } catch (e) {
-      notify(String(e), "error");
+      await exclusive(async () => {
+        const profile = profiles.find((candidate) => candidate.id === active.id);
+        if (!profile) return;
+        patchProfile(await bridge.saveProfile({ ...profile, name }));
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }
   };
 
-  const deleteActiveProfile = async () => {
-    const id = active.id;
-    const name = active.name;
+  const selectGameInstance = async (id: string) => {
     try {
-      await bridge.deleteProfile(id);
-    } catch (e) {
-      notify(String(e), "error");
+      await exclusive(async () => {
+        const profile = profiles.find((candidate) => candidate.id === active.id);
+        if (!profile || profile.gameInstanceId === id) return;
+        const saved = await bridge.saveProfile({ ...profile, gameInstanceId: id });
+        patchProfile(saved);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }
-    const left = profiles.filter((p) => p.id !== id);
-    if (left.length === 0) {
-      const starter: Profile = { id: "my-mods", name: "My mods", crewColor: CREW.violet, mods: [] };
-      await bridge.saveProfile(starter).catch(() => {});
-      setProfiles([starter]);
-      setActiveId(starter.id);
-    } else {
-      setProfiles(left);
-      setActiveId(left[0].id);
+  };
+
+  const deleteActiveProfile = async (): Promise<void> => {
+    try {
+      await exclusive(async () => {
+        const profile = profiles.find((candidate) => candidate.id === active.id);
+        if (!profile) throw new Error("Profile no longer exists.");
+        const left = profiles.filter((candidate) => candidate.id !== profile.id);
+        let replacement: Profile | undefined;
+        if (left.length === 0) {
+          replacement = await bridge.saveProfile({
+            id: profile.id === "my-mods-a" ? "my-mods-b" : "my-mods-a",
+            name: "My mods",
+            crewColor: CREW.violet,
+            gameInstanceId: activeGame?.id,
+            mods: [],
+          });
+        }
+        await bridge.deleteProfile(profile.id);
+        const nextProfiles = replacement ? [replacement] : left;
+        setProfiles(nextProfiles);
+        setActiveId(nextProfiles[0].id);
+        setSettings((current) => ({ ...current, activeProfile: undefined }));
+        notify(`Deleted ${profile.name}`);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
     }
-    notify(`Deleted ${name}`);
   };
 
   const openPicker = (modId: string) => {
-    const m = active.mods.find((x) => x.packageId === modId);
-    if (m) setPickerTarget({ repo: m.repo ?? m.packageId, name: m.name });
-  };
-
-  const addPersonal = (repo: string, name: string) => {
-    setSettingsOpen(false);
-    setPickerTarget({ repo, name, personal: true });
-  };
-
-  const removePersonal = async (repo: string) => {
-    const next: Settings = {
-      ...settings,
-      personalMods: (settings.personalMods ?? []).filter((p) => p.repo !== repo),
-    };
-    setSettings(next);
-    try {
-      await bridge.saveSettings(next);
-    } catch (e) {
-      notify(String(e), "error");
+    if (operationRef.current || runningRef.current) return;
+    const mod = active.mods.find((candidate) => candidate.packageId === modId);
+    if (mod) {
+      const repo = mod.repo ?? mod.packageId;
+      setPickerTarget({ repo, name: mod.name, trust: trustOf(repo) });
     }
   };
 
-  const togglePersonal = async (repo: string, enabled: boolean) => {
-    const next: Settings = {
-      ...settings,
-      personalMods: (settings.personalMods ?? []).map((p) =>
-        p.repo === repo ? { ...p, enabled } : p,
-      ),
-    };
-    setSettings(next);
+  const addPersonal = async (repo: string, name: string): Promise<void> => {
+    if (operationRef.current || runningRef.current) throw OPERATION_BUSY;
+    setPickerTarget({ repo, name, trust: trustOf(repo), personal: true });
+  };
+
+  const removePersonal = async (repo: string): Promise<void> => {
     try {
-      await bridge.saveSettings(next);
-    } catch (e) {
-      notify(String(e), "error");
+      await exclusive(async () => {
+        const normalized = await bridge.saveSettings({
+          ...settings,
+          personalMods: settings.personalMods.filter((personal) => personal.repo !== repo),
+        });
+        setSettings(normalized);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
     }
   };
 
-  const pickRelease = async (tag: string, assetName: string) => {
+  const togglePersonal = async (repo: string, enabled: boolean): Promise<void> => {
+    try {
+      await exclusive(async () => {
+        const normalized = await bridge.saveSettings({
+          ...settings,
+          personalMods: settings.personalMods.map((personal) =>
+            personal.repo === repo ? { ...personal, enabled } : personal,
+          ),
+        });
+        setSettings(normalized);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
+    }
+  };
+
+  const pickRelease = async (repo: string, tag: string, assetName: string) => {
     const target = pickerTarget;
-    if (!target) return;
-    setPickerTarget(null);
-
-    // personal "always-include" mod: store in settings, don't install to a profile
-    if (target.personal) {
-      const next: Settings = {
-        ...settings,
-        personalMods: [
-          ...(settings.personalMods ?? []).filter((p) => p.repo !== target.repo),
-          { repo: target.repo, tag, asset: assetName, name: target.name, enabled: (settings.personalMods ?? []).find((p) => p.repo === target.repo)?.enabled ?? true },
-        ],
-      };
-      setSettings(next);
-      try {
-        await bridge.saveSettings(next);
-        notify(`${target.name} will be added to every lobby you join`);
-      } catch (e) {
-        notify(String(e), "error");
-      }
-      return;
-    }
-
-    setBusyModId(target.repo);
-    notify(`Installing ${assetName}…`);
+    if (!target || target.repo !== repo) return;
     try {
-      patchProfile(await bridge.installAsset(active, target.repo, tag, assetName, arch));
-      notify(`Installed ${assetName}`);
-      await ensureLoader(active.id);
-      bridge.loadCatalog().then(setCatalog).catch(() => {});
-    } catch (e) {
-      notify(String(e), "error");
-    } finally {
-      setBusyModId(null);
+      await exclusive(async () => {
+        if (target.personal) {
+          const previous = settings.personalMods.find((personal) => personal.repo === target.repo);
+          const normalized = await bridge.saveSettings({
+            ...settings,
+            personalMods: [
+              ...settings.personalMods.filter((personal) => personal.repo !== target.repo),
+              {
+                repo: target.repo,
+                tag,
+                asset: assetName,
+                name: target.name,
+                enabled: previous?.enabled ?? true,
+              },
+            ],
+          });
+          setSettings(normalized);
+          setPickerTarget(null);
+          notify(`${target.name} will be added to every lobby you join`);
+          return;
+        }
+
+        const profile = profiles.find((candidate) => candidate.id === active.id);
+        const instance = gameForProfile(profile);
+        if (!profile || !instance) throw new Error("Assign an Among Us instance before installing a mod.");
+        notify(`Installing ${assetName}…`);
+        const installed = await bridge.installAsset(profile, target.repo, tag, assetName, instance.arch, true);
+        const warnings: string[] = [];
+        let refreshed = installed;
+        try {
+          refreshed = await refreshProfileUpdates(installed);
+        } catch (error) {
+          warnings.push(`Update refresh failed: ${messageFrom(error)}`);
+        }
+        patchProfile(refreshed);
+        setPickerTarget(null);
+        if (target.returnToAdd) setAddOpen(false);
+        const loaderWarning = await ensureLoaderInternal(refreshed);
+        if (loaderWarning) warnings.push(loaderWarning);
+        try {
+          setCatalog(await bridge.loadCatalog());
+        } catch (error) {
+          warnings.push(`Catalog reload failed: ${messageFrom(error)}`);
+        }
+        notify(
+          warnings.length > 0 ? `Installed ${assetName}. ${warnings.join(" ")}` : `Installed ${assetName}`,
+          warnings.length > 0 ? "error" : "success",
+        );
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
     }
   };
 
   const removeCatalogItem = async (id: string) => {
     try {
-      setCatalog(await bridge.removeCatalogMod(catalog, id));
-    } catch (e) {
-      notify(String(e), "error");
+      await exclusive(async () => setCatalog(await bridge.removeCatalogMod(catalog, id)));
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
     }
   };
 
-  const moveCatalogItem = async (id: string, dir: "up" | "down") => {
-    const ids = catalog.map((c) => c.id);
-    const i = ids.indexOf(id);
-    const j = dir === "up" ? i - 1 : i + 1;
-    if (i < 0 || j < 0 || j >= ids.length) return;
-    [ids[i], ids[j]] = [ids[j], ids[i]];
+  const moveCatalogItem = async (id: string, direction: "up" | "down") => {
+    const ids = catalog.map((item) => item.id);
+    const index = ids.indexOf(id);
+    const destination = direction === "up" ? index - 1 : index + 1;
+    if (index < 0 || destination < 0 || destination >= ids.length) return;
+    [ids[index], ids[destination]] = [ids[destination], ids[index]];
     try {
-      setCatalog(await bridge.reorderCatalog(catalog, ids));
-    } catch (e) {
-      notify(String(e), "error");
+      await exclusive(async () => setCatalog(await bridge.reorderCatalog(catalog, ids)));
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
     }
   };
 
-  const runLaunch = async (p: Profile) => {
-    const gamePath = settings.gamePath ?? game?.path;
+  const monitorGame = () => {
+    const session = ++launchSession.current;
+    const startedAt = Date.now();
+    let seen = false;
+    const poll = async () => {
+      if (launchSession.current !== session) return;
+      try {
+        const alive = await bridge.gameRunning();
+        if (launchSession.current !== session) return;
+        if (alive) {
+          seen = true;
+          window.setTimeout(poll, 2000);
+        } else if (seen || Date.now() - startedAt > 20000) {
+          setRunning(false);
+        } else {
+          window.setTimeout(poll, 2000);
+        }
+      } catch (error) {
+        if (launchSession.current === session) {
+          setRunning(false);
+          notify(`Could not read game status: ${messageFrom(error)}`, "error");
+        }
+      }
+    };
+    window.setTimeout(poll, 2000);
+  };
+
+  const launchInternal = async (profile: Profile, vanilla: boolean) => {
+    const instance = gameForProfile(profile);
+    if (!instance) throw new Error("No Among Us instance is assigned to this profile.");
+    setRunning(true);
     try {
-      setRunning(true);
-      await bridge.launchProfile(gamePath ?? "", p.id);
-      const isEpic = (game?.store ?? settings.store) === "epic";
+      if (vanilla) await bridge.launchVanilla(instance.path);
+      else await bridge.launchProfile(instance.path, profile.id);
       notify(
-        isEpic
-          ? `Launching ${p.name}. Epic may ask you to sign in the first time, that's normal.`
-          : `Launching ${p.name}`,
+        instance.store === "epic"
+          ? `Launching ${vanilla ? "vanilla Among Us" : profile.name}. Epic may ask you to sign in the first time, that's normal.`
+          : `Launching ${vanilla ? "vanilla Among Us" : profile.name}`,
       );
-      if (bridge.inTauri) {
-        // unlock when the game process exits, or after a grace if it never appears
-        const start = Date.now();
-        let seen = false;
-        const poll = setInterval(async () => {
-          let alive = false;
-          try {
-            alive = await bridge.gameRunning();
-          } catch {
-            return;
-          }
-          if (alive) {
-            seen = true;
-            return;
-          }
-          if (seen || Date.now() - start > 20000) {
-            clearInterval(poll);
-            setRunning(false);
-          }
-        }, 2000);
-      } else {
-        setTimeout(() => setRunning(false), 2800);
-      }
-    } catch (e) {
+      monitorGame();
+    } catch (error) {
       setRunning(false);
-      notify(String(e), "error");
+      throw error;
     }
   };
 
-  const doLaunchProfile = async (p: Profile) => {
-    const gamePath = settings.gamePath ?? game?.path;
-    if (bridge.inTauri && !gamePath) {
-      notify("No Among Us folder set. Open Settings to choose it.", "error");
-      return;
+  const doLaunchProfile = async (profile: Profile) => {
+    try {
+      await exclusive(async () => {
+        const current = profiles.find((candidate) => candidate.id === profile.id);
+        const instance = gameForProfile(current);
+        if (!current || !instance) throw new Error("No Among Us instance is assigned. Add one in Settings.");
+        if (!settings.skipLaunchWarning) {
+          const status = await bridge.loaderStatus(instance.path, current.id);
+          if (!status.current || !status.runtimeReady) {
+            setLaunchWarn(current);
+            return;
+          }
+        }
+        await launchInternal(current, false);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }
-    if (bridge.inTauri && gamePath && !settings.skipLaunchWarning) {
-      const status = await bridge.loaderStatus(gamePath, p.id).catch(() => null);
-      if (!status?.current || !status.runtimeReady) {
-        setLaunchWarn(p);
-        return;
-      }
-    }
-    await runLaunch(p);
   };
 
   const launchWarnInstall = async () => {
-    const p = launchWarn;
-    if (!p) return;
-    setLaunchWarn(null);
-    if (await ensureLoader(p.id)) await runLaunch(p);
+    const profile = launchWarn;
+    if (!profile) return;
+    try {
+      await exclusive(async () => {
+        const warning = await ensureLoaderInternal(profile);
+        if (warning) throw new Error(warning);
+        setLaunchWarn(null);
+        await launchInternal(profile, false);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+    }
   };
 
   const launchWarnAnyway = async (dontWarnAgain: boolean) => {
-    const p = launchWarn;
-    if (!p) return;
-    setLaunchWarn(null);
-    if (dontWarnAgain) {
-      const next: Settings = { ...settings, skipLaunchWarning: true };
-      setSettings(next);
-      bridge.saveSettings(next).catch((e) => notify(String(e), "error"));
+    const profile = launchWarn;
+    if (!profile) return;
+    try {
+      await exclusive(async () => {
+        if (dontWarnAgain) {
+          const normalized = await bridge.saveSettings({ ...settings, skipLaunchWarning: true });
+          setSettings(normalized);
+        }
+        setLaunchWarn(null);
+        await launchInternal(profile, true);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }
-    await runLaunch(p);
   };
 
   const openLobbyFromSidebar = () => {
     setLobbyCode(undefined);
     setLobbyOpen(true);
   };
+
   const openLobbyFromCode = (code: string) => {
     setLobbyCode(code);
     setLobbyOpen(true);
   };
 
   const applyLobby = async (doLaunch: boolean, code: string) => {
-    setLobbyOpen(false);
-    notify("Setting up lobby…");
     try {
-      const built = await bridge.applyLobbyCode(code, arch, buildLobbyProfile());
-      setProfiles((ps) => [...ps.filter((p) => p.id !== built.id), built]);
-      setActiveId(built.id);
-      if (!(await ensureLoader(built.id))) return;
-      if (doLaunch) {
-        await doLaunchProfile(built);
-      } else {
-        const gamePath = settings.gamePath ?? game?.path;
-        const warning =
-          bridge.inTauri && gamePath ? await bridge.syncProfile(gamePath, built.id) : null;
+      await exclusive(async () => {
+        const instance = activeGame;
+        if (!instance) throw new Error("Choose a concrete Among Us instance before applying a lobby.");
+        notify("Setting up lobby…");
+        let built = await bridge.applyLobbyCode(code, instance.arch, instance.id);
+        try {
+          built = await refreshProfileUpdates(built);
+        } catch (error) {
+          notify(`Lobby installed, but update refresh failed: ${messageFrom(error)}`, "error");
+        }
+        const normalized = await bridge.saveSettings({ ...settings, activeProfile: built.id });
+        setSettings(normalized);
+        setProfiles((current) => [...current.filter((profile) => profile.id !== built.id), built]);
+        setActiveId(built.id);
+        setLobbyOpen(false);
+        const loaderWarning = await ensureLoaderInternal(built);
+        if (doLaunch) {
+          if (loaderWarning) throw new Error(loaderWarning);
+          await launchInternal(built, false);
+        } else {
+          const warning = (await bridge.syncProfile(instance.path, built.id)) ?? loaderWarning;
+          notify(warning ? `Lobby profile ready: ${built.name}. ${warning}` : `Lobby profile ready: ${built.name}`);
+        }
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+    }
+  };
+
+  const saveSettings = async (draft: Settings, tokenAction: GithubTokenAction): Promise<void> => {
+    try {
+      await exclusive(async () => {
+        const normalized = await bridge.saveSettings(draft, tokenAction);
+        setSettings(normalized);
+        setSettingsOpen(false);
+        notify("Settings saved");
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
+    }
+  };
+
+  const completeSetup = async (gamePath?: string, selectedArch?: string, store?: string, runtime?: Runtime) => {
+    try {
+      await exclusive(async () => {
+        const instances = [...gameInstances];
+        let gameInstanceId = active.gameInstanceId;
+        if (gamePath) {
+          let instance = instances.find(
+            (candidate) =>
+              candidate.path.replaceAll("\\", "/").toLowerCase() ===
+              gamePath.replaceAll("\\", "/").toLowerCase(),
+          );
+          if (!instance) {
+            const detected = games.find((candidate) => candidate.path === gamePath);
+            const instanceStore = (store as Store | undefined) ?? detected?.store ?? "manual";
+            const storeCount = instances.filter((candidate) => candidate.store === instanceStore).length;
+            const baseName = INSTANCE_NAMES[instanceStore];
+            instance = {
+              id: `game-${Date.now().toString(36)}`,
+              name: storeCount === 0 ? baseName : `${baseName} ${storeCount + 1}`,
+              path: gamePath,
+              arch: (selectedArch as Arch | undefined) ?? detected?.arch ?? "x86",
+              store: instanceStore,
+              runtime: runtime ?? detected?.runtime ?? "native",
+            };
+            instances.push(instance);
+          }
+          gameInstanceId = instance.id;
+        }
+        // Persist the instance list first, but publish setupComplete only after the
+        // profile assignment succeeds. A failure or crash therefore reopens setup.
+        const provisional = await bridge.saveSettings({
+          ...settings,
+          setupComplete: false,
+          gameInstances: instances,
+        });
+        const savedProfile = await bridge.saveProfile({ ...active, gameInstanceId });
+        const normalized = await bridge.saveSettings({ ...provisional, setupComplete: true });
+        setSettings(normalized);
+        patchProfile(savedProfile);
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+    }
+  };
+
+  const setupMods = async (profile: Profile) => {
+    try {
+      await exclusive(async () => {
+        const current = profiles.find((candidate) => candidate.id === profile.id);
+        const instance = gameForProfile(current);
+        if (!current || !instance) throw new Error("No Among Us instance is assigned. Add one in Settings.");
+        notify("Setting up mods…");
+        const warning = await bridge.syncProfile(instance.path, current.id);
         notify(
           warning
-            ? `Lobby profile ready: ${built.name}. ${warning}`
-            : `Lobby profile ready: ${built.name}`,
+            ? `Mods are synchronized in the Among Us folder. ${warning}`
+            : "Mods set up in your Among Us folder. Launch Among Us when ready.",
         );
-      }
-    } catch (e) {
-      notify(String(e), "error");
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }
   };
 
-  const saveSettings = async (s: Settings) => {
-    setSettings(s);
-    setSettingsOpen(false);
+  const openUpdate = async () => {
+    if (!update) return;
     try {
-      await bridge.saveSettings(s);
-      notify("Settings saved");
-    } catch (e) {
-      notify(String(e), "error");
+      await bridge.openUrl(update.url);
+    } catch (error) {
+      notify(`Could not open the download page: ${messageFrom(error)}`, "error");
     }
   };
 
-  const completeSetup = async (gamePath?: string, arch?: string, store?: string, runtime?: Runtime) => {
-    const next: Settings = {
-      ...settings,
-      setupComplete: true,
-      ...(gamePath ? { gamePath } : {}),
-      ...(arch ? { arch: arch as Arch } : {}),
-      ...(store ? { store: store as Store } : {}),
-      ...(runtime ? { runtime } : {}),
-    };
-    setSettings(next);
-    if (gamePath) {
-      setGame(
-        games.find((candidate) => candidate.path === gamePath) ?? {
-          path: gamePath,
-          arch: (arch as Arch | undefined) ?? "x86",
-          store: (store as Store | undefined) ?? "manual",
-          runtime,
-        },
-      );
-    }
-    try {
-      await bridge.saveSettings(next);
-    } catch (e) {
-      notify(String(e), "error");
-    }
-  };
-
-  const setupMods = async (p: Profile) => {
-    const gamePath = settings.gamePath ?? game?.path;
-    if (bridge.inTauri && !gamePath) {
-      notify("No Among Us folder set. Open Settings to choose it.", "error");
-      return;
-    }
-    notify("Setting up mods…");
-    setBusyModId("__setup__");
-    try {
-      const warning = await bridge.syncProfile(gamePath ?? "", p.id);
-      notify(
-        warning
-          ? `Mods are synchronized in the Among Us folder. ${warning}`
-          : "Mods set up in your Among Us folder. Launch Among Us when ready.",
-      );
-    } catch (e) {
-      notify(String(e), "error");
-    } finally {
-      setBusyModId(null);
-    }
-  };
+  const topLevelOverlayOpen =
+    addOpen ||
+    lobbyOpen ||
+    settingsOpen ||
+    pickerTarget !== null ||
+    shareOpen ||
+    firstRun ||
+    launchWarn !== null;
 
   return (
     <div className="flex h-[100dvh] flex-col">
+      <div
+        className="flex min-h-0 flex-1 flex-col"
+        inert={topLevelOverlayOpen}
+        aria-hidden={topLevelOverlayOpen}
+      >
       <TopBar
-        onAddMod={() => setAddOpen(true)}
+        onAddMod={() => {
+          if (!busy) setAddOpen(true);
+        }}
         onPasteCode={openLobbyFromCode}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={() => {
+          if (!busy) setSettingsOpen(true);
+        }}
       />
 
       {update && !updateDismissed && (
@@ -557,7 +887,7 @@ export function App() {
           <span className="flex-1">Perfect-Sync {update.version} is available.</span>
           <button
             type="button"
-            onClick={() => bridge.openUrl(update.url)}
+            onClick={() => void openUpdate()}
             className="ring-focus accent-grad rounded-lg px-3 py-1.5 text-[12.5px] font-semibold text-[#0d0820]"
           >
             Download
@@ -573,39 +903,51 @@ export function App() {
         </div>
       )}
 
-
       <div className="flex min-h-0 flex-1 p-3 pt-2.5">
         <div className="glass flex min-h-0 flex-1 overflow-hidden rounded-3xl">
           <Sidebar
             profiles={profiles}
             activeId={active.id}
-            onSelect={setActiveId}
-            onNewProfile={newProfile}
+            busy={busy}
+            onSelect={(id) => void selectProfile(id)}
+            onNewProfile={() => void newProfile()}
             onPasteCode={openLobbyFromSidebar}
           />
           <MainPanel
             profile={active}
             game={gameStatus}
-            busyModId={busyModId}
+            gameInstances={gameInstances}
+            busy={busy}
             trustOf={trustOf}
-            onToggle={toggleMod}
+            onToggle={(id) => void toggleMod(id)}
             onRemove={removeMod}
             onPickRelease={openPicker}
-            onShare={() => setShareOpen(true)}
-            onRename={renameProfile}
+            onShare={() => {
+              if (!busy) setShareOpen(true);
+            }}
+            onRename={(name) => void renameProfile(name)}
             onDelete={deleteActiveProfile}
-            onLaunch={() => doLaunchProfile(active)}
-            onAddMod={() => setAddOpen(true)}
-            onSetup={() => setupMods(active)}
+            onLaunch={() => void doLaunchProfile(active)}
+            onAddMod={() => {
+              if (!busy) setAddOpen(true);
+            }}
+            onSetup={() => void setupMods(active)}
+            onSelectGameInstance={(id) => void selectGameInstance(id)}
+            onManageGameInstances={() => {
+              if (!busy) setSettingsOpen(true);
+            }}
           />
         </div>
+      </div>
       </div>
 
       <AddModPanel
         open={addOpen}
         profileName={active.name}
         catalog={catalog}
-        onClose={() => setAddOpen(false)}
+        onClose={() => {
+          if (!operationRef.current) setAddOpen(false);
+        }}
         onAddCatalog={addCatalog}
         onAddUrl={addUrl}
         onRemoveCatalog={removeCatalogItem}
@@ -614,18 +956,23 @@ export function App() {
       <LobbyCodeModal
         open={lobbyOpen}
         initialCode={lobbyCode}
-        installed={active.mods.map((m) => [m.packageId, m.version] as [string, string])}
+        installed={installedSnapshot}
         trustOf={trustOf}
-        personalMods={settings.personalMods ?? []}
-        onClose={() => setLobbyOpen(false)}
+        personalMods={settings.personalMods}
+        busyReason={running ? "Close Among Us before applying this lobby." : operationBusy ? "Wait for the current operation to finish." : undefined}
+        onClose={() => {
+          if (!operationRef.current) setLobbyOpen(false);
+        }}
         onApply={applyLobby}
       />
       <SettingsModal
         open={settingsOpen}
         settings={settings}
-        game={game}
         profileId={active.id}
-        onClose={() => setSettingsOpen(false)}
+        profileGameInstanceId={active.gameInstanceId}
+        onClose={() => {
+          if (!operationRef.current) setSettingsOpen(false);
+        }}
         onSave={saveSettings}
         onAddPersonal={addPersonal}
         onRemovePersonal={removePersonal}
@@ -636,14 +983,19 @@ export function App() {
         open={pickerTarget !== null}
         repo={pickerTarget?.repo ?? ""}
         modName={pickerTarget?.name ?? ""}
-        busy={busyModId !== null}
-        onClose={() => setPickerTarget(null)}
+        trust={pickerTarget?.trust ?? "flagged"}
+        busy={operationBusy}
+        onClose={() => {
+          if (!operationRef.current) setPickerTarget(null);
+        }}
         onPick={pickRelease}
       />
       <ShareModal
         open={shareOpen}
         profile={active}
-        onClose={() => setShareOpen(false)}
+        onClose={() => {
+          if (!operationRef.current) setShareOpen(false);
+        }}
       />
       <SetupModal
         open={firstRun}
@@ -655,69 +1007,11 @@ export function App() {
         open={launchWarn !== null}
         onInstall={launchWarnInstall}
         onLaunchAnyway={launchWarnAnyway}
-        onCancel={() => setLaunchWarn(null)}
+        onCancel={() => {
+          if (!operationRef.current) setLaunchWarn(null);
+        }}
       />
-      <Toast toast={toast} />
+      <Toast toast={toast} onDismiss={() => setToast(null)} />
     </div>
   );
-}
-
-function buildLobbyProfile(): Profile {
-  const find = (id: string) => CATALOG.find((c) => c.id === id)!;
-  const tou = find("AU-Avengers/TOU-Mira");
-  const sub = find("SubmergedAmongUs/Submerged");
-  const li = find("Dolfannn/LevelImposter");
-  const mk = (c: CatalogItem, version: string): ProfileMod => ({
-    packageId: c.id,
-    name: c.name,
-    repo: c.repo,
-    version,
-    versions: [version],
-    enabled: true,
-    source: "github",
-    tags: c.tags,
-  });
-  return {
-    id: "lobby-townofus-night",
-    name: "Lobby - TownOfUs Night",
-    crewColor: CREW.gold,
-    gameBuild: "17.0.1",
-    mods: [
-      mk(tou, "1.6.3"),
-      mk(sub, "2025.11.20"),
-      mk(li, "0.7.2"),
-      {
-        packageId: "All-Of-Us-Mods/MiraAPI",
-        name: "MiraAPI",
-        repo: "All-Of-Us-Mods/MiraAPI",
-        version: "0.3.9",
-        versions: ["0.3.9"],
-        enabled: true,
-        source: "catalog",
-        tags: ["library"],
-        managed: true,
-      },
-      {
-        packageId: "NuclearPowered/Reactor",
-        name: "Reactor",
-        repo: "NuclearPowered/Reactor",
-        version: "2.5.0",
-        versions: ["2.5.0"],
-        enabled: true,
-        source: "catalog",
-        tags: ["library"],
-        managed: true,
-      },
-      {
-        packageId: "BepInEx/BepInEx",
-        name: "BepInEx",
-        version: "6.0.0-be.735",
-        versions: ["6.0.0-be.735"],
-        enabled: true,
-        source: "catalog",
-        tags: ["loader"],
-        managed: true,
-      },
-    ],
-  };
 }

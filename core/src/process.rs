@@ -6,9 +6,10 @@
 //! All file mutations must be gated on the game NOT running (file locks), so
 //! callers check `is_running()` before installing/launching.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Output};
 
 pub const GAME_EXE: &str = "Among Us.exe";
 
@@ -25,38 +26,75 @@ pub fn command<S: AsRef<OsStr>>(program: S) -> Command {
     command
 }
 
-/// A fully-resolved launch: program + args + working dir + environment. On
-/// Windows `program` is the game exe; under Wine/Proton it is the wine/steam
-/// launcher with the exe (or app id) passed in `args`.
+/// A fully-resolved, structured launch. Arguments and environment entries stay
+/// as native OS strings so paths are never lossy or interpreted by a shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
     pub program: PathBuf,
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
     pub cwd: PathBuf,
-    pub env: Vec<(String, String)>,
+    pub env: Vec<(OsString, OsString)>,
+    /// A resolution failure which must be returned before any process is spawned.
+    pub error: Option<String>,
 }
 
-/// Whether an Among Us process is currently running. Windows uses `tasklist`;
-/// elsewhere `pgrep` (Wine names the process after the exe, so `-f Among Us.exe`
-/// matches the game running under Proton/Wine/CrossOver).
-pub fn is_running() -> bool {
+/// Query whether Among Us is running. A helper failure is distinct from a
+/// successful query which found no matching process.
+pub fn try_is_running() -> io::Result<bool> {
     if cfg!(windows) {
-        command("tasklist")
-            .args(["/FI", &format!("IMAGENAME eq {GAME_EXE}"), "/NH"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(GAME_EXE))
-            .unwrap_or(false)
+        interpret_tasklist(
+            command("tasklist")
+                .args(["/FI", &format!("IMAGENAME eq {GAME_EXE}"), "/NH"])
+                .output(),
+        )
     } else {
-        command("pgrep")
-            .args(["-f", GAME_EXE])
-            .output()
-            .map(|o| o.status.success() && !o.stdout.is_empty())
-            .unwrap_or(false)
+        interpret_pgrep(command("pgrep").args(["-f", GAME_EXE]).output())
     }
 }
 
+fn query_failed(helper: &str, output: &Output) -> io::Error {
+    io::Error::other(format!(
+        "{helper} process query failed with status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn interpret_tasklist(result: io::Result<Output>) -> io::Result<bool> {
+    let output = result?;
+    if !output.status.success() {
+        return Err(query_failed("tasklist", &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .to_ascii_lowercase()
+        .contains(&GAME_EXE.to_ascii_lowercase()))
+}
+
+fn pgrep_state(status_code: Option<i32>, has_output: bool) -> Option<bool> {
+    match status_code {
+        Some(0) => Some(has_output),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+fn interpret_pgrep(result: io::Result<Output>) -> io::Result<bool> {
+    let output = result?;
+    pgrep_state(output.status.code(), !output.stdout.is_empty())
+        .ok_or_else(|| query_failed("pgrep", &output))
+}
+
+/// Compatibility wrapper for existing boolean callsites. Query failures are
+/// conservatively treated as running so mutations remain fail closed.
+pub fn is_running() -> bool {
+    try_is_running().unwrap_or(true)
+}
+
 /// Spawn the game from a launch spec. Caller must ensure it is not already running.
-pub fn launch(spec: &LaunchSpec) -> std::io::Result<Child> {
+pub fn launch(spec: &LaunchSpec) -> io::Result<Child> {
+    if let Some(message) = &spec.error {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message.clone()));
+    }
     let mut cmd = command(&spec.program);
     cmd.current_dir(&spec.cwd);
     cmd.args(&spec.args);
@@ -64,6 +102,19 @@ pub fn launch(spec: &LaunchSpec) -> std::io::Result<Child> {
         cmd.env(k, v);
     }
     cmd.spawn()
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn pgrep_distinguishes_absence_from_query_failure() {
+        assert_eq!(pgrep_state(Some(1), false), Some(false));
+        assert_eq!(pgrep_state(Some(0), true), Some(true));
+        assert_eq!(pgrep_state(Some(2), false), None);
+        assert_eq!(pgrep_state(None, false), None);
+    }
 }
 
 #[cfg(all(test, windows))]

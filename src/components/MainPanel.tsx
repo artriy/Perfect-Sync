@@ -1,41 +1,57 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { DotsThree, PencilSimple, PlusCircle, ShareNetwork, Stack, TrashSimple } from "@phosphor-icons/react";
+import { CaretDown, DotsThree, GameController, PencilSimple, PlusCircle, ShareNetwork, Stack, TrashSimple } from "@phosphor-icons/react";
 import { ModRow } from "./ModRow";
 import { LaunchBar } from "./LaunchBar";
-import type { GameStatus, Profile, Trust } from "../lib/types";
+import type { GameInstance, GameStatus, Profile, Trust } from "../lib/types";
+import { useModalFocus } from "../lib/useModalFocus";
 
 interface MainPanelProps {
   profile: Profile;
   game: GameStatus;
-  busyModId: string | null;
+  gameInstances: GameInstance[];
+  busy: boolean;
   onToggle: (modId: string) => void;
-  onRemove: (modId: string) => void;
+  onRemove: (modId: string) => Promise<void>;
   onPickRelease: (modId: string) => void;
   onShare: () => void;
   onRename: (name: string) => void;
-  onDelete: () => void;
+  onDelete: () => Promise<void>;
   onLaunch: () => void;
   onAddMod: () => void;
   onSetup: () => void;
+  onSelectGameInstance: (id: string) => void;
+  onManageGameInstances: () => void;
   trustOf: (id: string) => Trust;
 }
 
 export function MainPanel(props: MainPanelProps) {
-  const { profile, game, busyModId } = props;
+  const { profile, game, busy } = props;
   const reduce = useReducedMotion();
   const userMods = profile.mods.filter((m) => !m.managed);
   const updates = userMods.filter((m) => m.update).length;
+  const selectedGame =
+    props.gameInstances.find((instance) => instance.id === profile.gameInstanceId) ??
+    props.gameInstances[0] ??
+    null;
 
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(profile.name);
   const menuRef = useRef<HTMLDivElement>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const deletePendingRef = useRef(false);
+  const deleteDialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    setDraft(profile.name.slice(0, 80));
     setRenaming(false);
     setMenuOpen(false);
-  }, [profile.id]);
+    setDeleteOpen(false);
+    setDeleting(false);
+    deletePendingRef.current = false;
+  }, [profile.id, profile.name]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -46,51 +62,116 @@ export function MainPanel(props: MainPanelProps) {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [menuOpen]);
 
-  const commitRename = () => {
-    const name = draft.trim();
+  useEffect(() => {
+    if (!busy) return;
+    setMenuOpen(false);
     setRenaming(false);
-    if (name && name !== profile.name) props.onRename(name);
+  }, [busy]);
+
+  const closeDelete = useCallback(() => {
+    if (!deletePendingRef.current) setDeleteOpen(false);
+  }, []);
+
+  useModalFocus(deleteOpen, deleteDialogRef, closeDelete);
+
+  const commitRename = () => {
+    const name = draft.trim().slice(0, 80);
+    setRenaming(false);
+    if (!busy && name && name !== profile.name) props.onRename(name);
+  };
+
+  const confirmDelete = async () => {
+    if (busy || deletePendingRef.current) return;
+    deletePendingRef.current = true;
+    setDeleting(true);
+    try {
+      await props.onDelete();
+      setDeleteOpen(false);
+    } catch {
+      // The parent reports the backend error; keep the confirmation visible for retry or cancel.
+    } finally {
+      deletePendingRef.current = false;
+      setDeleting(false);
+    }
   };
 
   return (
-    <section className="flex min-w-0 flex-1 flex-col">
-      <div className="flex items-end gap-4 px-6 pt-5 pb-3">
-        <div className="min-w-0">
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      <div className="flex items-center gap-3 border-b border-white/[0.06] px-6 py-2.5">
+        <span className="text-[10.5px] font-medium tracking-[0.12em] text-ink-faint uppercase">
+          Among Us instance
+        </span>
+        {selectedGame ? (
+          <>
+            <label className="glass relative flex max-w-[360px] min-w-0 flex-1 items-center gap-2 rounded-lg px-2.5 py-1.5">
+              <GameController size={14} className="shrink-0 text-accent-2" />
+              <select
+                value={selectedGame.id}
+                disabled={busy}
+                onChange={(e) => props.onSelectGameInstance(e.target.value)}
+                aria-label="Among Us instance for this profile"
+                title={`${selectedGame.name} · ${selectedGame.store} · ${selectedGame.arch}`}
+                className="min-w-0 flex-1 appearance-none truncate bg-transparent pr-5 text-[12.5px] font-medium text-ink focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {props.gameInstances.map((instance) => (
+                  <option key={instance.id} value={instance.id} className="bg-[#171225] text-ink">
+                    {instance.name} · {instance.store} · {instance.arch}
+                  </option>
+                ))}
+              </select>
+              <CaretDown size={12} weight="bold" className="pointer-events-none absolute right-2.5 text-ink-faint" />
+            </label>
+            <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-ink-faint" title={selectedGame.path}>
+              {selectedGame.path}
+            </span>
+          </>
+        ) : (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={props.onManageGameInstances}
+            className="ring-focus glass rounded-lg px-2.5 py-1.5 text-[12px] font-semibold text-accent-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Add an Among Us folder in Settings
+          </button>
+        )}
+      </div>
+      <div className="flex min-w-0 items-end gap-3 px-6 pt-5 pb-3">
+        <div className="min-w-0 flex-1">
           {renaming ? (
             <input
               value={draft}
+              maxLength={80}
+              disabled={busy}
               autoFocus
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => setDraft(e.target.value.slice(0, 80))}
               onKeyDown={(e) => {
                 if (e.key === "Enter") commitRename();
                 if (e.key === "Escape") setRenaming(false);
               }}
               onBlur={commitRename}
               aria-label="Profile name"
-              className="glass w-full rounded-lg px-2 py-1 text-[24px] font-semibold text-ink focus:outline-none"
+              className="glass w-full max-w-[36rem] rounded-lg px-2 py-1 text-[24px] font-semibold text-ink focus:outline-none disabled:opacity-60"
             />
           ) : (
-            <h1 className="truncate text-[26px] leading-tight font-semibold text-ink">{profile.name}</h1>
+            <h1 className="truncate text-[26px] leading-tight font-semibold text-ink" title={profile.name}>
+              {profile.name}
+            </h1>
           )}
           <div className="mt-1 flex items-center gap-2 text-[13px] text-ink-dim">
             <span>
               {userMods.length} mods
               {updates > 0 ? ` · ${updates} update${updates > 1 ? "s" : ""} available` : ""}
             </span>
-            {profile.gameBuild && (
-              <span className="glass rounded-full px-2 py-0.5 text-[11.5px] text-ink-dim">
-                built for Among Us {profile.gameBuild}
-              </span>
-            )}
           </div>
         </div>
 
-        <div className="flex-1" />
 
         <button
           type="button"
+          disabled={busy}
           onClick={props.onShare}
-          className="ring-focus glass flex items-center gap-1.5 rounded-xl px-3 py-2 text-[13px] text-ink-dim transition-colors hover:text-ink"
+          className="ring-focus glass flex shrink-0 items-center gap-1.5 rounded-xl px-3 py-2 text-[13px] text-ink-dim transition-colors hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
         >
           <ShareNetwork size={15} /> Share lobby
         </button>
@@ -98,8 +179,10 @@ export function MainPanel(props: MainPanelProps) {
           <button
             type="button"
             aria-label="More profile actions"
+            aria-expanded={menuOpen}
+            disabled={busy}
             onClick={() => setMenuOpen((o) => !o)}
-            className="ring-focus glass grid h-9 w-9 place-items-center rounded-xl text-ink-dim transition-colors hover:text-ink"
+            className="ring-focus glass grid h-9 w-9 shrink-0 place-items-center rounded-xl text-ink-dim transition-colors hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
           >
             <DotsThree size={18} weight="bold" />
           </button>
@@ -114,22 +197,24 @@ export function MainPanel(props: MainPanelProps) {
               >
                 <button
                   type="button"
+                  disabled={busy}
                   onClick={() => {
                     setMenuOpen(false);
-                    setDraft(profile.name);
+                    setDraft(profile.name.slice(0, 80));
                     setRenaming(true);
                   }}
-                  className="ring-focus flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink-dim hover:bg-white/10 hover:text-ink"
+                  className="ring-focus flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink-dim hover:bg-white/10 hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <PencilSimple size={15} /> Rename profile
                 </button>
                 <button
                   type="button"
+                  disabled={busy}
                   onClick={() => {
                     setMenuOpen(false);
-                    props.onDelete();
+                    setDeleteOpen(true);
                   }}
-                  className="ring-focus flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] text-[#ff8a8a] hover:bg-[rgba(226,59,59,0.15)]"
+                  className="ring-focus flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] text-[#ff8a8a] hover:bg-[rgba(226,59,59,0.15)] disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <TrashSimple size={15} /> Delete profile
                 </button>
@@ -144,17 +229,17 @@ export function MainPanel(props: MainPanelProps) {
         initial={reduce ? false : { opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
-        className="scroll-region flex flex-1 flex-col gap-2.5 overflow-y-auto px-6 pb-4"
+        className="scroll-region flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-6 pb-4"
       >
         {userMods.length === 0 ? (
-          <EmptyState onAddMod={props.onAddMod} />
+          <EmptyState onAddMod={props.onAddMod} busy={busy} />
         ) : (
           profile.mods.map((mod) => (
             <ModRow
               key={mod.packageId}
               mod={mod}
               trust={props.trustOf(mod.packageId)}
-              busy={busyModId === mod.packageId}
+              busy={busy}
               onToggle={() => props.onToggle(mod.packageId)}
               onRemove={() => props.onRemove(mod.packageId)}
               onPickRelease={() => props.onPickRelease(mod.packageId)}
@@ -166,15 +251,73 @@ export function MainPanel(props: MainPanelProps) {
       <LaunchBar
         profileName={profile.name}
         running={game.running}
-        busy={busyModId !== null}
+        busy={busy}
         onLaunch={props.onLaunch}
         onSetup={props.onSetup}
       />
+
+      <AnimatePresence>
+        {deleteOpen && (
+          <motion.div
+            className="fixed inset-0 z-[60] grid place-items-center bg-[rgba(6,4,18,0.68)] p-6"
+            style={{ backdropFilter: "blur(2px)" }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.16 }}
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) closeDelete();
+            }}
+          >
+            <motion.div
+              ref={deleteDialogRef}
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="delete-profile-title"
+              aria-describedby="delete-profile-description"
+              aria-busy={deleting}
+              tabIndex={-1}
+              initial={reduce ? { opacity: 0 } : { opacity: 0, y: 10, scale: 0.97 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={reduce ? { opacity: 0 } : { opacity: 0, y: 6, scale: 0.98 }}
+              transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+              className="glass-strong relative max-h-[calc(100dvh-3rem)] w-[420px] max-w-full overflow-y-auto rounded-3xl p-6"
+            >
+              <h2 id="delete-profile-title" className="text-[18px] font-semibold text-ink">
+                Delete profile?
+              </h2>
+              <p id="delete-profile-description" className="mt-2 break-words text-[13.5px] leading-relaxed text-ink-dim">
+                Delete “<strong className="font-semibold text-ink">{profile.name}</strong>”? This removes the
+                profile and its saved mod selection.
+              </p>
+              <div className="mt-5 flex justify-end gap-2.5">
+                <button
+                  type="button"
+                  data-autofocus
+                  disabled={deleting}
+                  onClick={closeDelete}
+                  className="ring-focus glass rounded-xl px-4 py-2.5 text-[13.5px] text-ink disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={deleting || busy}
+                  onClick={() => void confirmDelete()}
+                  className="ring-focus rounded-xl bg-[#e23b3b] px-4 py-2.5 text-[13.5px] font-semibold text-white hover:bg-[#ef5151] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {deleting ? "Deleting…" : "Delete profile"}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </section>
   );
 }
 
-function EmptyState({ onAddMod }: { onAddMod: () => void }) {
+function EmptyState({ onAddMod, busy }: { onAddMod: () => void; busy: boolean }) {
   return (
     <div className="grid flex-1 place-items-center py-16 text-center">
       <div className="max-w-sm">
@@ -188,7 +331,8 @@ function EmptyState({ onAddMod }: { onAddMod: () => void }) {
         <button
           type="button"
           onClick={onAddMod}
-          className="ring-focus accent-grad mx-auto mt-5 flex items-center gap-1.5 rounded-xl px-4 py-2.5 text-[13.5px] font-semibold text-[#0d0820] transition-transform active:scale-[0.97]"
+          disabled={busy}
+          className="ring-focus accent-grad mx-auto mt-5 flex items-center gap-1.5 rounded-xl px-4 py-2.5 text-[13.5px] font-semibold text-[#0d0820] transition-transform active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-50"
         >
           <PlusCircle size={16} weight="bold" /> Add a mod
         </button>

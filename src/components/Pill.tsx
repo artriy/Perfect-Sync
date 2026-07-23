@@ -6,7 +6,7 @@ export function Pill({ tag }: { tag: ModTag }) {
   const s = TAG_STYLE[tag];
   return (
     <span
-      className="rounded-full px-2.5 py-[3px] text-[11px] font-medium leading-none whitespace-nowrap"
+      className="tag-pill rounded-full px-2.5 py-[3px] text-[11px] font-medium leading-none whitespace-nowrap"
       style={{ color: s.fg, background: s.bg }}
     >
       {s.label}

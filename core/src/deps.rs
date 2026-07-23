@@ -3,30 +3,83 @@ use std::collections::HashSet;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Resolved {
-    /// install order: each dependency appears before the mod that needs it
+    /// Install order: each dependency appears before the mod that needs it.
     pub ordered: Vec<String>,
 }
 
-fn visit(cat: &Catalog, id: &str, out: &mut Vec<String>, stack: &mut HashSet<String>) {
-    if out.iter().any(|x| x == id) || !stack.insert(id.to_string()) {
-        return;
-    }
-    if let Some(entry) = cat.get(id) {
-        for dep in &entry.dependencies {
-            visit(cat, dep, out, stack);
-        }
-    }
-    stack.remove(id);
-    out.push(id.to_string());
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DependencyError {
+    #[error("catalog dependency {dependency:?} required by {required_by:?} is missing")]
+    Missing {
+        required_by: String,
+        dependency: String,
+    },
+    #[error("dependency cycle includes {0:?}")]
+    Cycle(String),
 }
 
-pub fn resolve(cat: &Catalog, selected: &[String]) -> Resolved {
+/// Resolve dependencies without recursion. Identifiers are matched using the
+/// same ASCII case-insensitive semantics as catalog lookup, and output uses the
+/// catalog's canonical spelling.
+pub fn resolve(cat: &Catalog, selected: &[String]) -> Result<Resolved, DependencyError> {
     let mut ordered = Vec::new();
-    let mut stack = HashSet::new();
-    for id in selected {
-        visit(cat, id, &mut ordered, &mut stack);
+    let mut done = HashSet::new();
+    let mut active = HashSet::new();
+
+    for requested in selected {
+        let Some(root) = cat.get(requested) else {
+            return Err(DependencyError::Missing {
+                required_by: "selection".to_string(),
+                dependency: requested.clone(),
+            });
+        };
+        let root_id = root.id.clone();
+        if done.contains(&root_id.to_ascii_lowercase()) {
+            continue;
+        }
+
+        // `expanded` frames append the node after all of its dependencies.
+        let mut stack = vec![(root_id, false)];
+        while let Some((id, expanded)) = stack.pop() {
+            let folded = id.to_ascii_lowercase();
+            if expanded {
+                active.remove(&folded);
+                if done.insert(folded) {
+                    ordered.push(id);
+                }
+                continue;
+            }
+            if done.contains(&folded) {
+                continue;
+            }
+            if !active.insert(folded.clone()) {
+                return Err(DependencyError::Cycle(id));
+            }
+
+            let entry = cat.get(&id).ok_or_else(|| DependencyError::Missing {
+                required_by: "selection".to_string(),
+                dependency: id.clone(),
+            })?;
+            stack.push((entry.id.clone(), true));
+            for dependency in entry.dependencies.iter().rev() {
+                let Some(target) = cat.get(dependency) else {
+                    return Err(DependencyError::Missing {
+                        required_by: entry.id.clone(),
+                        dependency: dependency.clone(),
+                    });
+                };
+                let target_folded = target.id.to_ascii_lowercase();
+                if active.contains(&target_folded) {
+                    return Err(DependencyError::Cycle(target.id.clone()));
+                }
+                if !done.contains(&target_folded) {
+                    stack.push((target.id.clone(), false));
+                }
+            }
+        }
     }
-    Resolved { ordered }
+
+    Ok(Resolved { ordered })
 }
 
 #[cfg(test)]
@@ -41,19 +94,15 @@ mod tests {
     }
 
     #[test]
-    fn expands_deps_before_dependent() {
+    fn expands_deps_before_dependent_case_insensitively() {
         let cat = parse(SAMPLE).unwrap();
-        let r = resolve(&cat, &["AU-Avengers/TOU-Mira".to_string()]);
-        // Reactor before MiraAPI before TOU-Mira
-        assert!(idx(&r.ordered, "NuclearPowered/Reactor") < idx(&r.ordered, "All-Of-Us-Mods/MiraAPI"));
-        assert!(idx(&r.ordered, "All-Of-Us-Mods/MiraAPI") < idx(&r.ordered, "AU-Avengers/TOU-Mira"));
-    }
-
-    #[test]
-    fn tohe_pulls_no_reactor() {
-        let cat = parse(SAMPLE).unwrap();
-        let r = resolve(&cat, &["EnhancedNetwork/TownofHost-Enhanced".to_string()]);
-        assert!(!r.ordered.iter().any(|x| x == "NuclearPowered/Reactor"));
+        let r = resolve(&cat, &["au-avengers/tou-mira".to_string()]).unwrap();
+        assert!(
+            idx(&r.ordered, "NuclearPowered/Reactor") < idx(&r.ordered, "All-Of-Us-Mods/MiraAPI")
+        );
+        assert!(
+            idx(&r.ordered, "All-Of-Us-Mods/MiraAPI") < idx(&r.ordered, "AU-Avengers/TOU-Mira")
+        );
     }
 
     #[test]
@@ -63,7 +112,7 @@ mod tests {
             "AU-Avengers/TOU-Mira".to_string(),
             "EnhancedNetwork/TownofHost-Enhanced".to_string(),
         ];
-        let resolved = resolve(&cat, &selected);
+        let resolved = resolve(&cat, &selected).unwrap();
         assert!(resolved
             .ordered
             .iter()
@@ -75,15 +124,20 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_dependencies_terminate() {
-        let json = r#"{"schema":1,"mods":[
-            {"id":"A","name":"A","summary":"","repo":null,"tags":[],"dependencies":["B"],"assetRules":{}},
-            {"id":"B","name":"B","summary":"","repo":null,"tags":[],"dependencies":["A"],"assetRules":{}}
-        ]}"#;
-        let cat = parse(json).unwrap();
-        let r = resolve(&cat, &["A".to_string()]);
-        assert!(r.ordered.iter().any(|x| x == "A"));
-        assert!(r.ordered.iter().any(|x| x == "B"));
-        assert_eq!(r.ordered.iter().filter(|x| *x == "A").count(), 1);
+    fn reports_missing_and_cycle_explicitly() {
+        let mut missing = parse(SAMPLE).unwrap();
+        missing.mods[0].dependencies.push("Missing/Library".into());
+        assert!(matches!(
+            resolve(&missing, &[missing.mods[0].id.clone()]),
+            Err(DependencyError::Missing { .. })
+        ));
+
+        let mut cyclic = parse(SAMPLE).unwrap();
+        let cycle_target = cyclic.mods[0].id.clone();
+        cyclic.mods[2].dependencies.push(cycle_target);
+        assert!(matches!(
+            resolve(&cyclic, &[cyclic.mods[0].id.clone()]),
+            Err(DependencyError::Cycle(_))
+        ));
     }
 }

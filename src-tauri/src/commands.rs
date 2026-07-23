@@ -5,22 +5,42 @@
 //! Network/disk-heavy commands are `async` and run their blocking body on a
 //! worker thread via `spawn_blocking`, so the UI thread never freezes.
 
-use crate::settings::{self, Settings};
+use crate::settings::{self, Settings, SettingsView, TokenAction};
 use perfect_sync_core::catalog::{parse, AssetArchRule, AssetRules, Catalog};
+use perfect_sync_core::deps;
 use perfect_sync_core::preview::{preview, Preview};
 use perfect_sync_core::profile::{InstalledMod, ProfileRecord, ProfileStore};
-use perfect_sync_core::resolver::{Http, Release, ResolvedDownload, UreqHttp};
-use perfect_sync_core::types::{Arch, ModSource, ModTag, Runtime, Trust};
+use perfect_sync_core::resolver::{download_resolved, Http, Release, ResolvedDownload, UreqHttp};
+use perfect_sync_core::types::{Arch, ModSource, ModTag, Runtime, Store, Trust};
 use perfect_sync_core::{codec, compat, game, loader, process, profile, resolver};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 const BUNDLED_CATALOG: &str = include_str!("../../catalog/catalog.json");
 
 const DEFAULT_CATALOG_URL: &str =
     "https://raw.githubusercontent.com/artriy/Perfect-Sync/main/catalog/catalog.json";
+const MAX_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_USER_CATALOG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CATALOG_ENVELOPE_BYTES: u64 = MAX_CATALOG_BYTES * 2 + MAX_USER_CATALOG_BYTES + 64 * 1024;
+const MAX_PROFILE_STAGE_FILES: usize = 8_192;
+const MAX_PROFILE_STAGE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_PROFILE_RECOVERY_JOURNALS: usize = 64;
+const MAX_PROFILE_RECOVERY_PARENT_ENTRIES: usize = 4_096;
+const MAX_PROFILE_RECOVERY_JOURNAL_BYTES: u64 = 1_024;
+static MUTATION_LOCK: Mutex<()> = Mutex::new(());
+static LAUNCH_PENDING: AtomicBool = AtomicBool::new(false);
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static INSPECTED_GAMES: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Run a blocking closure off the UI thread and flatten the result.
 async fn blocking<T, F>(f: F) -> Result<T, String>
@@ -33,13 +53,1028 @@ where
         .map_err(|e| e.to_string())?
 }
 
-fn catalog() -> Catalog {
-    if let Ok(text) = fs::read_to_string(settings::catalog_cache_path()) {
-        if let Ok(cat) = parse(&text) {
-            return cat;
+fn lock_mutations() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    MUTATION_LOCK
+        .lock()
+        .map_err(|_| "backend mutation lock is poisoned".to_string())
+}
+
+fn validate_profile_id(id: &str) -> Result<(), String> {
+    profile::validate_profile_id(id).map_err(|error| error.to_string())
+}
+
+fn game_is_stopped() -> Result<(), String> {
+    if LAUNCH_PENDING.load(Ordering::Acquire) {
+        return Err(
+            "Among Us is still launching. Wait for startup to finish before changing files.".into(),
+        );
+    }
+    match process::try_is_running() {
+        Ok(false) => Ok(()),
+        Ok(true) => Err("Among Us is running. Close it first.".into()),
+        Err(error) => Err(format!(
+            "Could not verify whether Among Us is running; refusing to modify game files: {error}"
+        )),
+    }
+}
+
+fn spawn_launch(operation: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    LAUNCH_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "Among Us is already launching.".to_string())?;
+    if let Err(error) = operation() {
+        LAUNCH_PENDING.store(false, Ordering::Release);
+        return Err(error);
+    }
+    std::thread::spawn(|| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if matches!(process::try_is_running(), Ok(true)) || Instant::now() >= deadline {
+                LAUNCH_PENDING.store(false, Ordering::Release);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    });
+    Ok(())
+}
+
+fn unique_sibling(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let parent = path.parent().ok_or("path has no parent directory")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("path has no portable file name")?;
+    for _ in 0..128 {
+        let serial = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{name}.{label}.{}.{}", std::process::id(), serial));
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => {}
+            Err(error) => return Err(error.to_string()),
         }
     }
-    bundled_catalog()
+    Err("could not allocate a unique temporary path".into())
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+fn read_bounded(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > limit {
+        return Err(format!("{} exceeds its size limit", path.display()));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("{} exceeds its size limit", path.display()));
+    }
+    Ok(Some(bytes))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("file has no parent directory")?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = unique_sibling(path, "tmp")?;
+    let result = (|| {
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        output.write_all(bytes).map_err(|error| error.to_string())?;
+        output.sync_all().map_err(|error| error.to_string())?;
+        drop(output);
+        atomic_replace_file(&temporary, path).map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn copy_profile_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    if is_reparse(&source_metadata) || !source_metadata.is_dir() {
+        return Err("profile is not a regular directory".into());
+    }
+    fs::create_dir(destination).map_err(|error| error.to_string())?;
+    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+    let mut files = 0_usize;
+    let mut bytes = 0_u64;
+    while let Some((from, to)) = pending.pop() {
+        for entry in fs::read_dir(&from).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+            if is_reparse(&metadata) {
+                return Err(format!(
+                    "profile contains a link or reparse point: {}",
+                    entry.path().display()
+                ));
+            }
+            let target = to.join(entry.file_name());
+            if metadata.is_dir() {
+                fs::create_dir(&target).map_err(|error| error.to_string())?;
+                pending.push((entry.path(), target));
+            } else if metadata.is_file() {
+                files += 1;
+                bytes = bytes
+                    .checked_add(metadata.len())
+                    .filter(|total| *total <= MAX_PROFILE_STAGE_BYTES)
+                    .ok_or("profile exceeds the staging byte limit")?;
+                if files > MAX_PROFILE_STAGE_FILES {
+                    return Err("profile contains too many files".into());
+                }
+                let mut input = File::open(entry.path()).map_err(|error| error.to_string())?;
+                let mut output = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&target)
+                    .map_err(|error| error.to_string())?;
+                let copied =
+                    io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
+                if copied != metadata.len() {
+                    return Err("profile file changed while it was staged".into());
+                }
+                output.sync_all().map_err(|error| error.to_string())?;
+            } else {
+                return Err("profile contains an unsupported filesystem entry".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+const DISABLED_DOORSTOP: &str = ".perfectsync-winhttp.disabled";
+const APP_LOADER_MARKER: &str = ".perfectsync_loader";
+
+fn copy_snapshot_path(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    if is_reparse(&metadata) {
+        return Err(format!("{} is a link or reparse point", source.display()));
+    }
+    if metadata.is_dir() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        copy_profile_tree(source, destination)
+    } else if metadata.is_file() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut input = File::open(source).map_err(|error| error.to_string())?;
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(destination)
+            .map_err(|error| error.to_string())?;
+        let copied = io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
+        if copied != metadata.len() {
+            return Err(format!(
+                "{} changed while it was snapshotted",
+                source.display()
+            ));
+        }
+        output.sync_all().map_err(|error| error.to_string())
+    } else {
+        Err(format!(
+            "{} is not a regular file or directory",
+            source.display()
+        ))
+    }
+}
+
+fn remove_snapshot_target(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_reparse(&metadata) => Err(format!(
+            "refusing to replace reparse point {}",
+            path.display()
+        )),
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir_all(path).map_err(|error| error.to_string())
+        }
+        Ok(metadata) if metadata.is_file() => {
+            fs::remove_file(path).map_err(|error| error.to_string())
+        }
+        Ok(_) => Err(format!(
+            "{} is an unsupported filesystem entry",
+            path.display()
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn game_artifact_transaction<T>(
+    game_dir: &Path,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let relative_paths = [
+        PathBuf::from("winhttp.dll"),
+        PathBuf::from(DISABLED_DOORSTOP),
+        PathBuf::from("doorstop_config.ini"),
+        PathBuf::from(".doorstop_version"),
+        PathBuf::from("steam_appid.txt"),
+        PathBuf::from("dotnet"),
+        PathBuf::from("BepInEx").join(APP_LOADER_MARKER),
+        PathBuf::from("BepInEx/core"),
+        PathBuf::from("BepInEx/config"),
+        PathBuf::from("BepInEx/interop"),
+        PathBuf::from("BepInEx/cache"),
+        PathBuf::from("BepInEx/plugins"),
+    ];
+    let backup = unique_sibling(game_dir, "prepare-backup")?;
+    fs::create_dir(&backup).map_err(|error| error.to_string())?;
+    let bep_existed = game_dir.join("BepInEx").exists();
+    for relative in &relative_paths {
+        let source = game_dir.join(relative);
+        match fs::symlink_metadata(&source) {
+            Ok(_) => {
+                if let Err(error) = copy_snapshot_path(&source, &backup.join(relative)) {
+                    let _ = fs::remove_dir_all(&backup);
+                    return Err(error);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let _ = fs::remove_dir_all(&backup);
+                return Err(error.to_string());
+            }
+        }
+    }
+    match operation() {
+        Ok(value) => {
+            let _ = fs::remove_dir_all(&backup);
+            Ok(value)
+        }
+        Err(error) => {
+            let mut rollback_errors = Vec::new();
+            for relative in relative_paths.iter().rev() {
+                let target = game_dir.join(relative);
+                if let Err(rollback) = remove_snapshot_target(&target) {
+                    rollback_errors.push(rollback);
+                    continue;
+                }
+                let saved = backup.join(relative);
+                if saved.exists() {
+                    if let Some(parent) = target.parent() {
+                        if let Err(rollback) = fs::create_dir_all(parent) {
+                            rollback_errors.push(rollback.to_string());
+                            continue;
+                        }
+                    }
+                    if let Err(rollback) = fs::rename(&saved, &target) {
+                        rollback_errors.push(rollback.to_string());
+                    }
+                }
+            }
+            if !bep_existed {
+                match fs::remove_dir(game_dir.join("BepInEx")) {
+                    Ok(()) => {}
+                    Err(rollback) if rollback.kind() == io::ErrorKind::NotFound => {}
+                    Err(rollback) => rollback_errors.push(rollback.to_string()),
+                }
+            }
+            if rollback_errors.is_empty() {
+                let _ = fs::remove_dir_all(&backup);
+                Err(error)
+            } else {
+                Err(format!(
+                    "{error}; additionally failed to restore game artifacts: {}. Recovery backup retained at {}",
+                    rollback_errors.join("; "),
+                    backup.display()
+                ))
+            }
+        }
+    }
+}
+
+fn with_profile_layout<T>(
+    profiles_root: &Path,
+    profile_id: &str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    recover_profile_transactions(profiles_root)?;
+    let bep = profiles_root.join(profile_id).join("BepInEx");
+    let plugins = bep.join("plugins");
+    let config = bep.join("config");
+    let bep_existed = bep.exists();
+    let plugins_existed = plugins.exists();
+    let config_existed = config.exists();
+    let outcome = match loader::ensure_profile_layout(profiles_root, profile_id) {
+        Ok(()) => operation(),
+        Err(error) => Err(error.to_string()),
+    };
+    match outcome {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let mut rollback_errors = Vec::new();
+            for (path, existed) in [(&plugins, plugins_existed), (&config, config_existed)] {
+                if !existed {
+                    if let Err(rollback) = fs::remove_dir(path) {
+                        if rollback.kind() != io::ErrorKind::NotFound {
+                            rollback_errors.push(rollback.to_string());
+                        }
+                    }
+                }
+            }
+            if !bep_existed {
+                if let Err(rollback) = fs::remove_dir(&bep) {
+                    if rollback.kind() != io::ErrorKind::NotFound {
+                        rollback_errors.push(rollback.to_string());
+                    }
+                }
+            }
+            if rollback_errors.is_empty() {
+                Err(error)
+            } else {
+                Err(format!(
+                    "{error}; additionally could not remove the newly created profile layout: {}",
+                    rollback_errors.join("; ")
+                ))
+            }
+        }
+    }
+}
+
+fn with_existing_profile_layout<T>(
+    profiles_root: &Path,
+    profile_id: &str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    validate_profile_id(profile_id)?;
+    recovered_profile_store(profiles_root)?
+        .load(profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("profile not found")?;
+    with_profile_layout(profiles_root, profile_id, operation)
+}
+
+fn app_loader_owned(game_dir: &Path) -> Result<bool, String> {
+    let marker = game_dir.join("BepInEx").join(APP_LOADER_MARKER);
+    match fs::symlink_metadata(marker) {
+        Ok(metadata) if !is_reparse(&metadata) && metadata.is_file() => Ok(true),
+        Ok(_) => Err("Perfect-Sync loader ownership marker is not a regular file".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn restore_doorstop(game_dir: &Path) -> Result<(), String> {
+    let disabled = game_dir.join(DISABLED_DOORSTOP);
+    let destination = game_dir.join("winhttp.dll");
+    let metadata = match fs::symlink_metadata(&disabled) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err("disabled Doorstop entry point is not a regular file".into());
+    }
+    if !app_loader_owned(game_dir)? {
+        return Err("disabled Doorstop entry point has no Perfect-Sync ownership marker".into());
+    }
+    if destination.exists() {
+        return Err(
+            "Cannot restore the Perfect-Sync Doorstop entry point because winhttp.dll already exists."
+                .into(),
+        );
+    }
+    fs::rename(disabled, destination).map_err(|error| error.to_string())
+}
+
+fn disable_doorstop(game_dir: &Path) -> Result<bool, String> {
+    let source = game_dir.join("winhttp.dll");
+    let disabled = game_dir.join(DISABLED_DOORSTOP);
+    let owned = app_loader_owned(game_dir)?;
+    if disabled.exists() {
+        if source.exists() {
+            return Err(
+                "Both active and disabled Perfect-Sync Doorstop entry points exist.".into(),
+            );
+        }
+        let metadata = fs::symlink_metadata(&disabled).map_err(|error| error.to_string())?;
+        if is_reparse(&metadata) || !metadata.is_file() {
+            return Err("disabled Doorstop entry point is not a regular file".into());
+        }
+        if !owned {
+            return Err(
+                "disabled Doorstop entry point has no Perfect-Sync ownership marker".into(),
+            );
+        }
+        return Ok(false);
+    }
+    if !owned {
+        return Ok(false);
+    }
+    if !source.exists() {
+        return Ok(false);
+    }
+    let metadata = fs::symlink_metadata(&source).map_err(|error| error.to_string())?;
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err("Perfect-Sync Doorstop entry point is not a regular file".into());
+    }
+    fs::rename(&source, &disabled).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn launch_without_doorstop(
+    game_dir: &Path,
+    launch: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let disabled_here = disable_doorstop(game_dir)?;
+    match fs::symlink_metadata(game_dir.join("winhttp.dll")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err("Cannot launch vanilla while an unowned winhttp.dll remains active.".into())
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    match launch() {
+        Ok(()) => Ok(()),
+        Err(error) if !disabled_here => Err(error),
+        Err(error) => match restore_doorstop(game_dir) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(format!(
+                "{error}; additionally could not restore Doorstop after launch failure: {rollback}"
+            )),
+        },
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProfileRecoveryAction {
+    Publish,
+    Rollback,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileRecoveryJournal {
+    version: u32,
+    profile_id: String,
+    action: ProfileRecoveryAction,
+}
+
+struct ProfileTransactionPaths {
+    stage_root: PathBuf,
+    backup_root: PathBuf,
+    journal: PathBuf,
+}
+
+fn profile_sibling_prefix(root: &Path, label: &str) -> Result<String, String> {
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("profile root has no portable file name")?;
+    Ok(format!(".{name}.{label}."))
+}
+
+fn profile_transaction_paths(root: &Path, suffix: &str) -> Result<ProfileTransactionPaths, String> {
+    let parent = root
+        .parent()
+        .ok_or("profile root has no parent directory")?;
+    Ok(ProfileTransactionPaths {
+        stage_root: parent.join(format!(
+            "{}{suffix}",
+            profile_sibling_prefix(root, "transaction")?
+        )),
+        backup_root: parent.join(format!(
+            "{}{suffix}",
+            profile_sibling_prefix(root, "backup")?
+        )),
+        journal: parent.join(format!(
+            "{}{suffix}",
+            profile_sibling_prefix(root, "recovery")?
+        )),
+    })
+}
+
+fn valid_profile_transaction_suffix(suffix: &str) -> bool {
+    if suffix.is_empty() || suffix.len() > 48 {
+        return false;
+    }
+    let mut parts = suffix.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(process), Some(serial), None)
+            if !process.is_empty()
+                && !serial.is_empty()
+                && process.bytes().all(|byte| byte.is_ascii_digit())
+                && serial.bytes().all(|byte| byte.is_ascii_digit())
+    )
+}
+
+fn allocate_profile_transaction_paths(root: &Path) -> Result<ProfileTransactionPaths, String> {
+    let stage_prefix = profile_sibling_prefix(root, "transaction")?;
+    for _ in 0..128 {
+        let stage_root = unique_sibling(root, "transaction")?;
+        let stage_name = stage_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("transaction path has no portable file name")?;
+        let suffix = stage_name
+            .strip_prefix(&stage_prefix)
+            .ok_or("transaction path has an invalid name")?;
+        let paths = profile_transaction_paths(root, suffix)?;
+        let available = [&paths.backup_root, &paths.journal].iter().all(|path| {
+            matches!(
+                fs::symlink_metadata(path),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            )
+        });
+        if available {
+            return Ok(paths);
+        }
+    }
+    Err("could not allocate profile transaction artifacts".into())
+}
+
+fn write_profile_recovery_journal(
+    path: &Path,
+    profile_id: &str,
+    action: ProfileRecoveryAction,
+) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec(&ProfileRecoveryJournal {
+        version: 1,
+        profile_id: profile_id.to_string(),
+        action,
+    })
+    .map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_PROFILE_RECOVERY_JOURNAL_BYTES {
+        return Err("profile recovery journal exceeds its size limit".into());
+    }
+    atomic_write(path, &bytes)
+}
+
+fn validate_profile_tree(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err("profile recovery artifact is not a regular directory".into());
+    }
+    let mut pending = vec![path.to_path_buf()];
+    let mut files = 0_usize;
+    let mut bytes = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+            if is_reparse(&metadata) {
+                return Err(format!(
+                    "profile recovery artifact contains a link or reparse point: {}",
+                    entry.path().display()
+                ));
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                files += 1;
+                bytes = bytes
+                    .checked_add(metadata.len())
+                    .filter(|total| *total <= MAX_PROFILE_STAGE_BYTES)
+                    .ok_or("profile recovery artifact exceeds the byte limit")?;
+                if files > MAX_PROFILE_STAGE_FILES {
+                    return Err("profile recovery artifact contains too many files".into());
+                }
+            } else {
+                return Err("profile recovery artifact contains an unsupported entry".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovery_profile(container: &Path, id: &str) -> Result<bool, String> {
+    let profile_dir = container.join(id);
+    match fs::symlink_metadata(&profile_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+        Ok(_) => {
+            validate_profile_tree(&profile_dir)?;
+            ProfileStore::new(container)
+                .load(id)
+                .map_err(|error| error.to_string())?
+                .ok_or("profile recovery artifact has no manifest")?;
+            Ok(true)
+        }
+    }
+}
+
+fn validate_recovery_container(container: &Path, id: &str) -> Result<(bool, bool), String> {
+    let metadata = match fs::symlink_metadata(container) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((false, false)),
+        Err(error) => return Err(error.to_string()),
+        Ok(metadata) => metadata,
+    };
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(format!(
+            "{} is not a regular recovery directory",
+            container.display()
+        ));
+    }
+    let mut profile_present = false;
+    for entry in fs::read_dir(container).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.file_name() != std::ffi::OsStr::new(id) || profile_present {
+            return Err(format!(
+                "{} contains ambiguous recovery data",
+                container.display()
+            ));
+        }
+        profile_present = true;
+    }
+    if profile_present {
+        validate_recovery_profile(container, id)?;
+    }
+    Ok((true, profile_present))
+}
+
+fn remove_profile_recovery_artifacts(paths: &ProfileTransactionPaths) -> Result<(), String> {
+    for directory in [&paths.stage_root, &paths.backup_root] {
+        match fs::remove_dir_all(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    fs::remove_file(&paths.journal).map_err(|error| error.to_string())
+}
+
+fn recover_profile_transaction(
+    root: &Path,
+    paths: &ProfileTransactionPaths,
+    journal: &ProfileRecoveryJournal,
+) -> Result<(), String> {
+    for _ in 0..4 {
+        let final_present = validate_recovery_profile(root, &journal.profile_id)?;
+        let (_, stage_present) =
+            validate_recovery_container(&paths.stage_root, &journal.profile_id)?;
+        let (_, backup_present) =
+            validate_recovery_container(&paths.backup_root, &journal.profile_id)?;
+        match journal.action {
+            ProfileRecoveryAction::Publish => {
+                match (final_present, stage_present, backup_present) {
+                    (true, true, true) => {
+                        return Err("both final, staged, and backup profiles exist".into())
+                    }
+                    (true, true, false) => {
+                        fs::rename(
+                            root.join(&journal.profile_id),
+                            paths.backup_root.join(&journal.profile_id),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    (false, true, true) => {
+                        fs::rename(
+                            paths.stage_root.join(&journal.profile_id),
+                            root.join(&journal.profile_id),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    (true, false, true) | (true, false, false) => {
+                        return remove_profile_recovery_artifacts(paths)
+                    }
+                    (false, false, true) => {
+                        fs::rename(
+                            paths.backup_root.join(&journal.profile_id),
+                            root.join(&journal.profile_id),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    _ => return Err("profile recovery artifacts are incomplete".into()),
+                }
+            }
+            ProfileRecoveryAction::Rollback => match (final_present, backup_present) {
+                (false, true) => {
+                    fs::rename(
+                        paths.backup_root.join(&journal.profile_id),
+                        root.join(&journal.profile_id),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                (true, false) => return remove_profile_recovery_artifacts(paths),
+                (true, true) => return Err("both final and rollback profiles exist".into()),
+                (false, false) => {
+                    return Err("rollback profile recovery artifacts are incomplete".into())
+                }
+            },
+        }
+    }
+    Err("profile recovery did not converge".into())
+}
+
+fn recover_profile_transactions(root: &Path) -> Result<(), String> {
+    let parent = root
+        .parent()
+        .ok_or("profile root has no parent directory")?;
+    let prefix = profile_sibling_prefix(root, "recovery")?;
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut journals = Vec::new();
+    let mut parent_entries = 0_usize;
+    for entry in entries {
+        parent_entries += 1;
+        if parent_entries > MAX_PROFILE_RECOVERY_PARENT_ENTRIES {
+            return Err("profile recovery directory contains too many entries".into());
+        }
+        let entry = entry.map_err(|error| error.to_string())?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(&prefix).map(str::to_owned) else {
+            continue;
+        };
+        if !valid_profile_transaction_suffix(&suffix) {
+            return Err(format!(
+                "invalid profile recovery marker {}",
+                entry.path().display()
+            ));
+        }
+        if journals.len() >= MAX_PROFILE_RECOVERY_JOURNALS {
+            return Err("too many pending profile recovery journals".into());
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        if is_reparse(&metadata) || !metadata.is_file() {
+            return Err(format!(
+                "profile recovery marker is not a regular file: {}",
+                entry.path().display()
+            ));
+        }
+        let bytes = read_bounded(&entry.path(), MAX_PROFILE_RECOVERY_JOURNAL_BYTES)?
+            .ok_or("profile recovery marker disappeared")?;
+        let journal: ProfileRecoveryJournal = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid profile recovery marker: {error}"))?;
+        if journal.version != 1 {
+            return Err("unsupported profile recovery journal version".into());
+        }
+        validate_profile_id(&journal.profile_id)?;
+        journals.push((name, profile_transaction_paths(root, &suffix)?, journal));
+    }
+    journals.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut ids = HashSet::new();
+    let mut artifacts = HashSet::new();
+    for (_, paths, journal) in &journals {
+        if !ids.insert(journal.profile_id.to_ascii_lowercase())
+            || !artifacts.insert(paths.stage_root.clone())
+            || !artifacts.insert(paths.backup_root.clone())
+        {
+            return Err("ambiguous profile recovery journals were retained".into());
+        }
+    }
+    for (_, paths, journal) in journals {
+        if let Err(error) = recover_profile_transaction(root, &paths, &journal) {
+            return Err(format!(
+                "could not recover profile {}: {error}; recovery evidence was retained at {}",
+                journal.profile_id,
+                paths.journal.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn failed_profile_commit(
+    backup: &Path,
+    publish_error: &io::Error,
+    rollback: Result<(), String>,
+) -> String {
+    match rollback {
+        Ok(()) => format!("could not commit staged profile: {publish_error}"),
+        Err(rollback_error) => format!(
+            "could not commit staged profile ({publish_error}) or restore the old profile \
+             ({rollback_error}); the intact backup and recovery journal were retained at {}",
+            backup.display()
+        ),
+    }
+}
+
+fn profile_transaction<T>(
+    root: &Path,
+    id: &str,
+    operation: impl FnOnce(&Path, &ProfileStore) -> Result<T, String>,
+) -> Result<T, String> {
+    validate_profile_id(id)?;
+    recover_profile_transactions(root)?;
+    fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let final_dir = root.join(id);
+    let paths = allocate_profile_transaction_paths(root)?;
+    fs::create_dir(&paths.stage_root).map_err(|error| error.to_string())?;
+    let stage_dir = paths.stage_root.join(id);
+    let old_exists = match fs::symlink_metadata(&final_dir) {
+        Ok(metadata) if is_reparse(&metadata) || !metadata.is_dir() => {
+            let _ = fs::remove_dir(&paths.stage_root);
+            return Err("profile is not a regular directory".into());
+        }
+        Ok(_) => match copy_profile_tree(&final_dir, &stage_dir) {
+            Ok(()) => true,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&paths.stage_root);
+                return Err(error);
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Err(error) = fs::create_dir(&stage_dir) {
+                let _ = fs::remove_dir_all(&paths.stage_root);
+                return Err(error.to_string());
+            }
+            false
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&paths.stage_root);
+            return Err(error.to_string());
+        }
+    };
+    let stage_store = ProfileStore::new(&paths.stage_root);
+    if old_exists {
+        match stage_store.load(id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let _ = fs::remove_dir_all(&paths.stage_root);
+                return Err("existing profile has no manifest".into());
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&paths.stage_root);
+                return Err(error.to_string());
+            }
+        }
+    }
+    let value = match operation(&paths.stage_root, &stage_store) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&paths.stage_root);
+            return Err(error);
+        }
+    };
+    if let Err(error) = stage_store
+        .load(id)
+        .map_err(|error| error.to_string())
+        .and_then(|record| record.ok_or("staged profile has no manifest".to_string()))
+    {
+        let _ = fs::remove_dir_all(&paths.stage_root);
+        return Err(error);
+    }
+    let backup = paths.backup_root.join(id);
+    if old_exists {
+        fs::create_dir(&paths.backup_root).map_err(|error| {
+            let _ = fs::remove_dir_all(&paths.stage_root);
+            error.to_string()
+        })?;
+        if let Err(error) =
+            write_profile_recovery_journal(&paths.journal, id, ProfileRecoveryAction::Publish)
+        {
+            let _ = fs::remove_dir_all(&paths.stage_root);
+            let _ = fs::remove_dir(&paths.backup_root);
+            return Err(error);
+        }
+        fs::rename(&final_dir, &backup).map_err(|error| {
+            format!(
+                "could not move the old profile into recovery storage ({error}); \
+                 recovery evidence was retained at {}",
+                paths.journal.display()
+            )
+        })?;
+    }
+    if let Err(error) = fs::rename(&stage_dir, &final_dir) {
+        if !old_exists {
+            let _ = fs::remove_dir_all(&paths.stage_root);
+            return Err(format!("could not commit staged profile: {error}"));
+        }
+        if let Err(journal_error) =
+            write_profile_recovery_journal(&paths.journal, id, ProfileRecoveryAction::Rollback)
+        {
+            return Err(format!(
+                "could not commit staged profile ({error}) or record rollback intent \
+                 ({journal_error}); recovery evidence was retained at {}",
+                paths.journal.display()
+            ));
+        }
+        let rollback = fs::rename(&backup, &final_dir).map_err(|rollback| rollback.to_string());
+        if rollback.is_ok() {
+            let _ = remove_profile_recovery_artifacts(&paths);
+        }
+        return Err(failed_profile_commit(&backup, &error, rollback));
+    }
+    if old_exists {
+        remove_profile_recovery_artifacts(&paths)
+            .map_err(|error| format!("profile committed but recovery cleanup failed: {error}"))?;
+    } else {
+        let _ = fs::remove_dir(&paths.stage_root);
+    }
+    Ok(value)
+}
+
+fn delete_profile_transaction(root: &Path, id: &str) -> Result<(), String> {
+    validate_profile_id(id)?;
+    recover_profile_transactions(root)?;
+    let final_dir = root.join(id);
+    let metadata = match fs::symlink_metadata(&final_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err("profile is not a regular directory".into());
+    }
+    let trash_root = unique_sibling(root, "deleted")?;
+    fs::create_dir(&trash_root).map_err(|error| error.to_string())?;
+    let trash = trash_root.join(id);
+    if let Err(error) = fs::rename(&final_dir, &trash) {
+        let _ = fs::remove_dir(&trash_root);
+        return Err(error.to_string());
+    }
+    let _ = fs::remove_dir_all(&trash_root);
+    Ok(())
+}
+
+fn legacy_cached_catalog_text() -> Result<Option<String>, String> {
+    let Some(bytes) = read_bounded(&settings::catalog_cache_path(), MAX_CATALOG_BYTES)? else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| format!("invalid catalog UTF-8: {error}"))
+}
+
+fn legacy_catalog() -> Result<Catalog, String> {
+    match legacy_cached_catalog_text()? {
+        Some(text) => parse(&text).map_err(|error| format!("invalid cached catalog: {error}")),
+        None => Ok(bundled_catalog()),
+    }
+}
+
+fn validate_persisted_catalog(catalog: Catalog) -> Result<Catalog, String> {
+    let encoded = serde_json::to_string(&catalog).map_err(|error| error.to_string())?;
+    parse(&encoded).map_err(|error| format!("invalid persisted hosted catalog: {error}"))
+}
+
+fn catalog() -> Result<Catalog, String> {
+    if let Some(bytes) = read_bounded(&settings::user_catalog_path(), MAX_CATALOG_ENVELOPE_BYTES)? {
+        if let Ok(envelope) = serde_json::from_slice::<CatalogEnvelope>(&bytes) {
+            if let Some(hosted) = envelope.hosted_catalog {
+                return validate_persisted_catalog(hosted);
+            }
+        }
+    }
+    legacy_catalog()
 }
 
 /// The catalog compiled into this build (always current with the app). Used for
@@ -48,12 +1083,21 @@ fn bundled_catalog() -> Catalog {
     parse(BUNDLED_CATALOG).expect("bundled catalog parses")
 }
 
-fn store() -> ProfileStore {
-    ProfileStore::new(settings::profiles_root())
+fn recovered_profile_store(root: &Path) -> Result<ProfileStore, String> {
+    recover_profile_transactions(root)?;
+    Ok(ProfileStore::new(root))
 }
 
-fn http() -> UreqHttp {
-    UreqHttp::new(settings::load().github_token)
+fn store() -> Result<ProfileStore, String> {
+    recovered_profile_store(&settings::profiles_root())
+}
+
+fn http() -> Result<UreqHttp, String> {
+    let token = settings::github_token().map_err(|error| error.to_string())?;
+    let exposed = token
+        .as_ref()
+        .map(|secret| secret.expose_secret().to_owned());
+    Ok(UreqHttp::new(exposed))
 }
 
 fn default_rules() -> AssetRules {
@@ -64,19 +1108,32 @@ fn default_rules() -> AssetRules {
     }
 }
 
-/// The game folder + arch to use: saved settings first, else autodetect. Arch is
-/// read from the real exe when present (correct on any host/runtime).
-fn current_game() -> Option<(String, String)> {
-    let s = settings::load();
-    if let Some(path) = s.game_path {
-        let arch = game::exe_arch(&Path::new(&path).join(process::GAME_EXE))
-            .map(arch_str)
-            .or(s.arch)
-            .unwrap_or_else(|| "x86".to_string());
-        return Some((path, arch));
-    }
-    let g = game::locate_all().into_iter().next()?;
-    Some((g.path.to_string_lossy().into_owned(), arch_str(g.arch)))
+fn saved_game_arch(instance_id: Option<&str>) -> Result<String, String> {
+    let saved = settings::load().map_err(|error| error.to_string())?;
+    let instance = match instance_id {
+        Some(id) => saved
+            .game_instances
+            .iter()
+            .find(|instance| instance.id == id)
+            .ok_or("unknown game instance")?,
+        None => saved
+            .game_instances
+            .first()
+            .ok_or("save a game instance before resolving mod assets")?,
+    };
+    let game_dir = canonical_game_path(Path::new(&instance.path))?;
+    game::exe_arch(&game_dir.join(process::GAME_EXE))
+        .map(arch_str)
+        .ok_or("Among Us executable architecture is unsupported".to_string())
+}
+
+fn profile_arch(profile_id: &str) -> Result<String, String> {
+    validate_profile_id(profile_id)?;
+    let record = store()?
+        .load(profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("profile not found")?;
+    saved_game_arch(record.game_instance_id.as_deref())
 }
 
 fn arch_str(a: Arch) -> String {
@@ -87,20 +1144,31 @@ fn arch_str(a: Arch) -> String {
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
+    matches!(
+        (fs::canonicalize(a), fs::canonicalize(b)),
+        (Ok(a), Ok(b)) if a == b
+    )
+}
+
+fn inferred_store(game_dir: &Path) -> Store {
+    let path = game_dir.to_string_lossy().replace('\\', "/").to_lowercase();
+    if path.contains("/steamapps/") {
+        Store::Steam
+    } else if game_dir.join(".egstore").is_dir() || path.contains("/epic games/") {
+        Store::Epic
+    } else {
+        Store::Manual
     }
 }
 
-fn runtime_context(game_dir: &Path) -> compat::RuntimeContext {
-    let saved = settings::load();
+fn runtime_context(game_dir: &Path) -> Result<compat::RuntimeContext, String> {
+    let saved = settings::load().map_err(|error| error.to_string())?;
     let hint = saved
-        .game_path
-        .as_deref()
-        .filter(|path| same_path(Path::new(path), game_dir))
-        .and(saved.runtime);
-    compat::resolve_with_hint(game_dir, hint)
+        .game_instances
+        .iter()
+        .find(|instance| same_path(Path::new(&instance.path), game_dir))
+        .map(|instance| instance.runtime);
+    Ok(compat::resolve_with_hint(game_dir, hint))
 }
 
 fn validate_game_dir(game_dir: &Path) -> Result<(), String> {
@@ -134,6 +1202,67 @@ fn validate_game_dir(game_dir: &Path) -> Result<(), String> {
             probe.display()
         )
     })
+}
+
+fn canonical_game_path(game_dir: &Path) -> Result<PathBuf, String> {
+    if !game_dir.is_dir() {
+        return Err(format!("game folder not found: {}", game_dir.display()));
+    }
+    let canonical = fs::canonicalize(game_dir).map_err(|error| error.to_string())?;
+    let executable = canonical.join(process::GAME_EXE);
+    let metadata = fs::symlink_metadata(&executable).map_err(|_| {
+        format!(
+            "This is not the Among Us folder: {} is missing",
+            executable.display()
+        )
+    })?;
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err("Among Us executable is not a regular file".into());
+    }
+    game::exe_arch(&executable).ok_or("Among Us executable architecture is unsupported")?;
+    Ok(canonical)
+}
+
+fn validate_game_target(game_path: &str, profile_id: Option<&str>) -> Result<PathBuf, String> {
+    let canonical = canonical_game_path(Path::new(game_path))?;
+    let saved = settings::load().map_err(|error| error.to_string())?;
+    if let Some(profile_id) = profile_id {
+        validate_profile_id(profile_id)?;
+        let record = store()?
+            .load(profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("profile not found")?;
+        let instance = match record.game_instance_id {
+            Some(instance_id) => saved
+                .game_instances
+                .iter()
+                .find(|instance| instance.id == instance_id)
+                .ok_or("profile refers to an unknown game instance")?,
+            None => saved
+                .game_instances
+                .first()
+                .ok_or("profile has no saved game instance")?,
+        };
+        if !same_path(Path::new(&instance.path), &canonical) {
+            return Err("game folder does not match the profile's saved instance".into());
+        }
+        return Ok(canonical);
+    }
+    if saved
+        .game_instances
+        .iter()
+        .any(|instance| same_path(Path::new(&instance.path), &canonical))
+    {
+        return Ok(canonical);
+    }
+    if INSPECTED_GAMES
+        .lock()
+        .map_err(|_| "inspected game lock is poisoned")?
+        .contains(&canonical)
+    {
+        return Ok(canonical);
+    }
+    Err("game folder must be saved or explicitly inspected before use".into())
 }
 
 fn configure_runtime_override(ctx: &compat::RuntimeContext) -> Result<(), String> {
@@ -187,7 +1316,7 @@ fn install_resolved(
     resolved: &ResolvedDownload,
     only: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let bytes = http.get_bytes(&resolved.url).map_err(|e| e.to_string())?;
+    let bytes = download_resolved(http, resolved).map_err(|e| e.to_string())?;
     if resolved.asset_name.to_lowercase().ends_with(".dll") {
         profile::install_plugin_bytes(profiles_root, profile_id, &resolved.asset_name, &bytes)
             .map_err(|e| e.to_string())?;
@@ -203,7 +1332,9 @@ fn install_resolved(
 /// Preferred: scrape the latest build from builds.bepinex.dev (always current,
 /// never hardcoded). Fallbacks: BepInEx Among Us pack API, then a fixed url.
 fn resolve_loader(http: &dyn Http, arch: &str) -> Result<(String, String), String> {
-    let loader = bundled_catalog().loader.ok_or("catalog has no loader entry")?;
+    let loader = bundled_catalog()
+        .loader
+        .ok_or("catalog has no loader entry")?;
     if let Some(builds) = &loader.builds_url {
         if let Ok(html) = http.get_text(builds) {
             if let Some(pair) = loader::parse_latest_build(&html, arch) {
@@ -231,92 +1362,282 @@ fn resolve_loader(http: &dyn Http, arch: &str) -> Result<(String, String), Strin
     Err("could not resolve a BepInEx loader source (check your internet)".to_string())
 }
 
+fn resolve_loader_for_ensure(
+    complete_owned_loader: bool,
+    resolve: impl FnOnce() -> Result<(String, String), String>,
+) -> Result<Option<(String, String)>, String> {
+    match resolve() {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(_) if complete_owned_loader => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn download_loader_for_ensure(
+    complete_owned_loader: bool,
+    download: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<Option<Vec<u8>>, String> {
+    match download() {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(_) if complete_owned_loader => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Install the Doorstop/BepInEx loader for a profile (idempotent). Downloads +
 /// caches the GitHub pack once per arch.
-fn ensure_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(), String> {
-    let game_dir = Path::new(game_path);
-    validate_game_dir(game_dir)?;
+fn ensure_loader_impl(game_path: &str, profile_id: &str, _arch: &str) -> Result<(), String> {
+    game_is_stopped()?;
+    let game_dir = validate_game_target(game_path, Some(profile_id))?;
+    restore_doorstop(&game_dir)?;
+    validate_game_dir(&game_dir)?;
     let root = settings::profiles_root();
-    loader::ensure_profile_layout(&root, profile_id).map_err(|e| e.to_string())?;
-    // prefer the real exe bitness over the caller's hint (selects the x86 vs x64 pack)
-    let exe_arch = game::exe_arch(&game_dir.join(process::GAME_EXE)).map(arch_str);
-    let arch = exe_arch.as_deref().unwrap_or(arch);
-    let h = http();
-    let have = loader::has_loader(game_dir);
-    // Resolve the newest build to check freshness. If a working loader is already
-    // present but the network is unreachable, keep it so launching works offline.
-    let (id, url) = match resolve_loader(&h, arch) {
-        Ok(pair) => pair,
-        Err(_) if have => return Ok(()),
-        Err(e) => return Err(e),
+    recovered_profile_store(&root)?
+        .load(profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "profile not found".to_string())?;
+    let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
+        .map(arch_str)
+        .ok_or("Among Us executable architecture is unsupported")?;
+    let http = http()?;
+    let have = loader::has_loader(&game_dir);
+    let Some((id, url)) = resolve_loader_for_ensure(have, || resolve_loader(&http, &arch))? else {
+        return Ok(());
     };
-    // Up to date already? Otherwise reinstall the newer build: an Among Us update
-    // changes the IL2CPP metadata and the old BepInEx build stops loading.
-    if have && !loader::is_outdated(loader::installed_version(game_dir).as_deref(), &id) {
+    if have && !loader::is_outdated(loader::installed_version(&game_dir).as_deref(), &id) {
         return Ok(());
     }
-    // Download + extract into the cache BEFORE removing the installed loader, so a
-    // failed download can't leave the game with a half-removed loader.
-    let cache = settings::cache_dir().join("bepinex").join(&id).join(arch);
-    if loader::locate_pack_root(&cache).is_none() {
-        let bytes = h.get_bytes(&url).map_err(|e| e.to_string())?;
-        loader::extract_all(&bytes, &cache).map_err(|e| e.to_string())?;
-    }
-    let pack_root = loader::locate_pack_root(&cache)
-        .ok_or_else(|| "downloaded BepInEx pack is missing winhttp.dll".to_string())?;
-    // remove any old/foreign loader bits (keep plugins) then install the current build
-    let bep = game_dir.join("BepInEx");
-    let _ = fs::remove_file(game_dir.join("winhttp.dll"));
-    for d in ["core", "interop", "cache"] {
-        let _ = fs::remove_dir_all(bep.join(d));
-    }
-    loader::install_pack(&pack_root, game_dir, &id).map_err(|e| e.to_string())?;
-    Ok(())
+    let cache_root = settings::cache_dir();
+    let cache =
+        loader::loader_cache_dir(&cache_root, &id, &arch).map_err(|error| error.to_string())?;
+    let pack_root = if let Some(root) = loader::locate_pack_root(&cache) {
+        root
+    } else {
+        let Some(bytes) = download_loader_for_ensure(have, || {
+            http.get_bytes(&url).map_err(|error| error.to_string())
+        })?
+        else {
+            return Ok(());
+        };
+        loader::publish_pack_cache(&bytes, &cache).map_err(|error| error.to_string())?
+    };
+    game_is_stopped()?;
+    game_artifact_transaction(&game_dir, || {
+        loader::install_pack(&pack_root, &game_dir, &id).map_err(|error| error.to_string())
+    })
 }
 
-/// Force a clean BepInEx reinstall: wipe the cached pack + the game's loader
-/// (keeping plugins), then reinstall the current pack. Use when the installed
-/// BepInEx is stale (e.g. Cpp2IL metadata version mismatch).
-fn reinstall_loader_impl(game_path: &str, profile_id: &str, arch: &str) -> Result<(), String> {
-    let game = Path::new(game_path);
-    validate_game_dir(game)?;
-    let _ = fs::remove_dir_all(settings::cache_dir().join("bepinex"));
-    let _ = fs::remove_file(game.join("winhttp.dll"));
-    let _ = fs::remove_file(game.join("BepInEx").join(".perfectsync_loader"));
-    let _ = fs::remove_dir_all(game.join("BepInEx").join("core"));
-    let _ = fs::remove_dir_all(game.join("BepInEx").join("interop"));
-    let _ = fs::remove_dir_all(game.join("BepInEx").join("cache"));
-    ensure_loader_impl(game_path, profile_id, arch)
+/// Force a fresh BepInEx download and rollback-safe replacement while keeping
+/// profile plugins and the prior working loader intact on failure.
+fn reinstall_loader_impl(game_path: &str, profile_id: &str, _arch: &str) -> Result<(), String> {
+    game_is_stopped()?;
+    let game_dir = validate_game_target(game_path, Some(profile_id))?;
+    restore_doorstop(&game_dir)?;
+    validate_game_dir(&game_dir)?;
+    let root = settings::profiles_root();
+    recovered_profile_store(&root)?
+        .load(profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "profile not found".to_string())?;
+    let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
+        .map(arch_str)
+        .ok_or("Among Us executable architecture is unsupported")?;
+    let http = http()?;
+    let (version, url) = resolve_loader(&http, &arch)?;
+    let bytes = http.get_bytes(&url).map_err(|error| error.to_string())?;
+    let cache_root = settings::cache_dir();
+    let cache = loader::loader_cache_dir(&cache_root, &version, &arch)
+        .map_err(|error| error.to_string())?;
+    let pack_root =
+        loader::publish_pack_cache(&bytes, &cache).map_err(|error| error.to_string())?;
+    game_is_stopped()?;
+    game_artifact_transaction(&game_dir, || {
+        loader::install_pack(&pack_root, &game_dir, &version).map_err(|error| error.to_string())
+    })
 }
 
-// ---------- settings + detection (fast, stay sync) ----------
+// ---------- settings + detection ----------
 
 #[tauri::command]
-pub fn detect_games() -> Vec<game::GameInstall> {
-    game::locate_all()
+pub async fn detect_games() -> Result<Vec<game::GameInstall>, String> {
+    blocking(|| Ok(game::locate_all())).await
 }
 
 #[tauri::command]
-pub fn get_settings() -> Settings {
-    settings::load()
+pub async fn inspect_game(game_path: String) -> Result<game::GameInstall, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        let canonical = canonical_game_path(Path::new(&game_path))?;
+        validate_game_dir(&canonical)?;
+        let store = inferred_store(&canonical);
+        let arch = game::exe_arch(&canonical.join(process::GAME_EXE))
+            .ok_or("Among Us executable architecture is unsupported")?;
+        let runtime = compat::resolve(&canonical).runtime;
+        INSPECTED_GAMES
+            .lock()
+            .map_err(|_| "inspected game lock is poisoned")?
+            .insert(canonical.clone());
+        Ok(game::GameInstall {
+            path: canonical,
+            store,
+            arch,
+            runtime,
+        })
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn save_settings(mut settings: Settings) -> Result<(), String> {
-    if let Some(path) = settings.game_path.as_deref() {
-        let game_dir = Path::new(path);
-        settings.runtime
-            .get_or_insert_with(|| compat::resolve(game_dir).runtime);
-        if let Some(arch) = game::exe_arch(&game_dir.join(process::GAME_EXE)) {
-            settings.arch = Some(arch_str(arch));
+pub async fn get_settings() -> Result<SettingsView, String> {
+    blocking(|| settings::view().map_err(|error| error.to_string())).await
+}
+
+#[tauri::command]
+pub async fn save_settings(
+    mut settings: Settings,
+    mut token_action: TokenAction,
+) -> Result<SettingsView, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        if let TokenAction::Set { token } = &mut token_action {
+            *token = token.trim().to_string();
+            if token.is_empty() {
+                return Err("GitHub token cannot be blank".into());
+            }
         }
-    }
-    settings::save(&settings).map_err(|e| e.to_string())
+        let previous_settings = settings::load().map_err(|error| error.to_string())?;
+        let mut ids = HashSet::new();
+        let mut paths = Vec::<PathBuf>::new();
+        for instance in &mut settings.game_instances {
+            instance.id = instance.id.trim().to_string();
+            instance.name = instance.name.trim().to_string();
+            instance.path = instance.path.trim().to_string();
+            if instance.id.is_empty() || !ids.insert(instance.id.clone()) {
+                return Err("Every Among Us instance needs a unique id.".to_string());
+            }
+            if instance.name.is_empty() {
+                instance.name = "Among Us".to_string();
+            }
+            let canonical = canonical_game_path(Path::new(&instance.path))?;
+            validate_game_dir(&canonical)?;
+            if paths.iter().any(|path| path == &canonical) {
+                return Err("Every Among Us instance needs a unique folder.".to_string());
+            }
+            instance.path = canonical.to_string_lossy().into_owned();
+            instance.arch = game::exe_arch(&canonical.join(process::GAME_EXE))
+                .ok_or("Among Us executable architecture is unsupported")?;
+            instance.runtime =
+                compat::resolve_with_hint(&canonical, Some(instance.runtime)).runtime;
+            let detected_store = inferred_store(&canonical);
+            if detected_store != Store::Manual {
+                instance.store = detected_store;
+            }
+            paths.push(canonical);
+        }
+        let mut personal_sources = HashSet::new();
+        for personal in &mut settings.personal_mods {
+            personal.repo = resolver::parse_repo(personal.repo.trim())
+                .ok_or("Every personal mod needs a valid GitHub repository.")?;
+            personal.tag = personal.tag.trim().to_string();
+            personal.asset = personal.asset.trim().to_string();
+            personal.name = personal
+                .name
+                .take()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty());
+            if personal.tag.is_empty()
+                || personal.tag.len() > 128
+                || personal.asset.is_empty()
+                || personal.asset.len() > 255
+                || personal.asset.contains('/')
+                || personal.asset.contains('\\')
+                || personal.asset.chars().any(char::is_control)
+            {
+                return Err("Every personal mod needs a valid tag and release asset name.".into());
+            }
+            let identity = format!(
+                "{}\0{}\0{}",
+                personal.repo.to_ascii_lowercase(),
+                personal.tag,
+                personal.asset
+            );
+            if !personal_sources.insert(identity) {
+                return Err("Personal mods cannot contain duplicate release assets.".into());
+            }
+        }
+        for profile in store()?.list().map_err(|error| error.to_string())? {
+            let (replacement, previous) = match profile.game_instance_id.as_deref() {
+                Some(instance_id) => {
+                    let replacement = settings
+                        .game_instances
+                        .iter()
+                        .find(|instance| instance.id == instance_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "Game instance {instance_id} is still used by profile {}. Reassign or delete that profile first.",
+                                profile.name
+                            )
+                        })?;
+                    let previous = previous_settings
+                        .game_instances
+                        .iter()
+                        .find(|instance| instance.id == instance_id);
+                    (Some(replacement), previous)
+                }
+                None if profile.mods.is_empty() => continue,
+                None => (
+                    settings.game_instances.first(),
+                    previous_settings.game_instances.first(),
+                ),
+            };
+            let replacement = replacement.ok_or_else(|| {
+                format!(
+                    "Profile {} uses the default game instance. Save a compatible instance or reassign the profile first.",
+                    profile.name
+                )
+            })?;
+            if !profile.mods.is_empty() {
+                let previous = previous.ok_or_else(|| {
+                    format!(
+                        "Profile {} has resolved mods but its prior game instance is missing. Re-create/re-resolve the profile before changing instances.",
+                        profile.name
+                    )
+                })?;
+                if previous.arch != replacement.arch || previous.store != replacement.store {
+                    return Err(format!(
+                        "Profile {} already contains resolved mods. Keep its game instance on the same architecture and store, or create/re-resolve a profile for the new installation.",
+                        profile.name
+                    ));
+                }
+            }
+        }
+        if let Some(active) = settings.active_profile.take() {
+            let active = active.trim().to_string();
+            validate_profile_id(&active)?;
+            if store()?
+                .load(&active)
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                return Err("Active profile does not exist.".into());
+            }
+            settings.active_profile = Some(active);
+        }
+        settings::apply_transaction(&settings, &token_action).map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn game_running() -> bool {
-    process::is_running()
+pub async fn game_running() -> Result<bool, String> {
+    blocking(|| {
+        if LAUNCH_PENDING.load(Ordering::Acquire) {
+            Ok(true)
+        } else {
+            process::try_is_running().map_err(|error| error.to_string())
+        }
+    })
+    .await
 }
 
 // ---------- catalog ----------
@@ -331,183 +1652,496 @@ pub struct CatalogListItem {
     pub latest: String,
     #[serde(default)]
     pub trust: Trust,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
-fn display_catalog() -> Vec<CatalogListItem> {
-    let mut list = match fs::read_to_string(settings::user_catalog_path())
-        .ok()
-        .and_then(|t| serde_json::from_str::<Vec<CatalogListItem>>(&t).ok())
-    {
-        Some(list) => list,
-        None => {
-            let seeded = seed_display_catalog();
-            let _ = save_display_catalog(&seeded);
-            seeded
-        }
-    };
-    // trust is authoritative from the bundled catalog, not the cache or hosted list
+fn catalog_item(entry: perfect_sync_core::catalog::CatalogEntry) -> CatalogListItem {
+    CatalogListItem {
+        id: entry.id.clone(),
+        name: entry.name,
+        repo: entry.repo.unwrap_or(entry.id),
+        summary: entry.summary,
+        tags: entry.tags,
+        latest: String::new(),
+        trust: Trust::Flagged,
+        extra: HashMap::new(),
+    }
+}
+
+fn apply_authoritative_trust(list: &mut [CatalogListItem]) {
     let bundled = bundled_catalog();
-    for it in &mut list {
-        it.trust = bundled
-            .get(&it.id)
-            .filter(|e| e.repo.as_deref().unwrap_or(&e.id) == it.repo)
-            .map(|e| e.trust)
+    for item in list {
+        item.trust = bundled
+            .get(&item.id)
+            .filter(|entry| entry.repo.as_deref().unwrap_or(&entry.id) == item.repo)
+            .map(|entry| entry.trust)
             .unwrap_or(Trust::Flagged);
     }
-    list
 }
 
-fn seed_display_catalog() -> Vec<CatalogListItem> {
-    catalog()
-        .mods
-        .into_iter()
-        .map(|m| CatalogListItem {
-            id: m.id.clone(),
-            name: m.name,
-            repo: m.repo.unwrap_or(m.id),
-            summary: m.summary,
-            tags: m.tags,
-            latest: String::new(),
-            trust: Trust::Flagged,
-        })
-        .collect()
+#[derive(Serialize, Deserialize)]
+struct CatalogEnvelope {
+    #[serde(default = "catalog_envelope_version")]
+    version: u32,
+    display: Vec<CatalogListItem>,
+    #[serde(default)]
+    hosted_ids: Vec<String>,
+    #[serde(default)]
+    hidden_hosted_ids: Vec<String>,
+    #[serde(default)]
+    hosted_catalog: Option<Catalog>,
 }
 
-fn save_display_catalog(list: &[CatalogListItem]) -> Result<(), String> {
-    fs::create_dir_all(settings::app_data_dir()).map_err(|e| e.to_string())?;
-    let text = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
-    fs::write(settings::user_catalog_path(), text).map_err(|e| e.to_string())
+fn catalog_envelope_version() -> u32 {
+    1
 }
 
-fn ensure_display_catalog(repo: &str, name: &str, summary: String, tags: Vec<ModTag>) {
-    let mut list = display_catalog();
-    if !list.iter().any(|c| c.id == repo) {
-        list.push(CatalogListItem {
-            id: repo.to_string(),
-            name: name.to_string(),
-            repo: repo.to_string(),
-            summary,
-            tags,
-            latest: String::new(),
-            trust: Trust::Flagged,
-        });
-        let _ = save_display_catalog(&list);
+fn validate_catalog_list(list: &mut [CatalogListItem]) -> Result<(), String> {
+    if serde_json::to_vec(list)
+        .map_err(|error| error.to_string())?
+        .len() as u64
+        > MAX_USER_CATALOG_BYTES
+    {
+        return Err("user catalog exceeds its size limit".into());
     }
+    let mut ids = HashSet::new();
+    for item in list.iter() {
+        if item.id.trim().is_empty() || !ids.insert(item.id.to_ascii_lowercase()) {
+            return Err("user catalog contains an invalid or duplicate id".into());
+        }
+        resolver::parse_repo(&item.repo)
+            .ok_or_else(|| format!("user catalog contains invalid repository {}", item.repo))?;
+    }
+    apply_authoritative_trust(list);
+    Ok(())
 }
 
-#[tauri::command]
-pub fn get_catalog() -> Vec<CatalogListItem> {
-    display_catalog()
-}
-
-#[tauri::command]
-pub fn add_catalog_mod(repo: String, name: Option<String>) -> Result<Vec<CatalogListItem>, String> {
-    let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
-    let entry = catalog().get(&repo).cloned();
-    let display_name = name
-        .or_else(|| entry.as_ref().map(|e| e.name.clone()))
-        .unwrap_or_else(|| repo.clone());
-    let summary = entry.as_ref().map(|e| e.summary.clone()).unwrap_or_default();
-    let tags = entry.map(|e| e.tags).unwrap_or_default();
-    ensure_display_catalog(&repo, &display_name, summary, tags);
-    Ok(display_catalog())
-}
-
-#[tauri::command]
-pub fn remove_catalog_mod(id: String) -> Result<Vec<CatalogListItem>, String> {
-    let mut list = display_catalog();
-    list.retain(|c| c.id != id);
-    save_display_catalog(&list)?;
-    Ok(list)
-}
-
-#[tauri::command]
-pub fn reorder_catalog(ids: Vec<String>) -> Result<Vec<CatalogListItem>, String> {
-    let current = display_catalog();
-    let mut out: Vec<CatalogListItem> = ids
-        .iter()
-        .filter_map(|id| current.iter().find(|c| &c.id == id).cloned())
-        .collect();
-    for c in &current {
-        if !out.iter().any(|r| r.id == c.id) {
-            out.push(c.clone());
+fn load_catalog_state() -> Result<CatalogEnvelope, String> {
+    let path = settings::user_catalog_path();
+    let stored = read_bounded(&path, MAX_CATALOG_ENVELOPE_BYTES)?;
+    if let Some(bytes) = stored.as_deref() {
+        if let Ok(mut envelope) = serde_json::from_slice::<CatalogEnvelope>(bytes) {
+            if envelope.version != catalog_envelope_version() {
+                return Err("unsupported user catalog envelope version".into());
+            }
+            validate_catalog_list(&mut envelope.display)?;
+            if let Some(hosted) = envelope.hosted_catalog.take() {
+                envelope.hosted_catalog = Some(validate_persisted_catalog(hosted)?);
+            }
+            return Ok(envelope);
         }
     }
-    save_display_catalog(&out)?;
-    Ok(out)
+    let legacy = legacy_catalog()?;
+    let legacy_ids: Vec<String> = legacy.mods.iter().map(|entry| entry.id.clone()).collect();
+    let display = match stored {
+        Some(bytes) => serde_json::from_slice::<Vec<CatalogListItem>>(&bytes)
+            .map_err(|error| format!("invalid user catalog: {error}"))?,
+        None => legacy.mods.iter().cloned().map(catalog_item).collect(),
+    };
+    let mut state = CatalogEnvelope {
+        version: catalog_envelope_version(),
+        display,
+        hosted_ids: legacy_ids,
+        hidden_hosted_ids: Vec::new(),
+        hosted_catalog: Some(legacy),
+    };
+    validate_catalog_list(&mut state.display)?;
+    Ok(state)
+}
+
+fn display_catalog() -> Result<Vec<CatalogListItem>, String> {
+    Ok(load_catalog_state()?.display)
+}
+
+fn serialized_catalog_state(state: &CatalogEnvelope) -> Result<Vec<u8>, String> {
+    let mut bytes = serde_json::to_vec(state).map_err(|error| error.to_string())?;
+    if serde_json::to_vec(&state.display)
+        .map_err(|error| error.to_string())?
+        .len() as u64
+        > MAX_USER_CATALOG_BYTES
+    {
+        return Err("user catalog exceeds its size limit".into());
+    }
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_CATALOG_ENVELOPE_BYTES {
+        return Err("catalog persistence envelope exceeds its size limit".into());
+    }
+    Ok(bytes)
+}
+
+fn save_catalog_state(state: &CatalogEnvelope) -> Result<(), String> {
+    atomic_write(
+        &settings::user_catalog_path(),
+        &serialized_catalog_state(state)?,
+    )
+}
+
+fn ensure_display_catalog_state(
+    state: &mut CatalogEnvelope,
+    requested_repo: &str,
+    canonical_id: &str,
+    effective_repo: &str,
+    name: &str,
+    summary: String,
+    tags: Vec<ModTag>,
+) {
+    state
+        .hidden_hosted_ids
+        .retain(|hidden| !hidden.eq_ignore_ascii_case(canonical_id));
+    let mut canonical = None;
+    state.display.retain(|item| {
+        if item.id.eq_ignore_ascii_case(canonical_id) {
+            if canonical.is_none() {
+                canonical = Some(item.clone());
+            }
+            return false;
+        }
+        !item.id.eq_ignore_ascii_case(requested_repo)
+            && !item.repo.eq_ignore_ascii_case(effective_repo)
+    });
+    let mut item = canonical.unwrap_or_else(|| CatalogListItem {
+        id: canonical_id.to_string(),
+        name: name.to_string(),
+        repo: effective_repo.to_string(),
+        summary,
+        tags,
+        latest: String::new(),
+        trust: Trust::Flagged,
+        extra: HashMap::new(),
+    });
+    item.id = canonical_id.to_string();
+    item.repo = effective_repo.to_string();
+    state.display.push(item);
+}
+
+fn ensure_display_catalog(
+    requested_repo: &str,
+    canonical_id: &str,
+    effective_repo: &str,
+    name: &str,
+    summary: String,
+    tags: Vec<ModTag>,
+) -> Result<(), String> {
+    let mut state = load_catalog_state()?;
+    ensure_display_catalog_state(
+        &mut state,
+        requested_repo,
+        canonical_id,
+        effective_repo,
+        name,
+        summary,
+        tags,
+    );
+    save_catalog_state(&state)
+}
+
+fn reconcile_hosted(mut state: CatalogEnvelope, hosted: &Catalog) -> CatalogEnvelope {
+    let old_hosted: HashSet<String> = state
+        .hosted_ids
+        .iter()
+        .map(|id| id.to_ascii_lowercase())
+        .collect();
+    let new_hosted: HashMap<String, _> = hosted
+        .mods
+        .iter()
+        .map(|entry| (entry.id.to_ascii_lowercase(), entry))
+        .collect();
+    state
+        .hidden_hosted_ids
+        .retain(|id| new_hosted.contains_key(&id.to_ascii_lowercase()));
+    let hidden: HashSet<String> = state
+        .hidden_hosted_ids
+        .iter()
+        .map(|id| id.to_ascii_lowercase())
+        .collect();
+    let mut seen = HashSet::new();
+    let mut output = Vec::with_capacity(state.display.len() + hosted.mods.len());
+    for mut current in state.display {
+        let folded = current.id.to_ascii_lowercase();
+        if let Some(entry) = new_hosted.get(&folded) {
+            seen.insert(folded.clone());
+            if hidden.contains(&folded) {
+                continue;
+            }
+            let mut replacement = catalog_item((*entry).clone());
+            replacement.latest = std::mem::take(&mut current.latest);
+            replacement.extra = std::mem::take(&mut current.extra);
+            output.push(replacement);
+        } else if !old_hosted.contains(&folded) {
+            seen.insert(folded);
+            output.push(current);
+        }
+    }
+    for entry in &hosted.mods {
+        let folded = entry.id.to_ascii_lowercase();
+        if seen.insert(folded.clone()) && !hidden.contains(&folded) {
+            output.push(catalog_item(entry.clone()));
+        }
+    }
+    apply_authoritative_trust(&mut output);
+    state.display = output;
+    state.hosted_ids = hosted.mods.iter().map(|entry| entry.id.clone()).collect();
+    state.hosted_catalog = Some(hosted.clone());
+    state
+}
+
+#[tauri::command]
+pub async fn get_catalog() -> Result<Vec<CatalogListItem>, String> {
+    blocking(|| {
+        let _guard = lock_mutations()?;
+        display_catalog()
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn add_catalog_mod(
+    repo: String,
+    name: Option<String>,
+) -> Result<Vec<CatalogListItem>, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
+        let catalog = catalog()?;
+        let entry = catalog_entry_for(&catalog, &repo).cloned();
+        let canonical_id = entry
+            .as_ref()
+            .map(|entry| entry.id.clone())
+            .unwrap_or_else(|| repo.clone());
+        let effective_repo = entry
+            .as_ref()
+            .map(|entry| entry.repo.clone().unwrap_or_else(|| entry.id.clone()))
+            .unwrap_or_else(|| repo.clone());
+        let display_name = name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .or_else(|| entry.as_ref().map(|entry| entry.name.clone()))
+            .unwrap_or_else(|| repo.clone());
+        let summary = entry
+            .as_ref()
+            .map(|entry| entry.summary.clone())
+            .unwrap_or_default();
+        let tags = entry
+            .as_ref()
+            .map(|entry| entry.tags.clone())
+            .unwrap_or_default();
+        ensure_display_catalog(
+            &repo,
+            &canonical_id,
+            &effective_repo,
+            &display_name,
+            summary,
+            tags,
+        )?;
+        display_catalog()
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn remove_catalog_mod(id: String) -> Result<Vec<CatalogListItem>, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        let mut state = load_catalog_state()?;
+        state
+            .display
+            .retain(|item| !item.id.eq_ignore_ascii_case(&id));
+        if state
+            .hosted_ids
+            .iter()
+            .any(|hosted| hosted.eq_ignore_ascii_case(&id))
+            && !state
+                .hidden_hosted_ids
+                .iter()
+                .any(|hidden| hidden.eq_ignore_ascii_case(&id))
+        {
+            state.hidden_hosted_ids.push(id);
+        }
+        save_catalog_state(&state)?;
+        Ok(state.display)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn reorder_catalog(ids: Vec<String>) -> Result<Vec<CatalogListItem>, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        let mut state = load_catalog_state()?;
+        let current = &state.display;
+        let mut seen = HashSet::new();
+        let mut output = Vec::with_capacity(current.len());
+        for id in ids {
+            if !seen.insert(id.to_ascii_lowercase()) {
+                return Err("catalog order contains duplicate ids".into());
+            }
+            let item = current
+                .iter()
+                .find(|item| item.id == id)
+                .ok_or_else(|| format!("unknown catalog id {id}"))?;
+            output.push(item.clone());
+        }
+        for item in current {
+            if seen.insert(item.id.to_ascii_lowercase()) {
+                output.push(item.clone());
+            }
+        }
+        state.display = output;
+        save_catalog_state(&state)?;
+        Ok(state.display)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn refresh_catalog() -> Result<usize, String> {
     blocking(|| {
-        let url = settings::load()
-            .catalog_url
-            .unwrap_or_else(|| DEFAULT_CATALOG_URL.to_string());
-        let text = http().get_text(&url).map_err(|e| e.to_string())?;
-        let cat = parse(&text).map_err(|e| format!("invalid catalog: {e}"))?;
-        fs::create_dir_all(settings::app_data_dir()).map_err(|e| e.to_string())?;
-        fs::write(settings::catalog_cache_path(), &text).map_err(|e| e.to_string())?;
-        Ok(cat.mods.len())
+        let _guard = lock_mutations()?;
+        let text = http()?
+            .get_text(DEFAULT_CATALOG_URL)
+            .map_err(|error| error.to_string())?;
+        if text.len() as u64 > MAX_CATALOG_BYTES {
+            return Err("hosted catalog exceeds its size limit".into());
+        }
+        let hosted = parse(&text).map_err(|error| format!("invalid catalog: {error}"))?;
+        let state = reconcile_hosted(load_catalog_state()?, &hosted);
+        save_catalog_state(&state)
+            .map_err(|error| format!("could not publish hosted catalog: {error}"))?;
+        Ok(hosted.mods.len())
     })
     .await
 }
 
-// ---------- profiles (fast) ----------
+// ---------- profiles ----------
 
 #[tauri::command]
-pub fn list_profiles() -> Vec<ProfileRecord> {
-    let store = store();
-    let root = settings::profiles_root();
-    let mut profiles = store.list();
-    for rec in &mut profiles {
-        let stale: Vec<String> = rec
-            .mods
-            .iter()
-            .filter(|m| m.managed && m.asset.is_none())
-            .filter_map(|m| m.file.clone())
-            .collect();
-        let before = rec.mods.len();
-        rec.mods.retain(|m| !(m.managed && m.asset.is_none()));
-        if rec.mods.len() != before {
-            for f in &stale {
-                let _ = profile::remove_plugin(&root, &rec.id, f);
-            }
-            let _ = store.save(rec);
+pub async fn list_profiles() -> Result<Vec<ProfileRecord>, String> {
+    blocking(|| {
+        let _guard = lock_mutations()?;
+        store()?.list().map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn save_profile(mut profile: ProfileRecord) -> Result<ProfileRecord, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        validate_profile_id(&profile.id)?;
+        profile.name = profile.name.trim().to_string();
+        profile.crew_color = profile.crew_color.trim().to_string();
+        if profile.name.is_empty() || profile.crew_color.is_empty() {
+            return Err("profile name and crew color are required".into());
         }
-    }
-    profiles
+        let saved = settings::load().map_err(|error| error.to_string())?;
+        let proposed_instance = match profile.game_instance_id.as_deref() {
+            Some(instance_id) => Some(
+                saved
+                    .game_instances
+                    .iter()
+                    .find(|instance| instance.id == instance_id)
+                    .ok_or("profile refers to an unknown game instance")?,
+            ),
+            None => saved.game_instances.first(),
+        };
+        if let Some(existing) = store()?
+            .load(&profile.id)
+            .map_err(|error| error.to_string())?
+        {
+            if !existing.mods.is_empty() {
+                let proposed_instance = proposed_instance.ok_or(
+                    "This populated profile needs a saved compatible Among Us instance before it can be changed.",
+                )?;
+                let existing_instance = match existing.game_instance_id.as_deref() {
+                    Some(instance_id) => saved
+                        .game_instances
+                        .iter()
+                        .find(|instance| instance.id == instance_id),
+                    None => saved.game_instances.first(),
+                };
+                let existing_instance = existing_instance.ok_or(
+                    "The populated profile's prior game instance is missing, so its asset architecture cannot be verified. Create a new profile and re-resolve its mods.",
+                )?;
+                if existing_instance.arch != proposed_instance.arch
+                    || existing_instance.store != proposed_instance.store
+                {
+                    return Err(
+                        "This profile already contains architecture/store-specific assets. Keep it on a compatible Among Us instance, or create a new profile and re-resolve its mods."
+                            .into(),
+                    );
+                }
+            }
+            profile.game_build = existing.game_build;
+            profile.mods = existing.mods;
+        } else if !profile.mods.is_empty() {
+            return Err("new profiles cannot contain backend-owned mods".into());
+        }
+        store()?.save(&profile).map_err(|error| error.to_string())?;
+        Ok(profile)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn save_profile(profile: ProfileRecord) -> Result<(), String> {
-    store().save(&profile).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn delete_profile(id: String) -> Result<(), String> {
-    store().delete(&id).map_err(|e| e.to_string())
+pub async fn delete_profile(id: String) -> Result<(), String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        validate_profile_id(&id)?;
+        let mut saved = settings::load().map_err(|error| error.to_string())?;
+        let original = saved.clone();
+        let clears_active = saved
+            .active_profile
+            .as_deref()
+            .is_some_and(|active| active == id.as_str());
+        if clears_active {
+            saved.active_profile = None;
+            settings::save(&saved).map_err(|error| error.to_string())?;
+        }
+        if let Err(error) = delete_profile_transaction(&settings::profiles_root(), &id) {
+            if clears_active {
+                return match settings::save(&original) {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(format!(
+                        "{error}; additionally could not restore the active-profile setting: {rollback}"
+                    )),
+                };
+            }
+            return Err(error);
+        }
+        Ok(())
+    })
+    .await
 }
 
 // ---------- lobby codes ----------
 
 #[tauri::command]
-pub fn encode_lobby_code(profile: ProfileRecord) -> String {
-    codec::encode(&profile::to_manifest(&profile))
+pub async fn encode_lobby_code(profile: ProfileRecord) -> Result<String, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        validate_profile_id(&profile.id)?;
+        let authoritative = store()?
+            .load(&profile.id)
+            .map_err(|error| error.to_string())?
+            .ok_or("profile not found")?;
+        codec::encode(&profile::to_manifest(&authoritative)).map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 pub fn preview_code(code: String, installed: Vec<(String, String)>) -> Result<Preview, String> {
-    preview(&code, &bundled_catalog(), &installed).map_err(|e| e.to_string())
+    preview(&code, &bundled_catalog(), &installed).map_err(|error| error.to_string())
 }
 
 // ---------- release/file picker ----------
 
-/// List a repo's recent releases (tags + asset files) for manual selection.
 #[tauri::command]
 pub async fn list_releases(repo: String) -> Result<Vec<Release>, String> {
     blocking(move || {
         let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
-        resolver::fetch_releases(&http(), &repo, 20).map_err(|e| e.to_string())
+        resolver::fetch_releases(&http()?, &repo, 20).map_err(|error| error.to_string())
     })
     .await
 }
@@ -520,8 +2154,439 @@ pub async fn install_asset(
     tag: String,
     asset_name: String,
     arch: String,
+    confirmed: bool,
 ) -> Result<ProfileRecord, String> {
-    blocking(move || install_asset_impl(profile_id, repo, tag, asset_name, arch)).await
+    require_manual_install_confirmation(confirmed)?;
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        install_asset_impl(profile_id, repo, tag, asset_name, arch)
+    })
+    .await
+}
+
+fn require_manual_install_confirmation(confirmed: bool) -> Result<(), String> {
+    if confirmed {
+        Ok(())
+    } else {
+        Err("Confirm the exact repository, release tag, and asset before installing.".into())
+    }
+}
+
+fn catalog_entry_for<'a>(
+    catalog: &'a Catalog,
+    identity: &str,
+) -> Option<&'a perfect_sync_core::catalog::CatalogEntry> {
+    catalog.get(identity).or_else(|| {
+        catalog.mods.iter().find(|entry| {
+            entry
+                .repo
+                .as_deref()
+                .is_some_and(|repo| repo.eq_ignore_ascii_case(identity))
+        })
+    })
+}
+
+fn is_managed_dependency(root_id: &str, candidate_id: &str) -> bool {
+    !root_id.eq_ignore_ascii_case(candidate_id)
+}
+
+fn selected_dependencies(
+    catalog: &Catalog,
+    selected: &[String],
+) -> Result<HashSet<String>, String> {
+    let selected_folded: HashSet<String> =
+        selected.iter().map(|id| id.to_ascii_lowercase()).collect();
+    let mut dependencies = HashSet::new();
+    for root in selected {
+        for candidate in deps::resolve(catalog, std::slice::from_ref(root))
+            .map_err(|error| error.to_string())?
+            .ordered
+        {
+            if !candidate.eq_ignore_ascii_case(root)
+                && selected_folded.contains(&candidate.to_ascii_lowercase())
+            {
+                dependencies.insert(candidate.to_ascii_lowercase());
+            }
+        }
+    }
+    Ok(dependencies)
+}
+
+fn validate_authoritative_dependencies(
+    catalog: &Catalog,
+    explicit_roots: &[String],
+) -> Result<(), String> {
+    let bundled = bundled_catalog();
+    for root in explicit_roots {
+        let resolved = deps::resolve(catalog, std::slice::from_ref(root))
+            .map_err(|error| error.to_string())?;
+        for candidate in &resolved.ordered {
+            let is_root = candidate.eq_ignore_ascii_case(root);
+            let hosted = catalog
+                .get(candidate)
+                .ok_or_else(|| format!("catalog dependency {candidate} is missing"))?;
+            let Some(authoritative) = bundled.get(&hosted.id) else {
+                if is_root {
+                    // A custom explicit root was already manually confirmed by the user.
+                    continue;
+                }
+                return Err(format!(
+                    "Catalog dependency {} is not authorized by the bundled catalog.",
+                    hosted.id
+                ));
+            };
+            let hosted_repo = hosted.repo.as_deref().unwrap_or(&hosted.id);
+            let authoritative_repo = authoritative.repo.as_deref().unwrap_or(&authoritative.id);
+            if !hosted_repo.eq_ignore_ascii_case(authoritative_repo) {
+                let role = if is_root { "root" } else { "dependency" };
+                return Err(format!(
+                    "Catalog {role} {} does not match its bundled authoritative identity.",
+                    hosted.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn explicit_catalog_roots(record: &ProfileRecord, catalog: &Catalog) -> Vec<String> {
+    record
+        .mods
+        .iter()
+        .filter(|installed| !installed.managed)
+        .filter_map(|installed| {
+            catalog_entry_for(catalog, &installed.package_id).map(|entry| entry.id.clone())
+        })
+        .collect()
+}
+
+fn required_by_other_explicit_root(
+    record: &ProfileRecord,
+    catalog: &Catalog,
+    package_id: &str,
+) -> Result<bool, String> {
+    for root in explicit_catalog_roots(record, catalog)
+        .into_iter()
+        .filter(|root| !root.eq_ignore_ascii_case(package_id))
+    {
+        if deps::resolve(catalog, std::slice::from_ref(&root))
+            .map_err(|error| error.to_string())?
+            .ordered
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(package_id))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn normalize_dependency_ownership(
+    stage_root: &Path,
+    profile_id: &str,
+    record: &mut ProfileRecord,
+    catalog: &Catalog,
+) -> Result<(), String> {
+    let explicit_roots: Vec<String> = record
+        .mods
+        .iter()
+        .filter(|installed| !installed.managed)
+        .filter_map(|installed| {
+            catalog_entry_for(catalog, &installed.package_id).map(|entry| entry.id.clone())
+        })
+        .collect();
+    let required: HashSet<String> = if explicit_roots.is_empty() {
+        HashSet::new()
+    } else {
+        deps::resolve(catalog, &explicit_roots)
+            .map_err(|error| error.to_string())?
+            .ordered
+            .into_iter()
+            .map(|id| id.to_ascii_lowercase())
+            .collect()
+    };
+    let roots: HashSet<String> = explicit_roots
+        .into_iter()
+        .map(|id| id.to_ascii_lowercase())
+        .collect();
+    let mut retained = Vec::with_capacity(record.mods.len());
+    for mut installed in record.mods.drain(..) {
+        let canonical = catalog_entry_for(catalog, &installed.package_id)
+            .map(|entry| entry.id.to_ascii_lowercase());
+        match canonical {
+            Some(id) if roots.contains(&id) => {
+                installed.managed = false;
+                retained.push(installed);
+            }
+            Some(id) if required.contains(&id) => {
+                installed.managed = true;
+                retained.push(installed);
+            }
+            _ if installed.managed => {
+                if let Some(file) = installed.file.as_deref() {
+                    profile::remove_plugin(stage_root, profile_id, file)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            _ => retained.push(installed),
+        }
+    }
+    record.mods = retained;
+    Ok(())
+}
+
+fn mod_position(record: &ProfileRecord, package_id: &str) -> Result<usize, String> {
+    record
+        .mods
+        .iter()
+        .position(|installed| installed.package_id.eq_ignore_ascii_case(package_id))
+        .ok_or_else(|| "mod not found".to_string())
+}
+
+fn validate_mod_toggle(
+    record: &ProfileRecord,
+    catalog: &Catalog,
+    package_id: &str,
+    enabled: bool,
+) -> Result<usize, String> {
+    let position = mod_position(record, package_id)?;
+    if record.mods[position].managed {
+        return Err("managed dependencies cannot be toggled".into());
+    }
+    if !enabled && required_by_other_explicit_root(record, catalog, package_id)? {
+        return Err("This mod is required by another explicit root and cannot be disabled.".into());
+    }
+    Ok(position)
+}
+
+fn remove_mod_from_record(
+    stage_root: &Path,
+    profile_id: &str,
+    record: &mut ProfileRecord,
+    catalog: &Catalog,
+    package_id: &str,
+) -> Result<(), String> {
+    let position = mod_position(record, package_id)?;
+    if record.mods[position].managed {
+        return Err("managed dependencies cannot be removed directly".into());
+    }
+    if required_by_other_explicit_root(record, catalog, package_id)? {
+        if let Some(file) = record.mods[position].file.as_deref() {
+            profile::set_plugin_enabled(stage_root, profile_id, file, true)
+                .map_err(|error| error.to_string())?;
+        }
+        record.mods[position].enabled = true;
+        record.mods[position].managed = true;
+    } else {
+        let removed = record.mods.remove(position);
+        if let Some(file) = removed.file {
+            profile::remove_plugin(stage_root, profile_id, &file)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    normalize_dependency_ownership(stage_root, profile_id, record, catalog)
+}
+
+fn selected_release_asset(
+    http: &dyn Http,
+    repo: &str,
+    tag: &str,
+    asset_name: &str,
+) -> Result<ResolvedDownload, String> {
+    let release =
+        resolver::fetch_release_by_tag(http, repo, tag).map_err(|error| error.to_string())?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or("selected file not found in that release")?;
+    Ok(ResolvedDownload {
+        url: asset.url.clone(),
+        asset_name: asset.name.clone(),
+        version: release.tag.clone(),
+
+        size: asset.size,
+    })
+}
+
+fn enforce_lobby_asset_choice(
+    requested: Option<&str>,
+    default: &ResolvedDownload,
+) -> Result<(), String> {
+    match requested {
+        Some(asset) if asset != default.asset_name => Err(format!(
+            "Lobby requests release asset {asset}, but the catalog selects {} for this game architecture. Refusing to install a different asset.",
+            default.asset_name
+        )),
+        _ => Ok(()),
+    }
+}
+fn staged_plugin_names(stage_root: &Path, profile_id: &str) -> Result<HashSet<String>, String> {
+    let directory = stage_root.join(profile_id).join("BepInEx").join("plugins");
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut names = HashSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        if is_reparse(&metadata) || !metadata.is_file() {
+            return Err("profile plugins contain an unsupported filesystem entry".into());
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "profile plugins contain a non-Unicode filename")?;
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err("profile plugins contain case-colliding filenames".into());
+        }
+    }
+    Ok(names)
+}
+
+struct InstallContext<'a> {
+    stage_root: &'a Path,
+    profile_id: &'a str,
+    http: &'a dyn Http,
+    catalog: &'a Catalog,
+    arch: &'a str,
+}
+
+struct InstallRequest<'a> {
+    package_id: String,
+    name: String,
+    repo: String,
+    tags: Vec<ModTag>,
+    managed: bool,
+    resolved: ResolvedDownload,
+    only: Option<&'a str>,
+}
+
+fn install_record(
+    context: &InstallContext<'_>,
+    record: &mut ProfileRecord,
+    request: InstallRequest<'_>,
+) -> Result<(), String> {
+    let InstallRequest {
+        package_id,
+        name,
+        repo,
+        tags,
+        managed,
+        resolved,
+        only,
+    } = request;
+    let preserve_explicit_root = managed
+        && record.mods.iter().any(|installed| {
+            installed.package_id.eq_ignore_ascii_case(&package_id) && !installed.managed
+        });
+    if let Some(existing) = record
+        .mods
+        .iter()
+        .find(|installed| installed.package_id.eq_ignore_ascii_case(&package_id))
+        .and_then(|installed| installed.file.clone())
+    {
+        profile::remove_plugin(context.stage_root, context.profile_id, &existing)
+            .map_err(|error| error.to_string())?;
+    }
+    let preexisting = staged_plugin_names(context.stage_root, context.profile_id)?;
+    let file = install_resolved(
+        context.stage_root,
+        context.profile_id,
+        context.http,
+        &resolved,
+        only,
+    )?;
+    if let Some(file) = file.as_deref() {
+        let lower = file.to_ascii_lowercase();
+        if preexisting.contains(&lower) || preexisting.contains(&format!("{lower}.disabled")) {
+            return Err(format!(
+                "plugin file {file} would overwrite a file not owned by this package"
+            ));
+        }
+        if record.mods.iter().any(|installed| {
+            !installed.package_id.eq_ignore_ascii_case(&package_id)
+                && installed
+                    .file
+                    .as_deref()
+                    .is_some_and(|owned| owned.eq_ignore_ascii_case(file))
+        }) {
+            return Err(format!(
+                "plugin file {file} is already owned by another installed package"
+            ));
+        }
+    }
+    let previous = record
+        .mods
+        .iter()
+        .position(|installed| installed.package_id.eq_ignore_ascii_case(&package_id));
+    let mut versions = previous
+        .map(|position| record.mods[position].versions.clone())
+        .unwrap_or_default();
+    if !versions.contains(&resolved.version) {
+        versions.insert(0, resolved.version.clone());
+    }
+    let installed = InstalledMod {
+        package_id,
+        name,
+        repo: Some(repo),
+        version: resolved.version.clone(),
+        versions,
+        enabled: true,
+        source: ModSource::Github,
+        tags,
+        managed: managed && !preserve_explicit_root,
+        update: None,
+        file,
+        asset: Some(resolved.asset_name),
+    };
+    if let Some(position) = previous {
+        record.mods[position] = installed;
+    } else {
+        record.mods.push(installed);
+    }
+    Ok(())
+}
+
+fn install_catalog_latest(
+    context: &InstallContext<'_>,
+    record: &mut ProfileRecord,
+    id: &str,
+    managed: bool,
+) -> Result<(), String> {
+    let entry = context
+        .catalog
+        .get(id)
+        .ok_or("catalog dependency is missing")?;
+    if managed
+        && record.mods.iter().any(|installed| {
+            installed.package_id.eq_ignore_ascii_case(&entry.id) && !installed.managed
+        })
+    {
+        return Ok(());
+    }
+    let repo = entry
+        .repo
+        .clone()
+        .or_else(|| resolver::parse_repo(&entry.id))
+        .ok_or_else(|| format!("cannot resolve source for {}", entry.id))?;
+    let resolved = resolver::resolve_latest(context.http, &repo, &entry.asset_rules, context.arch)
+        .map_err(|error| error.to_string())?;
+    install_record(
+        context,
+        record,
+        InstallRequest {
+            package_id: entry.id.clone(),
+            name: entry.name.clone(),
+            repo,
+            tags: entry.tags.clone(),
+            managed,
+            resolved,
+            only: entry.asset_rules.dll_name.as_deref(),
+        },
+    )
 }
 
 fn install_asset_impl(
@@ -531,147 +2596,201 @@ fn install_asset_impl(
     asset_name: String,
     arch: String,
 ) -> Result<ProfileRecord, String> {
-    let root = settings::profiles_root();
-    let store = ProfileStore::new(&root);
-    let mut rec = store.load(&profile_id).ok_or("profile not found")?;
+    validate_profile_id(&profile_id)?;
+    let _ = arch;
+    let arch = profile_arch(&profile_id)?;
     let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
-    let h = http();
-    let rel = resolver::fetch_release_by_tag(&h, &repo, &tag).map_err(|e| e.to_string())?;
-    let asset = rel
-        .assets
-        .iter()
-        .find(|a| a.name == asset_name)
-        .ok_or("selected file not found in that release")?;
-    let resolved = ResolvedDownload {
-        url: asset.url.clone(),
-        asset_name: asset.name.clone(),
-        version: rel.tag.clone(),
-        size: asset.size,
+    let catalog = catalog()?;
+    let root_entry = catalog_entry_for(&catalog, &repo).cloned();
+    let ordered = match root_entry.as_ref() {
+        Some(entry) => {
+            deps::resolve(&catalog, std::slice::from_ref(&entry.id))
+                .map_err(|error| error.to_string())?
+                .ordered
+        }
+        None => Vec::new(),
     };
-    let cat = catalog();
-    let entry = cat.get(&repo);
-    let file = install_resolved(&root, &profile_id, &h, &resolved, entry.and_then(|e| e.asset_rules.dll_name.as_deref()))?;
-
-    if let Some(pos) = rec.mods.iter().position(|m| m.package_id == repo) {
-        if let Some(old) = rec.mods[pos].file.clone() {
-            if Some(&old) != file.as_ref() {
-                let _ = profile::remove_plugin(&root, &profile_id, &old);
+    let root = settings::profiles_root();
+    profile_transaction(&root, &profile_id, |stage_root, stage_store| {
+        let mut record = stage_store
+            .load(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("profile not found")?;
+        let mut explicit_roots = explicit_catalog_roots(&record, &catalog);
+        if let Some(entry) = root_entry.as_ref() {
+            if !explicit_roots
+                .iter()
+                .any(|root| root.eq_ignore_ascii_case(&entry.id))
+            {
+                explicit_roots.push(entry.id.clone());
             }
         }
-        rec.mods[pos].version = rel.tag.clone();
-        rec.mods[pos].file = file;
-        rec.mods[pos].asset = Some(resolved.asset_name.clone());
-        if !rec.mods[pos].versions.contains(&rel.tag) {
-            rec.mods[pos].versions.insert(0, rel.tag.clone());
+        validate_authoritative_dependencies(&catalog, &explicit_roots)?;
+        let http = http()?;
+        let install = InstallContext {
+            stage_root,
+            profile_id: &profile_id,
+            http: &http,
+            catalog: &catalog,
+            arch: &arch,
+        };
+        for dependency in ordered.iter().filter(|id| {
+            root_entry
+                .as_ref()
+                .is_none_or(|root| is_managed_dependency(&root.id, id))
+        }) {
+            install_catalog_latest(&install, &mut record, dependency, true)?;
         }
-        rec.mods[pos].update = None;
-    } else {
-        rec.mods.push(InstalledMod {
-            package_id: repo.clone(),
-            name: entry.map(|e| e.name.clone()).unwrap_or_else(|| repo.clone()),
-            repo: Some(repo.clone()),
-            version: rel.tag.clone(),
-            versions: vec![rel.tag.clone()],
-            enabled: true,
-            source: ModSource::Github,
-            tags: entry.map(|e| e.tags.clone()).unwrap_or_default(),
-            managed: false,
-            update: None,
-            file,
-            asset: Some(resolved.asset_name.clone()),
-        });
-    }
-
-    if let Some((gp, _)) = current_game() {
-        let _ = ensure_loader_impl(&gp, &profile_id, &arch);
-    }
-    store.save(&rec).map_err(|e| e.to_string())?;
-    ensure_display_catalog(
-        &repo,
-        entry.map(|e| e.name.as_str()).unwrap_or(repo.as_str()),
-        entry.map(|e| e.summary.clone()).unwrap_or_default(),
-        entry.map(|e| e.tags.clone()).unwrap_or_default(),
-    );
-    Ok(rec)
+        let resolved = selected_release_asset(&http, &repo, &tag, &asset_name)?;
+        install_record(
+            &install,
+            &mut record,
+            InstallRequest {
+                package_id: root_entry
+                    .as_ref()
+                    .map(|entry| entry.id.clone())
+                    .unwrap_or_else(|| repo.clone()),
+                name: root_entry
+                    .as_ref()
+                    .map(|entry| entry.name.clone())
+                    .unwrap_or_else(|| repo.clone()),
+                repo: repo.clone(),
+                tags: root_entry
+                    .as_ref()
+                    .map(|entry| entry.tags.clone())
+                    .unwrap_or_default(),
+                managed: false,
+                resolved,
+                only: root_entry
+                    .as_ref()
+                    .and_then(|entry| entry.asset_rules.dll_name.as_deref()),
+            },
+        )?;
+        normalize_dependency_ownership(stage_root, &profile_id, &mut record, &catalog)?;
+        stage_store
+            .save(&record)
+            .map_err(|error| error.to_string())?;
+        Ok(record)
+    })
 }
 
 // ---------- mod mutations ----------
 
 #[tauri::command]
-pub async fn add_mod(profile_id: String, repo: String, arch: String) -> Result<ProfileRecord, String> {
-    blocking(move || add_mod_impl(profile_id, repo, arch)).await
+pub async fn add_mod(
+    profile_id: String,
+    repo: String,
+    arch: String,
+) -> Result<ProfileRecord, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        add_mod_impl(profile_id, repo, arch)
+    })
+    .await
 }
 
 fn add_mod_impl(profile_id: String, repo: String, arch: String) -> Result<ProfileRecord, String> {
-    let root = settings::profiles_root();
-    let store = ProfileStore::new(&root);
-    let mut rec = store.load(&profile_id).ok_or("profile not found")?;
+    validate_profile_id(&profile_id)?;
+    let _ = arch;
+    let arch = profile_arch(&profile_id)?;
     let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
-    let cat = catalog();
-    let http = http();
-
-    rec.mods.retain(|m| m.package_id != repo);
-    let ordered = vec![repo.clone()];
-    for id in ordered {
-        if rec.mods.iter().any(|m| m.package_id == id) {
-            continue;
+    let catalog = catalog()?;
+    let root_entry = catalog_entry_for(&catalog, &repo).cloned();
+    let ordered = match root_entry.as_ref() {
+        Some(entry) => {
+            deps::resolve(&catalog, std::slice::from_ref(&entry.id))
+                .map_err(|error| error.to_string())?
+                .ordered
         }
-        let entry = cat.get(&id);
-        let id_repo = entry
-            .and_then(|e| e.repo.clone())
-            .or_else(|| resolver::parse_repo(&id))
-            .unwrap_or_else(|| id.clone());
-        let rules = entry.map(|e| e.asset_rules.clone()).unwrap_or_else(default_rules);
-        let tags = entry.map(|e| e.tags.clone()).unwrap_or_default();
-        let name = entry.map(|e| e.name.clone()).unwrap_or_else(|| id.clone());
-        let resolved =
-            resolver::resolve_latest(&http, &id_repo, &rules, &arch).map_err(|e| e.to_string())?;
-        let file = install_resolved(&root, &profile_id, &http, &resolved, rules.dll_name.as_deref())?;
-        let managed = id != repo && tags.iter().any(|t| matches!(t, ModTag::Library | ModTag::Loader));
-        rec.mods.push(InstalledMod {
-            package_id: id,
-            name,
-            repo: Some(id_repo),
-            version: resolved.version.clone(),
-            versions: vec![resolved.version],
-            enabled: true,
-            source: ModSource::Github,
-            tags,
-            managed,
-            update: None,
-            file,
-            asset: Some(resolved.asset_name.clone()),
-        });
-    }
-
-    // auto-install the BepInEx loader using the detected/saved game (best-effort)
-    if let Some((game_path, _)) = current_game() {
-        let _ = ensure_loader_impl(&game_path, &profile_id, &arch);
-    }
-    store.save(&rec).map_err(|e| e.to_string())?;
-    Ok(rec)
+        None => Vec::new(),
+    };
+    let root = settings::profiles_root();
+    profile_transaction(&root, &profile_id, |stage_root, stage_store| {
+        let mut record = stage_store
+            .load(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("profile not found")?;
+        let mut explicit_roots = explicit_catalog_roots(&record, &catalog);
+        if let Some(entry) = root_entry.as_ref() {
+            if !explicit_roots
+                .iter()
+                .any(|root| root.eq_ignore_ascii_case(&entry.id))
+            {
+                explicit_roots.push(entry.id.clone());
+            }
+        }
+        validate_authoritative_dependencies(&catalog, &explicit_roots)?;
+        let http = http()?;
+        let install = InstallContext {
+            stage_root,
+            profile_id: &profile_id,
+            http: &http,
+            catalog: &catalog,
+            arch: &arch,
+        };
+        for id in &ordered {
+            let managed = root_entry
+                .as_ref()
+                .is_some_and(|root| is_managed_dependency(&root.id, id));
+            install_catalog_latest(&install, &mut record, id, managed)?;
+        }
+        if root_entry.is_none() {
+            let rules = default_rules();
+            let resolved = resolver::resolve_latest(&http, &repo, &rules, &arch)
+                .map_err(|error| error.to_string())?;
+            install_record(
+                &install,
+                &mut record,
+                InstallRequest {
+                    package_id: repo.clone(),
+                    name: repo.clone(),
+                    repo: repo.clone(),
+                    tags: Vec::new(),
+                    managed: false,
+                    resolved,
+                    only: None,
+                },
+            )?;
+        }
+        normalize_dependency_ownership(stage_root, &profile_id, &mut record, &catalog)?;
+        stage_store
+            .save(&record)
+            .map_err(|error| error.to_string())?;
+        Ok(record)
+    })
 }
 
 #[tauri::command]
-pub fn set_mod_enabled(
+pub async fn set_mod_enabled(
     profile_id: String,
     package_id: String,
     enabled: bool,
 ) -> Result<ProfileRecord, String> {
-    let root = settings::profiles_root();
-    let store = ProfileStore::new(&root);
-    let mut rec = store.load(&profile_id).ok_or("profile not found")?;
-    let pos = rec
-        .mods
-        .iter()
-        .position(|m| m.package_id == package_id)
-        .ok_or("mod not found")?;
-    rec.mods[pos].enabled = enabled;
-    if let Some(file) = rec.mods[pos].file.clone() {
-        profile::set_plugin_enabled(&root, &profile_id, &file, enabled).map_err(|e| e.to_string())?;
-    }
-    store.save(&rec).map_err(|e| e.to_string())?;
-    Ok(rec)
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        validate_profile_id(&profile_id)?;
+        let root = settings::profiles_root();
+        profile_transaction(&root, &profile_id, |stage_root, stage_store| {
+            let mut record = stage_store
+                .load(&profile_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("profile not found")?;
+            let catalog = catalog()?;
+            let explicit_roots = explicit_catalog_roots(&record, &catalog);
+            validate_authoritative_dependencies(&catalog, &explicit_roots)?;
+            let position = validate_mod_toggle(&record, &catalog, &package_id, enabled)?;
+            if let Some(file) = record.mods[position].file.as_deref() {
+                profile::set_plugin_enabled(stage_root, &profile_id, file, enabled)
+                    .map_err(|error| error.to_string())?;
+            }
+            record.mods[position].enabled = enabled;
+            stage_store
+                .save(&record)
+                .map_err(|error| error.to_string())?;
+            Ok(record)
+        })
+    })
+    .await
 }
 
 #[tauri::command]
@@ -681,7 +2800,11 @@ pub async fn set_mod_version(
     version: String,
     arch: String,
 ) -> Result<ProfileRecord, String> {
-    blocking(move || set_mod_version_impl(profile_id, package_id, version, arch)).await
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        set_mod_version_impl(profile_id, package_id, version, arch)
+    })
+    .await
 }
 
 fn set_mod_version_impl(
@@ -690,185 +2813,342 @@ fn set_mod_version_impl(
     version: String,
     arch: String,
 ) -> Result<ProfileRecord, String> {
+    validate_profile_id(&profile_id)?;
+    let _ = arch;
+    let arch = profile_arch(&profile_id)?;
+    let catalog = catalog()?;
     let root = settings::profiles_root();
-    let store = ProfileStore::new(&root);
-    let mut rec = store.load(&profile_id).ok_or("profile not found")?;
-    let pos = rec
-        .mods
-        .iter()
-        .position(|m| m.package_id == package_id)
-        .ok_or("mod not found")?;
-    let repo = rec.mods[pos]
-        .repo
-        .clone()
-        .and_then(|r| resolver::parse_repo(&r))
-        .or_else(|| resolver::parse_repo(&package_id))
-        .ok_or("cannot resolve source")?;
-    let cat = catalog();
-    let rules = cat
-        .get(&package_id)
-        .or_else(|| cat.get(&repo))
-        .map(|e| e.asset_rules.clone())
-        .unwrap_or_else(default_rules);
-    let http = http();
-    let resolved =
-        resolver::resolve_tag(&http, &repo, &version, &rules, &arch).map_err(|e| e.to_string())?;
-    if let Some(old) = rec.mods[pos].file.clone() {
-        let _ = profile::remove_plugin(&root, &profile_id, &old);
-    }
-    let file = install_resolved(&root, &profile_id, &http, &resolved, rules.dll_name.as_deref())?;
-    rec.mods[pos].version = resolved.version.clone();
-    rec.mods[pos].file = file;
-    rec.mods[pos].asset = Some(resolved.asset_name.clone());
-    if !rec.mods[pos].versions.contains(&resolved.version) {
-        rec.mods[pos].versions.push(resolved.version.clone());
-    }
-    rec.mods[pos].update = None;
-    store.save(&rec).map_err(|e| e.to_string())?;
-    Ok(rec)
+    profile_transaction(&root, &profile_id, |stage_root, stage_store| {
+        let mut record = stage_store
+            .load(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("profile not found")?;
+        let position = record
+            .mods
+            .iter()
+            .position(|installed| installed.package_id == package_id)
+            .ok_or("mod not found")?;
+        let existing = record.mods[position].clone();
+        if existing.managed {
+            return Err(
+                "Managed dependency versions are selected by their root mods. Change the root mod version instead."
+                    .into(),
+            );
+        }
+        let repo = existing
+            .repo
+            .as_deref()
+            .and_then(resolver::parse_repo)
+            .or_else(|| resolver::parse_repo(&package_id))
+            .ok_or("cannot resolve source")?;
+        let rules = catalog_entry_for(&catalog, &package_id)
+            .map(|entry| entry.asset_rules.clone())
+            .unwrap_or_else(default_rules);
+        let http = http()?;
+        let install = InstallContext {
+            stage_root,
+            profile_id: &profile_id,
+            http: &http,
+            catalog: &catalog,
+            arch: &arch,
+        };
+        let resolved = resolver::resolve_tag(&http, &repo, &version, &rules, &arch)
+            .map_err(|error| error.to_string())?;
+        install_record(
+            &install,
+            &mut record,
+            InstallRequest {
+                package_id: existing.package_id,
+                name: existing.name,
+                repo,
+                tags: existing.tags,
+                managed: existing.managed,
+                resolved,
+                only: rules.dll_name.as_deref(),
+            },
+        )?;
+        stage_store
+            .save(&record)
+            .map_err(|error| error.to_string())?;
+        Ok(record)
+    })
 }
 
 #[tauri::command]
-pub fn remove_mod(profile_id: String, package_id: String) -> Result<ProfileRecord, String> {
-    let root = settings::profiles_root();
-    let store = ProfileStore::new(&root);
-    let mut rec = store.load(&profile_id).ok_or("profile not found")?;
-    let pos = rec
-        .mods
-        .iter()
-        .position(|m| m.package_id == package_id)
-        .ok_or("mod not found")?;
-    let removed = rec.mods.remove(pos);
-    if let Some(file) = removed.file {
-        let _ = profile::remove_plugin(&root, &profile_id, &file);
-    }
-    store.save(&rec).map_err(|e| e.to_string())?;
-    Ok(rec)
+pub async fn remove_mod(profile_id: String, package_id: String) -> Result<ProfileRecord, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        validate_profile_id(&profile_id)?;
+        let root = settings::profiles_root();
+        profile_transaction(&root, &profile_id, |stage_root, stage_store| {
+            let mut record = stage_store
+                .load(&profile_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("profile not found")?;
+            let catalog = catalog()?;
+            let explicit_roots = explicit_catalog_roots(&record, &catalog);
+            validate_authoritative_dependencies(&catalog, &explicit_roots)?;
+            remove_mod_from_record(stage_root, &profile_id, &mut record, &catalog, &package_id)?;
+            stage_store
+                .save(&record)
+                .map_err(|error| error.to_string())?;
+            Ok(record)
+        })
+    })
+    .await
 }
 
 #[tauri::command]
-pub async fn apply_lobby_code(code: String, arch: String) -> Result<ProfileRecord, String> {
-    blocking(move || apply_lobby_code_impl(code, arch)).await
-}
-
-/// Stable short hash of a lobby code (FNV-1a), mixed into the imported profile id
-/// so two distinct codes never collide on one id and silently overwrite a profile.
-fn code_hash(code: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in code.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{:08x}", h as u32)
-}
-
-fn apply_lobby_code_impl(code: String, arch: String) -> Result<ProfileRecord, String> {
-    let manifest = codec::decode(&code).map_err(|e| e.to_string())?;
-    let root = settings::profiles_root();
-    let store = ProfileStore::new(&root);
-    let cat = catalog();
-    let http = http();
-
-    let display = manifest.name.clone().unwrap_or_else(|| "Imported lobby".to_string());
-    let slug = display.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "-");
-    let hash = code_hash(&code);
-    let id = if slug.is_empty() { format!("lobby-{hash}") } else { format!("lobby-{slug}-{hash}") };
-
-    let mut mods = Vec::new();
-    for mm in &manifest.mods {
-        let repo = resolver::parse_repo(&mm.id)
-            .ok_or_else(|| format!("cannot resolve source for {}", mm.id))?;
-        let entry = cat.get(&mm.id).or_else(|| cat.get(&repo));
-        let rules = entry.map(|e| e.asset_rules.clone()).unwrap_or_else(default_rules);
-        let tags = entry.map(|e| e.tags.clone()).unwrap_or_default();
-        let name = entry.map(|e| e.name.clone()).unwrap_or_else(|| repo.clone());
-
-        // use the host's exact file if the code pinned one, else auto-pick by rules
-        let resolved = if let Some(asset_name) = &mm.asset {
-            let rel = resolver::fetch_release_by_tag(&http, &repo, &mm.v).map_err(|e| e.to_string())?;
-            let asset = rel
-                .assets
-                .iter()
-                .find(|x| &x.name == asset_name)
-                .ok_or_else(|| format!("file {asset_name} not found in {repo} {}", mm.v))?;
-            ResolvedDownload {
-                url: asset.url.clone(),
-                asset_name: asset.name.clone(),
-                version: rel.tag.clone(),
-                size: asset.size,
+pub async fn check_mod_updates(profile_id: String, arch: String) -> Result<ProfileRecord, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        validate_profile_id(&profile_id)?;
+        let _ = arch;
+        let arch = profile_arch(&profile_id)?;
+        let catalog = catalog()?;
+        let root = settings::profiles_root();
+        profile_transaction(&root, &profile_id, |_stage_root, stage_store| {
+            let mut record = stage_store
+                .load(&profile_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("profile not found")?;
+            let http = http()?;
+            for installed in &mut record.mods {
+                let Some(repo) = installed
+                    .repo
+                    .as_deref()
+                    .and_then(resolver::parse_repo)
+                    .or_else(|| resolver::parse_repo(&installed.package_id))
+                else {
+                    installed.update = None;
+                    continue;
+                };
+                let rules = catalog_entry_for(&catalog, &installed.package_id)
+                    .map(|entry| entry.asset_rules.clone())
+                    .unwrap_or_else(default_rules);
+                let latest = resolver::resolve_latest(&http, &repo, &rules, &arch)
+                    .map_err(|error| error.to_string())?;
+                installed.update =
+                    perfect_sync_core::version::is_newer(&latest.version, &installed.version)
+                        .then_some(latest.version);
             }
-        } else {
-            resolver::resolve_tag(&http, &repo, &mm.v, &rules, &arch).map_err(|e| e.to_string())?
-        };
-        let file = install_resolved(&root, &id, &http, &resolved, rules.dll_name.as_deref())?;
-        let managed = tags.iter().any(|t| matches!(t, ModTag::Library | ModTag::Loader));
-        mods.push(InstalledMod {
-            package_id: mm.id.clone(),
-            name,
-            repo: Some(repo),
-            version: mm.v.clone(),
-            versions: vec![mm.v.clone()],
-            enabled: true,
-            source: ModSource::Github,
-            tags,
-            managed,
-            update: None,
-            file,
-            asset: Some(resolved.asset_name.clone()),
-        });
-    }
+            stage_store
+                .save(&record)
+                .map_err(|error| error.to_string())?;
+            Ok(record)
+        })
+    })
+    .await
+}
 
-    // merge the user's personal "always-include" mods (if not already in the code)
-    for pm in settings::load().personal_mods {
-        if !pm.enabled {
-            continue;
-        }
-        let prepo = resolver::parse_repo(&pm.repo).unwrap_or_else(|| pm.repo.clone());
-        if mods.iter().any(|m| m.package_id == prepo) {
-            continue;
-        }
-        let Ok(rel) = resolver::fetch_release_by_tag(&http, &prepo, &pm.tag) else {
-            continue;
-        };
-        let Some(asset) = rel.assets.iter().find(|a| a.name == pm.asset) else {
-            continue;
-        };
-        let resolved = ResolvedDownload {
-            url: asset.url.clone(),
-            asset_name: asset.name.clone(),
-            version: rel.tag.clone(),
-            size: asset.size,
-        };
-        let file = install_resolved(&root, &id, &http, &resolved, cat.get(&prepo).and_then(|e| e.asset_rules.dll_name.as_deref()))?;
-        let entry = cat.get(&prepo);
-        mods.push(InstalledMod {
-            package_id: prepo.clone(),
-            name: pm.name.clone().or_else(|| entry.map(|e| e.name.clone())).unwrap_or_else(|| prepo.clone()),
-            repo: Some(prepo),
-            version: rel.tag.clone(),
-            versions: vec![rel.tag],
-            enabled: true,
-            source: ModSource::Github,
-            tags: entry.map(|e| e.tags.clone()).unwrap_or_default(),
-            managed: false,
-            update: None,
-            file,
-            asset: Some(resolved.asset_name.clone()),
-        });
-    }
+#[tauri::command]
+pub async fn apply_lobby_code(
+    code: String,
+    arch: String,
+    game_instance_id: Option<String>,
+) -> Result<ProfileRecord, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        apply_lobby_code_impl(code, arch, game_instance_id)
+    })
+    .await
+}
 
-    let record = ProfileRecord {
-        id: id.clone(),
-        name: display.clone(),
-        crew_color: "#ffd23f".to_string(),
-        game_build: manifest.game_build.clone(),
-        mods,
+fn lobby_digest(code: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(code.as_bytes());
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn apply_lobby_code_impl(
+    code: String,
+    arch: String,
+    game_instance_id: Option<String>,
+) -> Result<ProfileRecord, String> {
+    let manifest = codec::decode(&code).map_err(|error| error.to_string())?;
+    let settings = settings::load().map_err(|error| error.to_string())?;
+    if let Some(instance_id) = game_instance_id.as_deref() {
+        if !settings
+            .game_instances
+            .iter()
+            .any(|instance| instance.id == instance_id)
+        {
+            return Err("lobby profile refers to an unknown game instance".into());
+        }
+    }
+    let _ = arch;
+    let arch = saved_game_arch(game_instance_id.as_deref())?;
+    let display = manifest
+        .name
+        .clone()
+        .unwrap_or_else(|| "Imported lobby".to_string());
+    let slug: String = display
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(16)
+        .collect();
+    let digest = lobby_digest(&code);
+    let slug = slug.trim_matches('-');
+    let id = if slug.is_empty() {
+        format!("lobby-{}", &digest[..40])
+    } else {
+        format!("lobby-{slug}-{}", &digest[..40])
     };
-    store.save(&record).map_err(|e| e.to_string())?;
-    if let Some((game_path, _)) = current_game() {
-        let _ = ensure_loader_impl(&game_path, &id, &arch);
-    }
-    Ok(record)
+    validate_profile_id(&id)?;
+    let catalog = catalog()?;
+    let selected: Vec<String> = manifest
+        .mods
+        .iter()
+        .filter_map(|manifest_mod| {
+            catalog_entry_for(&catalog, &manifest_mod.id).map(|entry| entry.id.clone())
+        })
+        .collect();
+    validate_authoritative_dependencies(&catalog, &selected)?;
+    let included_dependencies = selected_dependencies(&catalog, &selected)?;
+    let ordered = if selected.is_empty() {
+        Vec::new()
+    } else {
+        deps::resolve(&catalog, &selected)
+            .map_err(|error| error.to_string())?
+            .ordered
+    };
+    let root = settings::profiles_root();
+    profile_transaction(&root, &id, |stage_root, stage_store| {
+        let marker = stage_store
+            .profile_dir(&id)
+            .map_err(|error| error.to_string())?
+            .join(".perfectsync-lobby-source");
+        let existing_record = stage_store.load(&id).map_err(|error| error.to_string())?;
+        match (existing_record.is_some(), read_bounded(&marker, 128)?) {
+            (_, Some(existing)) if existing != digest.as_bytes() => {
+                return Err("lobby profile id belongs to a different lobby source".into());
+            }
+            (true, None) => {
+                return Err("refusing to overwrite a profile with unknown lobby source".into());
+            }
+            _ => {}
+        }
+        let mut record = existing_record.unwrap_or(ProfileRecord {
+            id: id.clone(),
+            name: display.clone(),
+            crew_color: "#ffd23f".to_string(),
+            game_build: manifest.game_build.clone(),
+            game_instance_id: game_instance_id.clone(),
+            mods: Vec::new(),
+        });
+        for old in &record.mods {
+            if let Some(file) = old.file.as_deref() {
+                profile::remove_plugin(stage_root, &id, file).map_err(|error| error.to_string())?;
+            }
+        }
+        record.mods.clear();
+        record.name = display.clone();
+        record.game_build = manifest.game_build.clone();
+        record.game_instance_id = game_instance_id.clone();
+        let http = http()?;
+        let install = InstallContext {
+            stage_root,
+            profile_id: &id,
+            http: &http,
+            catalog: &catalog,
+            arch: &arch,
+        };
+        for dependency in ordered.iter().filter(|id| {
+            !manifest
+                .mods
+                .iter()
+                .any(|manifest_mod| id.eq_ignore_ascii_case(&manifest_mod.id))
+        }) {
+            install_catalog_latest(&install, &mut record, dependency, true)?;
+        }
+        for manifest_mod in &manifest.mods {
+            let repo = catalog_entry_for(&catalog, &manifest_mod.id)
+                .and_then(|entry| entry.repo.clone())
+                .or_else(|| resolver::parse_repo(&manifest_mod.id))
+                .ok_or_else(|| format!("cannot resolve source for {}", manifest_mod.id))?;
+            let entry = catalog_entry_for(&catalog, &manifest_mod.id);
+            let rules = entry
+                .map(|entry| entry.asset_rules.clone())
+                .unwrap_or_else(default_rules);
+            let resolved = resolver::resolve_tag(&http, &repo, &manifest_mod.v, &rules, &arch)
+                .map_err(|error| error.to_string())?;
+            enforce_lobby_asset_choice(manifest_mod.asset.as_deref(), &resolved)?;
+            install_record(
+                &install,
+                &mut record,
+                InstallRequest {
+                    package_id: entry
+                        .map(|entry| entry.id.clone())
+                        .unwrap_or_else(|| manifest_mod.id.clone()),
+                    name: entry
+                        .map(|entry| entry.name.clone())
+                        .unwrap_or_else(|| repo.clone()),
+                    repo,
+                    tags: entry.map(|entry| entry.tags.clone()).unwrap_or_default(),
+                    managed: entry.is_some_and(|entry| {
+                        included_dependencies.contains(&entry.id.to_ascii_lowercase())
+                    }),
+                    resolved,
+                    only: rules.dll_name.as_deref(),
+                },
+            )?;
+        }
+        for personal in settings
+            .personal_mods
+            .iter()
+            .filter(|personal| personal.enabled)
+        {
+            let repo = resolver::parse_repo(&personal.repo)
+                .ok_or_else(|| format!("invalid personal mod source {}", personal.repo))?;
+            if let Some(installed) = record.mods.iter_mut().find(|installed| {
+                installed.package_id.eq_ignore_ascii_case(&repo)
+                    || installed
+                        .repo
+                        .as_deref()
+                        .is_some_and(|source| source.eq_ignore_ascii_case(&repo))
+            }) {
+                installed.managed = false;
+                continue;
+            }
+            let resolved = selected_release_asset(&http, &repo, &personal.tag, &personal.asset)?;
+            let entry = catalog_entry_for(&catalog, &repo);
+            install_record(
+                &install,
+                &mut record,
+                InstallRequest {
+                    package_id: repo.clone(),
+                    name: personal
+                        .name
+                        .clone()
+                        .or_else(|| entry.map(|entry| entry.name.clone()))
+                        .unwrap_or_else(|| repo.clone()),
+                    repo,
+                    tags: entry.map(|entry| entry.tags.clone()).unwrap_or_default(),
+                    managed: false,
+                    resolved,
+                    only: entry.and_then(|entry| entry.asset_rules.dll_name.as_deref()),
+                },
+            )?;
+        }
+        normalize_dependency_ownership(stage_root, &id, &mut record, &catalog)?;
+        stage_store
+            .save(&record)
+            .map_err(|error| error.to_string())?;
+        atomic_write(&marker, digest.as_bytes())?;
+        Ok(record)
+    })
 }
 
 // ---------- loader + launch ----------
@@ -880,8 +3160,14 @@ pub async fn ensure_loader(
     arch: String,
 ) -> Result<Option<String>, String> {
     blocking(move || {
-        ensure_loader_impl(&game_path, &profile_id, &arch)?;
-        Ok(configure_runtime_override(&runtime_context(Path::new(&game_path))).err())
+        let _guard = lock_mutations()?;
+        with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
+            ensure_loader_impl(&game_path, &profile_id, &arch)?;
+            let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
+            let context = runtime_context(&game_dir)?;
+            game_is_stopped()?;
+            Ok(configure_runtime_override(&context).err())
+        })
     })
     .await
 }
@@ -893,8 +3179,14 @@ pub async fn reinstall_loader(
     arch: String,
 ) -> Result<Option<String>, String> {
     blocking(move || {
-        reinstall_loader_impl(&game_path, &profile_id, &arch)?;
-        Ok(configure_runtime_override(&runtime_context(Path::new(&game_path))).err())
+        let _guard = lock_mutations()?;
+        with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
+            reinstall_loader_impl(&game_path, &profile_id, &arch)?;
+            let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
+            let context = runtime_context(&game_dir)?;
+            game_is_stopped()?;
+            Ok(configure_runtime_override(&context).err())
+        })
     })
     .await
 }
@@ -916,215 +3208,319 @@ pub struct LoaderStatus {
 }
 
 #[tauri::command]
-pub fn loader_status(game_path: String, profile_id: String) -> LoaderStatus {
-    let game = Path::new(&game_path);
-    let root = settings::profiles_root();
-    let ctx = runtime_context(game);
-    let count_dll = |dir: std::path::PathBuf| {
-        fs::read_dir(dir)
-            .map(|it| {
-                it.flatten()
-                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("dll"))
-                    .count()
-            })
-            .unwrap_or(0)
-    };
-    let runtime_ready = ctx.runtime == Runtime::Native
-        || ctx.prefix.as_deref().is_some_and(compat::has_winhttp_override);
-    LoaderStatus {
-        game_found: game.is_dir(),
-        winhttp: game.join("winhttp.dll").exists(),
-        preloader: game.join("BepInEx").join("core").join(loader::IL2CPP_PRELOADER).exists(),
-        current: loader::has_loader(game),
-        installed_version: loader::installed_version(game),
-        dotnet: game.join("dotnet").join("coreclr.dll").exists(),
-        steam_appid: game.join("steam_appid.txt").exists(),
-        profile_plugins: count_dll(loader::profile_plugins_dir(&root, &profile_id)),
-        game_plugins: count_dll(game.join("BepInEx").join("plugins")),
-        runtime: ctx.runtime,
-        runtime_ready,
-    }
+pub async fn loader_status(game_path: String, profile_id: String) -> Result<LoaderStatus, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        validate_profile_id(&profile_id)?;
+        let game = validate_game_target(&game_path, Some(&profile_id))?;
+        let root = settings::profiles_root();
+        let store = recovered_profile_store(&root)?;
+        store
+            .load(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "profile not found".to_string())?;
+        let profile_plugins = store
+            .profile_dir(&profile_id)
+            .map_err(|error| error.to_string())?
+            .join("BepInEx")
+            .join("plugins");
+        let count_dll = |directory: PathBuf| -> Result<usize, String> {
+            let entries = match fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+                Err(error) => return Err(error.to_string()),
+            };
+            let mut count = 0;
+            for entry in entries {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let metadata = entry.metadata().map_err(|error| error.to_string())?;
+                if metadata.is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+                {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        };
+        let context = runtime_context(&game)?;
+        let runtime_ready = context.runtime == Runtime::Native
+            || context
+                .prefix
+                .as_deref()
+                .is_some_and(compat::has_winhttp_override);
+        Ok(LoaderStatus {
+            game_found: true,
+            winhttp: game.join("winhttp.dll").is_file(),
+            preloader: game
+                .join("BepInEx")
+                .join("core")
+                .join(loader::IL2CPP_PRELOADER)
+                .is_file(),
+            current: loader::has_loader(&game),
+            installed_version: loader::installed_version(&game),
+            dotnet: game.join("dotnet").join("coreclr.dll").is_file(),
+            steam_appid: game.join("steam_appid.txt").is_file(),
+            profile_plugins: count_dll(profile_plugins)?,
+            game_plugins: count_dll(game.join("BepInEx").join("plugins"))?,
+            runtime: context.runtime,
+            runtime_ready,
+        })
+    })
+    .await
 }
 
 /// A game copy in a location apps can't write (Microsoft Store / Game Pass lives
 /// under the ACL-locked WindowsApps). Returns guidance instead of letting the
 /// install fail later with a raw permission error.
 fn protected_install_hint(game_dir: &Path) -> Option<String> {
-    let p = game_dir.to_string_lossy().replace('\\', "/").to_lowercase();
-    if p.contains("/windowsapps/") || p.ends_with("/windowsapps") {
+    let path = game_dir.to_string_lossy().replace('\\', "/").to_lowercase();
+    if path.contains("/windowsapps/") || path.ends_with("/windowsapps") {
         Some("This Among Us copy is in the protected WindowsApps folder (Microsoft Store / Game Pass), which apps can't modify. Copy the \"Among Us\" folder to a normal location (e.g. your Documents), then point Perfect-Sync at that copy.".to_string())
     } else {
         None
     }
 }
 
-/// Install/verify BepInEx and copy the profile into the selected Among Us
-/// folder without requiring Wine/Proton to be installed or initialized. A
-/// runtime warning is returned separately after all folder changes succeed.
 fn prepare_profile(game_path: &str, profile_id: &str) -> Result<Option<String>, String> {
-    if process::is_running() {
-        return Err("Among Us is running. Close it first.".into());
-    }
-    let game_dir = Path::new(game_path);
+    game_is_stopped()?;
+    let game_dir = validate_game_target(game_path, Some(profile_id))?;
     let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
         .map(arch_str)
-        .or_else(|| settings::load().arch)
-        .unwrap_or_else(|| "x86".to_string());
-    ensure_loader_impl(game_path, profile_id, &arch)?;
-    loader::ensure_steam_appid(game_dir).map_err(|e| e.to_string())?;
-    loader::write_console_off(game_dir).map_err(|e| e.to_string())?;
-    loader::sync_profile_plugins(&settings::profiles_root(), profile_id, game_dir)
-        .map_err(|e| e.to_string())?;
-    Ok(configure_runtime_override(&runtime_context(game_dir)).err())
+        .ok_or("Among Us executable architecture is unsupported")?;
+    with_profile_layout(&settings::profiles_root(), profile_id, || {
+        game_artifact_transaction(&game_dir, || {
+            restore_doorstop(&game_dir)?;
+            game_is_stopped()?;
+            loader::sync_profile_plugins(&settings::profiles_root(), profile_id, &game_dir)
+                .map_err(|error| error.to_string())?;
+            ensure_loader_impl(game_path, profile_id, &arch)?;
+            game_is_stopped()?;
+            loader::ensure_steam_appid(&game_dir).map_err(|error| error.to_string())?;
+            game_is_stopped()?;
+            loader::write_console_off(&game_dir).map_err(|error| error.to_string())?;
+            let context = runtime_context(&game_dir)?;
+            game_is_stopped()?;
+            Ok(configure_runtime_override(&context).err())
+        })
+    })
 }
 
-/// Set up the mods in the selected game folder. Wine/Proton launcher setup is
-/// best-effort and returned as guidance, never allowed to block folder syncing.
+fn require_launch_ready(guidance: Option<String>) -> Result<(), String> {
+    match guidance {
+        Some(guidance) => Err(guidance),
+        None => Ok(()),
+    }
+}
+
 #[tauri::command]
-pub async fn sync_profile(
-    game_path: String,
-    profile_id: String,
-) -> Result<Option<String>, String> {
-    blocking(move || prepare_profile(&game_path, &profile_id)).await
+pub async fn sync_profile(game_path: String, profile_id: String) -> Result<Option<String>, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        prepare_profile(&game_path, &profile_id)
+    })
+    .await
 }
 
-/// Which store to launch through: persisted from setup, else inferred from the path.
-fn launch_store(game_path: &str) -> Option<String> {
-    let saved = settings::load();
-    if saved
-        .game_path
-        .as_deref()
-        .is_some_and(|path| same_path(Path::new(path), Path::new(game_path)))
-    {
-        if let Some(store) = saved.store {
-            return Some(store);
-        }
-    }
-    if game_path.replace('\\', "/").to_lowercase().contains("/steamapps/") {
-        return Some("steam".to_string());
-    }
-    if Path::new(game_path).join(".egstore").is_dir()
-        || game_path.replace('\\', "/").to_lowercase().contains("/epic games/")
-    {
-        return Some("epic".to_string());
-    }
-    None
+fn launch_store(game_path: &Path) -> Result<Store, String> {
+    Ok(settings::load()
+        .map_err(|error| error.to_string())?
+        .game_instances
+        .into_iter()
+        .find(|instance| same_path(Path::new(&instance.path), game_path))
+        .map(|instance| instance.store)
+        .unwrap_or_else(|| inferred_store(game_path)))
 }
 
-/// Whether `game_dir` is the exact install Steam launches for the Among Us appid.
-/// An unresolvable Steam install keeps the steam:// path (no behavior change).
-fn launches_registered_install(game_dir: &Path) -> bool {
-    match game::steam_install_path() {
-        Some(reg) => match (fs::canonicalize(&reg), fs::canonicalize(game_dir)) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        },
-        None => true,
-    }
+fn registered_steam_client(game_dir: &Path) -> Option<PathBuf> {
+    let client = game::native_steam_client_for_install(game_dir)?;
+    let metadata = fs::symlink_metadata(&client).ok()?;
+    (!is_reparse(&metadata) && metadata.is_file()).then_some(client)
 }
 
-/// Whether the Steam client is running (Windows: tasklist by image name).
-fn is_steam_running() -> bool {
-    process::command("tasklist")
-        .args(["/FI", "IMAGENAME eq steam.exe", "/NH"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("steam.exe"))
-        .unwrap_or(false)
-}
-
-/// Start the Steam client to the tray and wait until it is up, so a direct
-/// launch can init Steamworks via steam_appid.txt. No-op if Steam is already
-/// running or not installed.
-fn ensure_steam_running() {
-    if is_steam_running() {
-        return;
-    }
-    let Some(exe) = game::steam_exe() else {
-        return;
-    };
-    if process::command(&exe).arg("-silent").spawn().is_err() {
-        return;
-    }
-    // ponytail: poll for the process, then a fixed grace for login; swap for a
-    // real Steamworks-readiness probe if this proves flaky on slow/first logins.
-    for _ in 0..40 {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if is_steam_running() {
-            break;
-        }
-    }
-    std::thread::sleep(std::time::Duration::from_secs(5));
+fn launch_steam_app(client: &Path) -> Result<(), String> {
+    spawn_launch(|| {
+        process::command(client)
+            .args(["-applaunch", game::STEAM_APP_ID])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("couldn't launch the registered Steam install: {error}"))
+    })
 }
 
 const EPIC_STARTER_URL: &str =
-    "https://github.com/whichtwix/EpicGamesStarter/releases/latest/download/EpicGamesStarter.exe.zip";
+    "https://github.com/whichtwix/EpicGamesStarter/releases/download/1.1.0/EpicGamesStarter.exe.zip";
+const EPIC_STARTER_SIZE: u64 = 6_865_606;
+const EPIC_STARTER_SHA256: &str =
+    "15fb526b39b90a6e571397ec9981faded67e140a6dd3f42c011c7f4060188bc8";
+const MAX_EPIC_STARTER_BYTES: u64 = 64 * 1024 * 1024;
+const EPIC_EXECUTABLE_SIZE: u64 = 15_316_174;
+const EPIC_EXECUTABLE_SHA256: &str =
+    "7e1d7e1d2d96aca2ae3a4229f0c2902b1997d94f166f70ce2acd4e7b5bcb8c42";
 
-/// Ensure EpicGamesStarter.exe sits in the game folder (download once if missing);
-/// returns its path. Running it from the folder mirrors a manual EpicGamesDowngrader
-/// setup, so it finds .egstore and handles its own Epic sign-in.
-fn ensure_epic_starter(http: &dyn Http, game_dir: &Path) -> Result<std::path::PathBuf, String> {
-    let exe = game_dir.join("EpicGamesStarter.exe");
-    if exe.is_file() {
-        return Ok(exe);
+fn pinned_epic_download() -> Result<ResolvedDownload, String> {
+    let release = resolver::parse_release(&format!(
+        r#"{{"tag_name":"1.1.0","assets":[{{"name":"EpicGamesStarter.exe.zip","browser_download_url":"{EPIC_STARTER_URL}","size":{EPIC_STARTER_SIZE},"digest":"sha256:{EPIC_STARTER_SHA256}"}}]}}"#
+    ))
+    .map_err(|error| error.to_string())?;
+    let asset = release
+        .assets
+        .into_iter()
+        .next()
+        .ok_or("missing Epic pin")?;
+    Ok(ResolvedDownload {
+        url: asset.url,
+        asset_name: asset.name,
+        version: release.tag,
+        size: asset.size,
+    })
+}
+
+fn validated_epic_executable(archive: &[u8]) -> Result<Vec<u8>, String> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(archive))
+        .map_err(|error| format!("invalid EpicGamesStarter ZIP: {error}"))?;
+    if zip.len() != 1 {
+        return Err("EpicGamesStarter ZIP must contain exactly one entry".into());
     }
-    let bytes = http.get_bytes(EPIC_STARTER_URL).map_err(|e| e.to_string())?;
-    loader::extract_all(&bytes, game_dir).map_err(|e| e.to_string())?;
-    if exe.is_file() {
-        Ok(exe)
-    } else {
-        Err("EpicGamesStarter.exe missing from download".to_string())
+    let mut entry = zip
+        .by_index(0)
+        .map_err(|error| format!("invalid EpicGamesStarter ZIP entry: {error}"))?;
+    if entry.is_dir()
+        || entry.name() != "EpicGamesStarter.exe"
+        || entry.size() == 0
+        || entry.size() > MAX_EPIC_STARTER_BYTES
+        || entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 != 0o100000)
+    {
+        return Err(
+            "EpicGamesStarter ZIP must contain one nonempty regular EpicGamesStarter.exe".into(),
+        );
     }
+    let expected = entry.size();
+    let mut bytes = Vec::with_capacity(expected as usize);
+    entry
+        .by_ref()
+        .take(MAX_EPIC_STARTER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 != expected {
+        return Err("EpicGamesStarter expanded size did not match ZIP metadata".into());
+    }
+    Ok(bytes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn epic_executable_matches_pin(path: &Path) -> Result<bool, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err(format!(
+            "{} is not a regular non-link executable",
+            path.display()
+        ));
+    }
+    if metadata.len() != EPIC_EXECUTABLE_SIZE {
+        return Ok(false);
+    }
+    let bytes = read_bounded(path, EPIC_EXECUTABLE_SIZE)?
+        .ok_or("EpicGamesStarter executable disappeared during verification")?;
+    Ok(sha256_hex(&bytes) == EPIC_EXECUTABLE_SHA256)
+}
+
+fn ensure_epic_starter(http: &dyn Http, game_dir: &Path) -> Result<PathBuf, String> {
+    let executable = game_dir.join("EpicGamesStarter.exe");
+    if epic_executable_matches_pin(&executable)? {
+        return Ok(executable);
+    }
+    let archive =
+        download_resolved(http, &pinned_epic_download()?).map_err(|error| error.to_string())?;
+    let delivered = validated_epic_executable(&archive)?;
+    if delivered.len() as u64 != EPIC_EXECUTABLE_SIZE
+        || sha256_hex(&delivered) != EPIC_EXECUTABLE_SHA256
+    {
+        return Err("downloaded EpicGamesStarter executable failed the extracted-file pin".into());
+    }
+    game_is_stopped()?;
+    atomic_write(&executable, &delivered)?;
+    if !epic_executable_matches_pin(&executable)? {
+        return Err("published EpicGamesStarter failed pin verification".into());
+    }
+    Ok(executable)
+}
+
+fn launch_prepared_game(game_dir: &Path) -> Result<(), String> {
+    let store = launch_store(game_dir)?;
+    if store == Store::Steam {
+        if let Some(client) = registered_steam_client(game_dir) {
+            return launch_steam_app(&client);
+        }
+    }
+    let context = runtime_context(game_dir)?;
+    if store == Store::Epic {
+        let starter = ensure_epic_starter(&http()?, game_dir)?;
+        if cfg!(windows) {
+            return spawn_launch(|| {
+                process::command(&starter)
+                    .current_dir(game_dir)
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|error| format!("couldn't run EpicGamesStarter: {error}"))
+            });
+        }
+        let specification = compat::build_program_spec(&starter, game_dir, &context);
+        return spawn_launch(|| {
+            process::launch(&specification)
+                .map(|_| ())
+                .map_err(|error| launch_err_msg(&context, &error))
+        });
+    }
+    let specification = compat::build_launch_spec(game_dir, &context);
+    spawn_launch(|| {
+        process::launch(&specification)
+            .map(|_| ())
+            .map_err(|error| launch_err_msg(&context, &error))
+    })
 }
 
 #[tauri::command]
 pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(), String> {
     blocking(move || {
-        prepare_profile(&game_path, &profile_id)?;
-        let game_dir = Path::new(&game_path);
-        // Windows store-specific launch: Steam starts Steam + the game; Epic uses
-        // EpicGamesStarter to pass the launcher's auth to the modded copy.
-        if cfg!(windows) {
-            match launch_store(&game_path).as_deref() {
-                Some("steam") => {
-                    // steam://rungameid launches Steam's REGISTERED install for the
-                    // appid, not necessarily the folder we just synced. Only defer to
-                    // Steam when game_dir IS that install; otherwise fall through and
-                    // launch this copy's exe directly (steam_appid.txt, written during
-                    // setup, lets it init Steamworks while Steam runs).
-                    if launches_registered_install(game_dir) {
-                        let url = format!("steam://rungameid/{}", game::STEAM_APP_ID);
-                        process::command("cmd")
-                            .args(["/C", "start", "", &url])
-                            .spawn()
-                            .map_err(|e| format!("couldn't launch via Steam: {e}"))?;
-                        return Ok(());
-                    }
-                    ensure_steam_running();
-                }
-                Some("epic") => {
-                    let starter = ensure_epic_starter(&http(), game_dir)?;
-                    process::command(&starter)
-                        .current_dir(game_dir)
-                        .stdin(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .map_err(|e| format!("couldn't run EpicGamesStarter: {e}"))?;
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
-        let ctx = runtime_context(game_dir);
-        configure_runtime_override(&ctx)?;
-        if !cfg!(windows) && launch_store(&game_path).as_deref() == Some("epic") {
-            let starter = ensure_epic_starter(&http(), game_dir)?;
-            let spec = compat::build_program_spec(&starter, game_dir, &ctx);
-            process::launch(&spec).map_err(|e| launch_err_msg(&ctx, &e))?;
-            return Ok(());
-        }
-        let spec = compat::build_launch_spec(game_dir, &ctx);
-        process::launch(&spec).map_err(|e| launch_err_msg(&ctx, &e))?;
-        Ok(())
+        let _guard = lock_mutations()?;
+        require_launch_ready(prepare_profile(&game_path, &profile_id)?)?;
+        game_is_stopped()?;
+        let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
+        launch_prepared_game(&game_dir)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn launch_vanilla(game_path: String) -> Result<(), String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        game_is_stopped()?;
+        let game_dir = validate_game_target(&game_path, None)?;
+        launch_without_doorstop(&game_dir, || launch_prepared_game(&game_dir))
     })
     .await
 }
@@ -1138,61 +3534,757 @@ pub struct UpdateInfo {
 
 const REPO_SLUG: &str = "artriy/Perfect-Sync";
 
-/// Check GitHub Releases for a newer version. Returns None on any error (offline,
-/// rate-limited, no release) so the UI just shows nothing.
 #[tauri::command]
-pub async fn check_update() -> Option<UpdateInfo> {
+pub async fn check_update() -> Result<Option<UpdateInfo>, String> {
     blocking(|| {
-        // /releases/latest excludes prereleases, which is what this project ships;
-        // list the most recent release (prereleases included) instead.
-        let url = format!("https://api.github.com/repos/{REPO_SLUG}/releases?per_page=1");
-        let text = http().get_text(&url).map_err(|e| e.to_string())?;
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        let rel = v.get(0).ok_or_else(|| "no releases".to_string())?;
-        let tag = rel["tag_name"].as_str().unwrap_or_default().to_string();
-        if tag.is_empty() {
-            return Err("no release tag".to_string());
-        }
-        if !perfect_sync_core::version::is_newer(&tag, env!("CARGO_PKG_VERSION")) {
+        let api = format!("https://api.github.com/repos/{REPO_SLUG}/releases?per_page=1");
+        let text = http()?.get_text(&api).map_err(|error| error.to_string())?;
+        let releases: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        let release = releases.get(0).ok_or("no releases")?;
+        let tag = release["tag_name"]
+            .as_str()
+            .filter(|tag| !tag.is_empty())
+            .ok_or("no release tag")?;
+        if !perfect_sync_core::version::is_newer(tag, env!("CARGO_PKG_VERSION")) {
             return Ok(None);
         }
-        let html = rel["html_url"].as_str().unwrap_or("");
-        let url = if html.is_empty() {
-            format!("https://github.com/{REPO_SLUG}/releases")
-        } else {
-            html.to_string()
-        };
-        Ok(Some(UpdateInfo { version: tag.trim_start_matches('v').to_string(), url }))
+        let url = release["html_url"]
+            .as_str()
+            .ok_or("release has no canonical GitHub URL")?
+            .to_string();
+        validate_release_url(&url)?;
+        Ok(Some(UpdateInfo {
+            version: tag.trim_start_matches('v').to_string(),
+            url,
+        }))
     })
     .await
-    .unwrap_or(None)
 }
 
-/// Open an https URL in the user's default browser (used by the update notifier).
-#[tauri::command]
-pub fn open_url(url: String) -> Result<(), String> {
-    if !url.starts_with("https://") {
-        return Err("only https links allowed".to_string());
+fn validate_release_url(value: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(value).map_err(|error| format!("invalid release URL: {error}"))?;
+    let segments: Vec<&str> = parsed
+        .path_segments()
+        .ok_or("release URL cannot be a base URL")?
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("github.com")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || segments.len() < 3
+        || segments[0] != "artriy"
+        || segments[1] != "Perfect-Sync"
+        || segments[2] != "releases"
+    {
+        return Err(
+            "only artriy/Perfect-Sync canonical GitHub Releases HTTPS links are allowed".into(),
+        );
     }
-    let spawned = if cfg!(windows) {
-        process::command("cmd").args(["/C", "start", "", &url]).spawn()
-    } else if cfg!(target_os = "macos") {
-        process::command("open").arg(&url).spawn()
-    } else {
-        process::command("xdg-open").arg(&url).spawn()
+    Ok(parsed)
+}
+
+#[cfg(windows)]
+fn open_release_url_native(url: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            window: *mut std::ffi::c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+    let operation: Vec<u16> = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let file: Vec<u16> = std::ffi::OsStr::new(url)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
     };
-    spawned.map(|_| ()).map_err(|e| e.to_string())
+    if result <= 32 {
+        Err(format!("native URL opener failed with status {result}"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_release_url_native(url: &str) -> Result<(), String> {
+    process::command("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn open_release_url_native(url: &str) -> Result<(), String> {
+    process::command("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn open_url(url: String) -> Result<(), String> {
+    blocking(move || {
+        let parsed = validate_release_url(&url)?;
+        open_release_url_native(parsed.as_str())
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    struct DownloadHttp(&'static [u8]);
+
+    impl Http for DownloadHttp {
+        fn get_text(
+            &self,
+            _url: &str,
+        ) -> Result<String, perfect_sync_core::resolver::ResolveError> {
+            unreachable!()
+        }
+
+        fn get_bytes(
+            &self,
+            _url: &str,
+        ) -> Result<Vec<u8>, perfect_sync_core::resolver::ResolveError> {
+            Ok(self.0.to_vec())
+        }
+    }
+
+    fn resolved_download(size: u64, digest: Option<&str>) -> ResolvedDownload {
+        let digest = digest
+            .map(|value| format!(r#","digest":"{value}""#))
+            .unwrap_or_default();
+        let release = resolver::parse_release(&format!(
+            r#"{{"tag_name":"v1","assets":[{{"name":"mod.dll","browser_download_url":"https://example.invalid/mod.dll","size":{size}{digest}}}]}}"#
+        ))
+        .unwrap();
+        let asset = &release.assets[0];
+        ResolvedDownload {
+            url: asset.url.clone(),
+            asset_name: asset.name.clone(),
+            version: release.tag.clone(),
+            size: asset.size,
+        }
+    }
+
     #[test]
-    fn code_hash_is_stable_and_distinguishes_codes() {
-        assert_eq!(code_hash("abc"), code_hash("abc"));
-        assert_ne!(code_hash("abc"), code_hash("abd"));
-        assert_eq!(code_hash("anything").len(), 8);
+    fn resolved_install_verifies_metadata_before_publishing() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = "checked-download";
+
+        let size_error = install_resolved(
+            temp.path(),
+            profile,
+            &DownloadHttp(b"short"),
+            &resolved_download(6, None),
+            None,
+        )
+        .unwrap_err();
+        assert!(size_error.contains("download size mismatch"));
+
+        let digest_error = install_resolved(
+            temp.path(),
+            profile,
+            &DownloadHttp(b"evil"),
+            &resolved_download(
+                4,
+                Some("sha256:770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c"),
+            ),
+            None,
+        )
+        .unwrap_err();
+        assert!(digest_error.contains("SHA-256 digest"));
+        assert!(!temp
+            .path()
+            .join(profile)
+            .join("BepInEx")
+            .join("plugins")
+            .join("mod.dll")
+            .exists());
+    }
+
+    #[test]
+    fn lobby_digest_is_collision_resistant_and_stable() {
+        assert_eq!(lobby_digest("abc"), lobby_digest("abc"));
+        assert_ne!(lobby_digest("abc"), lobby_digest("abd"));
+        assert_eq!(lobby_digest("anything").len(), 64);
+    }
+
+    #[test]
+    fn town_of_us_dependency_plan_is_managed_and_dependency_first() {
+        let catalog = bundled_catalog();
+        let root = "AU-Avengers/TOU-Mira".to_string();
+        let ordered = deps::resolve(&catalog, std::slice::from_ref(&root))
+            .unwrap()
+            .ordered;
+        let position = |id: &str| ordered.iter().position(|entry| entry == id).unwrap();
+        assert!(position("NuclearPowered/Reactor") < position("All-Of-Us-Mods/MiraAPI"));
+        assert!(position("All-Of-Us-Mods/MiraAPI") < position(&root));
+        assert!(is_managed_dependency(&root, "NuclearPowered/Reactor"));
+        assert!(is_managed_dependency(&root, "All-Of-Us-Mods/MiraAPI"));
+        assert!(!is_managed_dependency(&root, &root));
+    }
+
+    #[test]
+    fn lobby_rows_that_are_required_by_another_root_stay_managed() {
+        let catalog = bundled_catalog();
+        let selected = vec![
+            "NuclearPowered/Reactor".to_string(),
+            "All-Of-Us-Mods/MiraAPI".to_string(),
+            "AU-Avengers/TOU-Mira".to_string(),
+        ];
+        let managed = selected_dependencies(&catalog, &selected).unwrap();
+        assert!(managed.contains("nuclearpowered/reactor"));
+        assert!(managed.contains("all-of-us-mods/miraapi"));
+        assert!(!managed.contains("au-avengers/tou-mira"));
+    }
+
+    #[test]
+    fn dependency_normalization_prunes_orphans_but_keeps_explicit_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_id = "deps";
+        let plugin = |id: &str, file: &str, managed: bool| InstalledMod {
+            package_id: id.into(),
+            name: id.into(),
+            repo: Some(id.into()),
+            version: "v1".into(),
+            versions: vec!["v1".into()],
+            enabled: true,
+            source: ModSource::Github,
+            tags: Vec::new(),
+            managed,
+            update: None,
+            file: Some(file.into()),
+            asset: Some(file.into()),
+        };
+        for file in ["Tou.dll", "Reactor.dll", "Mira.dll"] {
+            profile::install_plugin_bytes(temp.path(), profile_id, file, file.as_bytes()).unwrap();
+        }
+        let mut record = ProfileRecord {
+            id: profile_id.into(),
+            name: "Dependencies".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            game_instance_id: None,
+            mods: vec![
+                plugin("AU-Avengers/TOU-Mira", "Tou.dll", false),
+                plugin("NuclearPowered/Reactor", "Reactor.dll", false),
+                plugin("All-Of-Us-Mods/MiraAPI", "Mira.dll", true),
+            ],
+        };
+        let catalog = bundled_catalog();
+        normalize_dependency_ownership(temp.path(), profile_id, &mut record, &catalog).unwrap();
+        assert!(record
+            .mods
+            .iter()
+            .find(|item| item.package_id == "NuclearPowered/Reactor")
+            .is_some_and(|item| !item.managed));
+        record
+            .mods
+            .retain(|item| item.package_id != "AU-Avengers/TOU-Mira");
+        profile::remove_plugin(temp.path(), profile_id, "Tou.dll").unwrap();
+        normalize_dependency_ownership(temp.path(), profile_id, &mut record, &catalog).unwrap();
+        assert_eq!(record.mods.len(), 1);
+        assert_eq!(record.mods[0].package_id, "NuclearPowered/Reactor");
+        assert!(!temp
+            .path()
+            .join(profile_id)
+            .join("BepInEx/plugins/Mira.dll")
+            .exists());
+    }
+
+    #[test]
+    fn github_release_url_allowlist_rejects_unsafe_open_targets() {
+        assert!(
+            validate_release_url("https://github.com/artriy/Perfect-Sync/releases/tag/v1").is_ok()
+        );
+        for unsafe_url in [
+            "http://github.com/artriy/Perfect-Sync/releases",
+            "https://github.com.evil.invalid/artriy/Perfect-Sync/releases",
+            "https://github.com/artriy/Perfect-Sync/issues",
+            "https://user@github.com/artriy/Perfect-Sync/releases",
+            "https://github.com/artriy/Perfect-Sync/releases?next=evil",
+            "https://github.com/attacker/payload/releases/tag/v1",
+            "https://github.com/artriy/Perfect-Sync/releases#foreign",
+        ] {
+            assert!(validate_release_url(unsafe_url).is_err(), "{unsafe_url}");
+        }
+    }
+
+    #[test]
+    fn profile_transaction_failure_preserves_record_and_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profiles");
+        let store = ProfileStore::new(&root);
+        let record = ProfileRecord {
+            id: "stable".into(),
+            name: "Old".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            game_instance_id: None,
+            mods: Vec::new(),
+        };
+        store.save(&record).unwrap();
+        profile::install_plugin_bytes(&root, "stable", "Owned.dll", b"old").unwrap();
+        let original_manifest = fs::read(root.join("stable/profile.json")).unwrap();
+        let original_plugin = fs::read(root.join("stable/BepInEx/plugins/Owned.dll")).unwrap();
+
+        let error = profile_transaction(&root, "stable", |stage_root, _| {
+            profile::remove_plugin(stage_root, "stable", "Owned.dll").unwrap();
+            Err::<(), _>("injected failure".into())
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "injected failure");
+        assert_eq!(
+            fs::read(root.join("stable/profile.json")).unwrap(),
+            original_manifest
+        );
+        assert_eq!(
+            fs::read(root.join("stable/BepInEx/plugins/Owned.dll")).unwrap(),
+            original_plugin
+        );
+    }
+
+    #[test]
+    fn profile_transaction_artifacts_never_enter_the_profile_store() {
+        use std::cell::RefCell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profiles");
+        let observed_stage = RefCell::new(None);
+        profile_transaction(&root, "new-profile", |stage_root, stage_store| {
+            observed_stage.replace(Some(stage_root.to_path_buf()));
+            stage_store
+                .save(&ProfileRecord {
+                    id: "new-profile".into(),
+                    name: "New".into(),
+                    crew_color: "#fff".into(),
+                    game_build: None,
+                    game_instance_id: None,
+                    mods: Vec::new(),
+                })
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+        let stage = observed_stage.into_inner().unwrap();
+        assert_eq!(stage.parent(), root.parent());
+        assert_ne!(stage.parent(), Some(root.as_path()));
+        let backup_candidate = unique_sibling(&root, "backup").unwrap();
+        assert_eq!(backup_candidate.parent(), root.parent());
+        assert_ne!(backup_candidate.parent(), Some(root.as_path()));
+        assert!(!stage.exists());
+        assert_eq!(ProfileStore::new(&root).list().unwrap().len(), 1);
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("new-profile")]
+        );
+    }
+
+    #[test]
+    fn interrupted_profile_swap_recovers_before_list_and_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profiles");
+        let id = "recoverable";
+        let original = ProfileRecord {
+            id: id.into(),
+            name: "Original".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            game_instance_id: None,
+            mods: Vec::new(),
+        };
+        ProfileStore::new(&root).save(&original).unwrap();
+        let paths = allocate_profile_transaction_paths(&root).unwrap();
+        fs::create_dir(&paths.stage_root).unwrap();
+        fs::create_dir(&paths.backup_root).unwrap();
+        copy_profile_tree(&root.join(id), &paths.stage_root.join(id)).unwrap();
+        let stage_store = ProfileStore::new(&paths.stage_root);
+        let mut committed = stage_store.load(id).unwrap().unwrap();
+        committed.name = "Committed".into();
+        stage_store.save(&committed).unwrap();
+        write_profile_recovery_journal(&paths.journal, id, ProfileRecoveryAction::Publish).unwrap();
+        fs::rename(&root.join(id), &paths.backup_root.join(id)).unwrap();
+
+        let recovered = recovered_profile_store(&root).unwrap();
+        let listed = recovered.list().unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Committed");
+        assert_eq!(recovered.load(id).unwrap().unwrap().name, "Committed");
+        assert!(!paths.stage_root.exists());
+        assert!(!paths.backup_root.exists());
+        assert!(!paths.journal.exists());
+    }
+
+    #[test]
+    fn interrupted_profile_swap_restores_backup_when_publish_stage_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profiles");
+        let id = "restore-original";
+        let original = ProfileRecord {
+            id: id.into(),
+            name: "Original".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            game_instance_id: None,
+            mods: Vec::new(),
+        };
+        ProfileStore::new(&root).save(&original).unwrap();
+        let paths = allocate_profile_transaction_paths(&root).unwrap();
+        fs::create_dir(&paths.stage_root).unwrap();
+        fs::create_dir(&paths.backup_root).unwrap();
+        write_profile_recovery_journal(&paths.journal, id, ProfileRecoveryAction::Publish).unwrap();
+        fs::rename(&root.join(id), &paths.backup_root.join(id)).unwrap();
+
+        let recovered = recovered_profile_store(&root).unwrap();
+
+        assert_eq!(recovered.load(id).unwrap().unwrap().name, "Original");
+        assert!(!paths.stage_root.exists());
+        assert!(!paths.backup_root.exists());
+        assert!(!paths.journal.exists());
+    }
+
+    #[test]
+    fn ambiguous_profile_recovery_fails_closed_and_retains_every_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profiles");
+        let id = "ambiguous";
+        let record = ProfileRecord {
+            id: id.into(),
+            name: "Original".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            game_instance_id: None,
+            mods: Vec::new(),
+        };
+        ProfileStore::new(&root).save(&record).unwrap();
+        let paths = allocate_profile_transaction_paths(&root).unwrap();
+        fs::create_dir(&paths.stage_root).unwrap();
+        fs::create_dir(&paths.backup_root).unwrap();
+        copy_profile_tree(&root.join(id), &paths.stage_root.join(id)).unwrap();
+        write_profile_recovery_journal(&paths.journal, id, ProfileRecoveryAction::Publish).unwrap();
+        fs::rename(&root.join(id), &paths.backup_root.join(id)).unwrap();
+        copy_profile_tree(&paths.backup_root.join(id), &root.join(id)).unwrap();
+
+        let error = recovered_profile_store(&root).err().unwrap();
+
+        assert!(error.contains("recovery evidence was retained"));
+        assert!(root.join(id).exists());
+        assert!(paths.stage_root.join(id).exists());
+        assert!(paths.backup_root.join(id).exists());
+        assert!(paths.journal.exists());
+    }
+
+    #[test]
+    fn failed_commit_retains_backup_when_rollback_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage_root = temp.path().join("stage");
+        let backup_root = temp.path().join("backup");
+        let backup = backup_root.join("stable");
+        fs::create_dir_all(&stage_root).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("profile.json"), b"intact").unwrap();
+
+        let error = failed_profile_commit(
+            &backup,
+            &io::Error::other("publish blocked"),
+            Err("rollback blocked".into()),
+        );
+
+        assert!(stage_root.exists());
+        assert_eq!(fs::read(backup.join("profile.json")).unwrap(), b"intact");
+        assert!(error.contains(&backup.display().to_string()));
+    }
+
+    #[test]
+    fn vanilla_doorstop_move_is_reversible_and_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("BepInEx")).unwrap();
+        fs::write(
+            temp.path().join("BepInEx").join(APP_LOADER_MARKER),
+            b"owned",
+        )
+        .unwrap();
+        fs::write(temp.path().join("winhttp.dll"), b"doorstop").unwrap();
+        assert!(disable_doorstop(temp.path()).unwrap());
+        assert!(!temp.path().join("winhttp.dll").exists());
+        assert_eq!(
+            fs::read(temp.path().join(DISABLED_DOORSTOP)).unwrap(),
+            b"doorstop"
+        );
+        restore_doorstop(temp.path()).unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("winhttp.dll")).unwrap(),
+            b"doorstop"
+        );
+    }
+
+    #[test]
+    fn vanilla_launch_blocks_unowned_loader_and_only_rolls_back_its_own_move() {
+        use std::cell::Cell;
+
+        let unowned = tempfile::tempdir().unwrap();
+        fs::write(unowned.path().join("winhttp.dll"), b"foreign").unwrap();
+        let launched = Cell::new(false);
+        let error = launch_without_doorstop(unowned.path(), || {
+            launched.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("unowned winhttp.dll"));
+        assert!(!launched.get());
+
+        let already_disabled = tempfile::tempdir().unwrap();
+        fs::create_dir_all(already_disabled.path().join("BepInEx")).unwrap();
+        fs::write(
+            already_disabled
+                .path()
+                .join("BepInEx")
+                .join(APP_LOADER_MARKER),
+            b"owned",
+        )
+        .unwrap();
+        fs::write(already_disabled.path().join(DISABLED_DOORSTOP), b"disabled").unwrap();
+        assert_eq!(
+            launch_without_doorstop(already_disabled.path(), || Err("spawn failed".into()))
+                .unwrap_err(),
+            "spawn failed"
+        );
+        assert!(already_disabled.path().join(DISABLED_DOORSTOP).exists());
+        assert!(!already_disabled.path().join("winhttp.dll").exists());
+
+        let disabled_here = tempfile::tempdir().unwrap();
+        fs::create_dir_all(disabled_here.path().join("BepInEx")).unwrap();
+        fs::write(
+            disabled_here.path().join("BepInEx").join(APP_LOADER_MARKER),
+            b"owned",
+        )
+        .unwrap();
+        fs::write(disabled_here.path().join("winhttp.dll"), b"owned").unwrap();
+        assert_eq!(
+            launch_without_doorstop(disabled_here.path(), || Err("spawn failed".into()))
+                .unwrap_err(),
+            "spawn failed"
+        );
+        assert_eq!(
+            fs::read(disabled_here.path().join("winhttp.dll")).unwrap(),
+            b"owned"
+        );
+        assert!(!disabled_here.path().join(DISABLED_DOORSTOP).exists());
+    }
+
+    #[test]
+    fn failed_game_prepare_restores_all_touched_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("BepInEx/config")).unwrap();
+        fs::write(temp.path().join("winhttp.dll"), b"old-loader").unwrap();
+        fs::write(
+            temp.path().join("BepInEx/config/BepInEx.cfg"),
+            b"old-config",
+        )
+        .unwrap();
+        let error = game_artifact_transaction(temp.path(), || {
+            fs::write(temp.path().join("winhttp.dll"), b"new-loader").unwrap();
+            fs::create_dir_all(temp.path().join("BepInEx/plugins")).unwrap();
+            fs::write(temp.path().join("BepInEx/plugins/New.dll"), b"new").unwrap();
+            Err::<(), _>("injected prepare failure".into())
+        })
+        .unwrap_err();
+        assert_eq!(error, "injected prepare failure");
+        assert_eq!(
+            fs::read(temp.path().join("winhttp.dll")).unwrap(),
+            b"old-loader"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("BepInEx/config/BepInEx.cfg")).unwrap(),
+            b"old-config"
+        );
+        assert!(!temp.path().join("BepInEx/plugins/New.dll").exists());
+    }
+
+    fn epic_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn epic_helper_zip_requires_one_exact_nonempty_executable() {
+        assert_eq!(
+            validated_epic_executable(&epic_zip(&[("EpicGamesStarter.exe", b"verified")])).unwrap(),
+            b"verified"
+        );
+        for invalid in [
+            epic_zip(&[("other.exe", b"x")]),
+            epic_zip(&[("EpicGamesStarter.exe", b"")]),
+            epic_zip(&[("EpicGamesStarter.exe", b"x"), ("unexpected.txt", b"x")]),
+        ] {
+            assert!(validated_epic_executable(&invalid).is_err());
+        }
+        let pin = pinned_epic_download().unwrap();
+        assert_eq!(pin.url, EPIC_STARTER_URL);
+        assert_eq!(pin.size.bytes(), EPIC_STARTER_SIZE);
+    }
+
+    #[test]
+    fn catalog_repo_alias_reuses_and_unhides_canonical_entry() {
+        let catalog = parse(
+            r#"{"schema":1,"mods":[{"id":"Canonical/Mod","name":"Canonical","summary":"hosted","repo":"Alias/Repository","tags":[],"trust":"trusted","dependencies":[],"assetRules":{}}]}"#,
+        )
+        .unwrap();
+        let entry = catalog_entry_for(&catalog, "Alias/Repository")
+            .unwrap()
+            .clone();
+        let mut state = CatalogEnvelope {
+            version: catalog_envelope_version(),
+            display: vec![CatalogListItem {
+                id: "Alias/Repository".into(),
+                name: "Duplicate".into(),
+                repo: "Alias/Repository".into(),
+                summary: String::new(),
+                tags: Vec::new(),
+                latest: String::new(),
+                trust: Trust::Flagged,
+                extra: HashMap::new(),
+            }],
+            hosted_ids: vec![entry.id.clone()],
+            hidden_hosted_ids: vec![entry.id.clone()],
+            hosted_catalog: Some(catalog),
+        };
+        let effective_repo = entry.repo.clone().unwrap_or_else(|| entry.id.clone());
+
+        ensure_display_catalog_state(
+            &mut state,
+            "Alias/Repository",
+            &entry.id,
+            &effective_repo,
+            &entry.name,
+            entry.summary,
+            entry.tags,
+        );
+
+        assert!(state.hidden_hosted_ids.is_empty());
+        assert_eq!(state.display.len(), 1);
+        assert_eq!(state.display[0].id, "Canonical/Mod");
+        assert_eq!(state.display[0].repo, "Alias/Repository");
+    }
+
+    #[test]
+    fn hosted_reconciliation_keeps_custom_order_and_updates_hosted_entries() {
+        let hosted = parse(
+            r#"{"schema":1,"mods":[{"id":"Owner/Hosted","name":"New","summary":"fresh","repo":"Owner/Hosted","tags":[],"trust":"trusted","dependencies":[],"assetRules":{"perArch":{},"bundlesLoader":false}}]}"#,
+        )
+        .unwrap();
+        let custom = CatalogListItem {
+            id: "User/Custom".into(),
+            name: "Custom".into(),
+            repo: "User/Custom".into(),
+            summary: String::new(),
+            tags: Vec::new(),
+            latest: String::new(),
+            trust: Trust::Flagged,
+            extra: HashMap::new(),
+        };
+        let old_hosted = CatalogListItem {
+            id: "Owner/Hosted".into(),
+            name: "Old".into(),
+            repo: "Owner/Hosted".into(),
+            summary: String::new(),
+            tags: Vec::new(),
+            latest: String::new(),
+            trust: Trust::Flagged,
+            extra: HashMap::new(),
+        };
+        let state = CatalogEnvelope {
+            version: catalog_envelope_version(),
+            display: vec![custom, old_hosted],
+            hosted_ids: vec!["Owner/Hosted".into()],
+            hidden_hosted_ids: Vec::new(),
+            hosted_catalog: None,
+        };
+        let reconciled = reconcile_hosted(state, &hosted);
+        assert_eq!(reconciled.display[0].id, "User/Custom");
+        assert_eq!(reconciled.display[1].name, "New");
+        assert_eq!(
+            reconciled.hosted_catalog.as_ref().unwrap().mods[0].id,
+            "Owner/Hosted"
+        );
+    }
+
+    #[test]
+    fn hosted_reconciliation_honors_tombstones_and_prunes_removed_provenance() {
+        let hosted = parse(
+            r#"{"schema":1,"mods":[{"id":"Owner/Hidden","name":"Hidden","summary":"","repo":"Owner/Hidden","tags":[],"trust":"trusted","dependencies":[],"assetRules":{}}]}"#,
+        )
+        .unwrap();
+        let item = |id: &str| CatalogListItem {
+            id: id.into(),
+            name: id.into(),
+            repo: id.into(),
+            summary: String::new(),
+            tags: Vec::new(),
+            latest: String::new(),
+            trust: Trust::Flagged,
+            extra: HashMap::new(),
+        };
+        let state = CatalogEnvelope {
+            version: catalog_envelope_version(),
+            display: vec![
+                item("User/Custom"),
+                item("Owner/Hidden"),
+                item("Owner/Gone"),
+            ],
+            hosted_ids: vec!["Owner/Hidden".into(), "Owner/Gone".into()],
+            hidden_hosted_ids: vec!["Owner/Hidden".into(), "Owner/Gone".into()],
+            hosted_catalog: None,
+        };
+        let reconciled = reconcile_hosted(state, &hosted);
+        assert_eq!(
+            reconciled
+                .display
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["User/Custom"]
+        );
+        assert_eq!(reconciled.hidden_hosted_ids, vec!["Owner/Hidden"]);
+        assert_eq!(reconciled.hosted_ids, vec!["Owner/Hidden"]);
     }
 
     #[test]
@@ -1213,5 +4305,179 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".perfectsync-write-test-")
         }));
+    }
+    #[test]
+    fn nonexistent_profile_loader_preflight_creates_no_layout_or_record() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profiles");
+        let ran = Cell::new(false);
+        let result = with_existing_profile_layout(&root, "missing", || {
+            ran.set(true);
+            Ok(())
+        });
+
+        assert_eq!(result.unwrap_err(), "profile not found");
+        assert!(!ran.get());
+        assert!(ProfileStore::new(&root).list().unwrap().is_empty());
+        assert!(!root.join("missing").exists());
+    }
+
+    #[test]
+    fn launch_readiness_rejects_runtime_guidance_while_sync_can_return_it() {
+        assert!(require_launch_ready(None).is_ok());
+        assert_eq!(
+            require_launch_ready(Some("configure the runtime override first".into())).unwrap_err(),
+            "configure the runtime override first"
+        );
+    }
+
+    #[test]
+    fn complete_owned_loader_survives_offline_acquisition() {
+        assert_eq!(
+            resolve_loader_for_ensure(true, || Err("offline".into())).unwrap(),
+            None
+        );
+        assert_eq!(
+            download_loader_for_ensure(true, || Err("offline".into())).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_loader_for_ensure(false, || Err("offline".into())).unwrap_err(),
+            "offline"
+        );
+        assert_eq!(
+            download_loader_for_ensure(false, || Err("offline".into())).unwrap_err(),
+            "offline"
+        );
+    }
+
+    #[test]
+    fn hosted_only_dependency_is_not_authoritative() {
+        let hosted = parse(
+            r#"{"schema":1,"mods":[
+                {"id":"Owner/Root","name":"Root","summary":"","repo":"Owner/Root","tags":[],"trust":"trusted","dependencies":["Attacker/Dependency"],"assetRules":{}},
+                {"id":"Attacker/Dependency","name":"Dependency","summary":"","repo":"Attacker/Dependency","tags":[],"trust":"trusted","dependencies":[],"assetRules":{}}
+            ]}"#,
+        )
+        .unwrap();
+
+        let error =
+            validate_authoritative_dependencies(&hosted, &["Owner/Root".into()]).unwrap_err();
+        assert!(error.contains("not authorized by the bundled catalog"));
+    }
+
+    #[test]
+    fn bundled_identity_cannot_be_reused_by_an_explicit_root_with_another_repo() {
+        let custom = parse(
+            r#"{"schema":1,"mods":[
+                {"id":"Owner/Manual","name":"Manual","summary":"","repo":"Owner/Manual","tags":[],"trust":"flagged","dependencies":[],"assetRules":{}}
+            ]}"#,
+        )
+        .unwrap();
+        validate_authoritative_dependencies(&custom, &["Owner/Manual".into()]).unwrap();
+
+        let impersonated = parse(
+            r#"{"schema":1,"mods":[
+                {"id":"NuclearPowered/Reactor","name":"Reactor","summary":"","repo":"Attacker/Reactor","tags":[],"trust":"trusted","dependencies":[],"assetRules":{}}
+            ]}"#,
+        )
+        .unwrap();
+        let error =
+            validate_authoritative_dependencies(&impersonated, &["NuclearPowered/Reactor".into()])
+                .unwrap_err();
+        assert!(error.contains("Catalog root NuclearPowered/Reactor"));
+        assert!(error.contains("bundled authoritative identity"));
+    }
+
+    #[test]
+    fn required_explicit_dependency_cannot_be_disabled_and_remove_retains_it_managed() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_id = "required-dependency";
+        let installed = |id: &str, file: &str| InstalledMod {
+            package_id: id.into(),
+            name: id.into(),
+            repo: Some(id.into()),
+            version: "v1".into(),
+            versions: vec!["v1".into()],
+            enabled: true,
+            source: ModSource::Github,
+            tags: Vec::new(),
+            managed: false,
+            update: None,
+            file: Some(file.into()),
+            asset: Some(file.into()),
+        };
+        profile::install_plugin_bytes(temp.path(), profile_id, "Reactor.dll", b"reactor").unwrap();
+        profile::set_plugin_enabled(temp.path(), profile_id, "Reactor.dll", false).unwrap();
+        let mut record = ProfileRecord {
+            id: profile_id.into(),
+            name: "Required dependency".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            game_instance_id: None,
+            mods: vec![
+                installed("AU-Avengers/TOU-Mira", "Tou.dll"),
+                InstalledMod {
+                    enabled: false,
+                    ..installed("NuclearPowered/Reactor", "Reactor.dll")
+                },
+            ],
+        };
+        let catalog = bundled_catalog();
+
+        let toggle =
+            validate_mod_toggle(&record, &catalog, "NuclearPowered/Reactor", false).unwrap_err();
+        assert!(toggle.contains("required by another explicit root"));
+        remove_mod_from_record(
+            temp.path(),
+            profile_id,
+            &mut record,
+            &catalog,
+            "NuclearPowered/Reactor",
+        )
+        .unwrap();
+
+        let reactor = record
+            .mods
+            .iter()
+            .find(|installed| installed.package_id == "NuclearPowered/Reactor")
+            .unwrap();
+        assert!(reactor.managed);
+        assert!(reactor.enabled);
+        assert!(temp
+            .path()
+            .join(profile_id)
+            .join("BepInEx/plugins/Reactor.dll")
+            .is_file());
+        assert!(!temp
+            .path()
+            .join(profile_id)
+            .join("BepInEx/plugins/Reactor.dll.disabled")
+            .exists());
+    }
+
+    #[test]
+    fn manual_install_requires_confirmation_before_work_starts() {
+        assert!(require_manual_install_confirmation(true).is_ok());
+        let error = require_manual_install_confirmation(false).unwrap_err();
+        assert!(error.contains("repository, release tag, and asset"));
+    }
+
+    #[test]
+    fn lobby_asset_must_match_the_architecture_selected_default() {
+        let default = ResolvedDownload {
+            url: "https://github.com/Owner/Repo/releases/download/v1/Repo-x86.dll".into(),
+            asset_name: "Repo-x86.dll".into(),
+            version: "v1".into(),
+            size: perfect_sync_core::resolver::AssetSize::new(1),
+        };
+        assert!(enforce_lobby_asset_choice(None, &default).is_ok());
+        assert!(enforce_lobby_asset_choice(Some("Repo-x86.dll"), &default).is_ok());
+        let error = enforce_lobby_asset_choice(Some("Repo-x64.dll"), &default).unwrap_err();
+        assert!(error.contains("Repo-x64.dll"));
+        assert!(error.contains("Repo-x86.dll"));
+        assert!(error.contains("Refusing"));
     }
 }
