@@ -145,7 +145,7 @@ jobs:
           NOTES
           fi
 
-          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .id)"
+          release_id="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)"
           old_assets="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100")"
           jq -r 'add | .[].id' <<<"$old_assets" |
             while IFS= read -r asset_id; do
@@ -335,10 +335,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
+          release_id="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)"
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
           test "$(jq -r .draft <<<"$release_json")" = true
           test "$(jq -r .prerelease <<<"$release_json")" = true
-          release_id="$(jq -r .id <<<"$release_json")"
 
           assets="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100")"
           jq -e '
