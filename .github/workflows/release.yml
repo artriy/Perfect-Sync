@@ -27,6 +27,7 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      checks: write
     outputs:
       release_commit: ${{ steps.release_identity.outputs.commit }}
     steps:
