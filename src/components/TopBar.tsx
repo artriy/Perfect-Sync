@@ -67,8 +67,9 @@ export function TopBar({ onAddMod, onPasteCode, onOpenSettings }: TopBarProps) {
 
   return (
     <header data-tauri-drag-region className="glass-2 flex min-w-0 items-center gap-3 px-4 py-3">
-      <div data-tauri-drag-region className="shrink-0 font-semibold tracking-tight">
-        Perfect-Sync
+      <div data-tauri-drag-region className="flex shrink-0 items-baseline gap-1.5 font-semibold tracking-tight">
+        <span data-tauri-drag-region>Perfect-Sync</span>
+        <span data-tauri-drag-region className="font-mono text-[9.5px] font-medium text-ink-faint">v0.1.1</span>
       </div>
 
       <div className="relative min-w-[180px] max-w-[460px] flex-1">

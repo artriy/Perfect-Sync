@@ -13,8 +13,8 @@ use std::process::{Child, Command, Output};
 
 pub const GAME_EXE: &str = "Among Us.exe";
 
-/// Construct a child process without ever allocating a console window on
-/// Windows. Every process spawned by the application goes through this helper.
+/// Construct a background child process without allocating a console window on
+/// Windows. Use `interactive_command` for helpers that require user input.
 pub fn command<S: AsRef<OsStr>>(program: S) -> Command {
     let mut command = Command::new(program);
     #[cfg(windows)]
@@ -24,6 +24,133 @@ pub fn command<S: AsRef<OsStr>>(program: S) -> Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+/// Construct an interactive child process with inherited standard streams.
+/// Windows gets a dedicated visible console so GUI parents cannot hide prompts.
+pub fn interactive_command<S: AsRef<OsStr>>(program: S) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        command.creation_flags(CREATE_NEW_CONSOLE);
+    }
+    command
+}
+
+/// Launch a console helper with usable standard handles. Windows must bypass
+/// `std::process::Command`: inheriting a GUI parent's empty standard handles
+/// produces a visible but blank console that cannot accept input.
+pub fn launch_console_interactive(
+    program: &std::path::Path,
+    cwd: &std::path::Path,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct StartupInfoW {
+            cb: u32,
+            lpReserved: *mut u16,
+            lpDesktop: *mut u16,
+            lpTitle: *mut u16,
+            dwX: u32,
+            dwY: u32,
+            dwXSize: u32,
+            dwYSize: u32,
+            dwXCountChars: u32,
+            dwYCountChars: u32,
+            dwFillAttribute: u32,
+            dwFlags: u32,
+            wShowWindow: u16,
+            cbReserved2: u16,
+            lpReserved2: *mut u8,
+            hStdInput: *mut std::ffi::c_void,
+            hStdOutput: *mut std::ffi::c_void,
+            hStdError: *mut std::ffi::c_void,
+        }
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct ProcessInformation {
+            hProcess: *mut std::ffi::c_void,
+            hThread: *mut std::ffi::c_void,
+            dwProcessId: u32,
+            dwThreadId: u32,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateProcessW(
+                application_name: *const u16,
+                command_line: *mut u16,
+                process_attributes: *const std::ffi::c_void,
+                thread_attributes: *const std::ffi::c_void,
+                inherit_handles: i32,
+                creation_flags: u32,
+                environment: *const std::ffi::c_void,
+                current_directory: *const u16,
+                startup_info: *const StartupInfoW,
+                process_information: *mut ProcessInformation,
+            ) -> i32;
+            fn CloseHandle(object: *mut std::ffi::c_void) -> i32;
+        }
+
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let application_name: Vec<u16> = program.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut command_line = Vec::with_capacity(application_name.len() + 2);
+        command_line.push(u16::from(b'"'));
+        command_line.extend(
+            application_name
+                .iter()
+                .copied()
+                .take(application_name.len() - 1),
+        );
+        command_line.push(u16::from(b'"'));
+        command_line.push(0);
+        let current_directory: Vec<u16> = cwd.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut startup_info: StartupInfoW = unsafe { std::mem::zeroed() };
+        startup_info.cb = std::mem::size_of::<StartupInfoW>() as u32;
+        let mut process_information: ProcessInformation = unsafe { std::mem::zeroed() };
+
+        // SAFETY: all strings are NUL-terminated and live for the duration of
+        // the call. STARTF_USESTDHANDLES is intentionally absent, allowing the
+        // new console to initialize keyboard and screen-buffer handles.
+        let created = unsafe {
+            CreateProcessW(
+                application_name.as_ptr(),
+                command_line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CREATE_NEW_CONSOLE,
+                std::ptr::null(),
+                current_directory.as_ptr(),
+                &startup_info,
+                &mut process_information,
+            )
+        };
+        if created == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateProcessW initialized both handles on success. The
+        // process and its console remain alive after these owner handles close.
+        unsafe {
+            CloseHandle(process_information.hThread);
+            CloseHandle(process_information.hProcess);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        interactive_command(program)
+            .current_dir(cwd)
+            .spawn()
+            .map(|_| ())
+    }
 }
 
 /// A fully-resolved, structured launch. Arguments and environment entries stay
@@ -104,6 +231,21 @@ pub fn launch(spec: &LaunchSpec) -> io::Result<Child> {
     cmd.spawn()
 }
 
+/// Spawn an interactive helper from a launch spec. Standard streams stay
+/// inherited on every host; Windows also receives a dedicated console window.
+pub fn launch_interactive(spec: &LaunchSpec) -> io::Result<Child> {
+    if let Some(message) = &spec.error {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message.clone()));
+    }
+    let mut cmd = interactive_command(&spec.program);
+    cmd.current_dir(&spec.cwd);
+    cmd.args(&spec.args);
+    for (key, value) in &spec.env {
+        cmd.env(key, value);
+    }
+    cmd.spawn()
+}
+
 #[cfg(test)]
 mod query_tests {
     use super::*;
@@ -122,6 +264,7 @@ mod tests {
     use super::*;
 
     const NO_CONSOLE_CHILD: &str = "PERFECT_SYNC_NO_CONSOLE_CHILD";
+    const INTERACTIVE_CONSOLE_CHILD: &str = "PERFECT_SYNC_INTERACTIVE_CONSOLE_CHILD";
 
     #[link(name = "Kernel32")]
     extern "system" {
@@ -142,6 +285,31 @@ mod tests {
             .args([
                 "--exact",
                 "process::tests::spawned_helpers_have_no_console_window",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn interactive_helpers_get_a_console_window() {
+        if std::env::var_os(INTERACTIVE_CONSOLE_CHILD).is_some() {
+            // SAFETY: GetConsoleWindow has no parameters and returns the calling
+            // process's console window handle, or zero when it has none.
+            assert_ne!(unsafe { GetConsoleWindow() }, 0);
+            return;
+        }
+
+        let output = interactive_command(std::env::current_exe().unwrap())
+            .env(INTERACTIVE_CONSOLE_CHILD, "1")
+            .args([
+                "--exact",
+                "process::tests::interactive_helpers_get_a_console_window",
             ])
             .output()
             .unwrap();

@@ -32,15 +32,8 @@
       "summary": "The Mira-API rebuild of Town of Us. Dozens of custom roles.",
       "repo": "AU-Avengers/TOU-Mira",
       "tags": ["role", "all-client"],
-      "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor"],
-      "assetRules": {
-        "perArch": {
-          "x86": { "match": "(?i)steam-itch", "prefer": "zip" },
-          "x64": { "match": "(?i)epic-msstore", "prefer": "zip" }
-        },
-        "dllName": "TownOfUsMira.dll",
-        "bundlesLoader": true
-      },
+      "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor", "miniduikboot/Mini.RegionInstall"],
+      "assetRules": { "perArch": {}, "dllName": "TownOfUsMira.dll" },
       "trust": "trusted"
     },
     {
@@ -105,7 +98,7 @@
     {
       "id": "DigiWorm0/LevelImposter",
       "name": "LevelImposter",
-      "summary": "Load community-built custom maps from files.",
+      "summary": "Trusted custom-map loader with searchable community map downloads.",
       "repo": "DigiWorm0/LevelImposter",
       "tags": ["map", "cosmetic"],
       "dependencies": ["NuclearPowered/Reactor"],

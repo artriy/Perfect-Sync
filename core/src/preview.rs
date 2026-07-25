@@ -19,9 +19,11 @@ pub struct PreviewItem {
 }
 
 #[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Preview {
     pub name: String,
     pub items: Vec<PreviewItem>,
+    pub levelimposter_maps: Vec<String>,
 }
 
 pub fn preview(
@@ -72,6 +74,7 @@ pub fn preview(
         name: manifest
             .name
             .unwrap_or_else(|| "Imported lobby".to_string()),
+        levelimposter_maps: manifest.levelimposter_maps,
         items,
     })
 }
@@ -101,6 +104,7 @@ mod tests {
                 v: "1.6.3".into(),
                 asset: Some("TouMira-v1.6.3-x86-steam-itch.zip".into()),
             }],
+            levelimposter_maps: Vec::new(),
             loader: None,
         };
         let code = encode(&manifest).unwrap();
@@ -139,6 +143,7 @@ mod tests {
                     asset: None,
                 },
             ],
+            levelimposter_maps: Vec::new(),
             loader: None,
         };
         assert_eq!(
@@ -166,6 +171,7 @@ mod tests {
                     asset: Some(asset.clone()),
                 })
                 .collect(),
+            levelimposter_maps: Vec::new(),
             loader: None,
         };
         let result = preview(&encode(&manifest).unwrap(), &cat, &[]).unwrap();

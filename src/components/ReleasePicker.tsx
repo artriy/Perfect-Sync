@@ -77,6 +77,8 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
     setResult(null);
     setError(null);
 
+    pickingRef.current = null;
+    setPicking(null);
     if (!open) {
       setLoadingRepo(null);
       return;
@@ -106,7 +108,7 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
   const loading = loadingRepo === repo;
   const currentError = error?.repo === repo ? error.message : null;
   const hasEligibleAssets = releases.some((release) =>
-    release.assets.some((asset) => /\.(dll|zip)$/i.test(asset.name)),
+    release.assets.some((asset) => /\.dll$/i.test(asset.name)),
   );
   const controlsBusy = busy || picking !== null;
 
@@ -139,8 +141,21 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
   return (
     <AnimatePresence>
       {open && (
-        <motion.div className="fixed inset-0 z-50 grid place-items-center p-4 sm:p-6" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.18 }}>
-          <div className="absolute inset-0 bg-[rgba(6,4,18,0.5)]" style={{ backdropFilter: "blur(2px)" }} onClick={confirmChoice === null && !controlsBusy ? closePicker : undefined} />
+        <motion.div
+          className="fixed inset-0 z-50 grid place-items-center p-4 sm:p-6"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+          onClick={(event) => {
+            if (event.target === event.currentTarget && confirmChoice === null && !controlsBusy) closePicker();
+          }}
+        >
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 bg-[rgba(6,4,18,0.5)]"
+            style={{ backdropFilter: "blur(2px)" }}
+          />
           <motion.div
             ref={modalRef}
             role="dialog"
@@ -176,10 +191,10 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
               {loading && <p className="py-8 text-center text-[13px] text-ink-faint" role="status">Loading releases…</p>}
               {currentError && <p className="py-8 text-center text-[13px] break-words text-[#ff8a8a]" role="alert">Could not load releases: {currentError}</p>}
               {!loading && !currentError && !hasEligibleAssets && (
-                <p className="py-8 text-center text-[13px] text-ink-faint">No .dll or .zip files were found in this repository's releases.</p>
+                <p className="py-8 text-center text-[13px] text-ink-faint">No .dll files were found in this repository&apos;s releases.</p>
               )}
               {!loading && !currentError && releases.map((release) => {
-                const assets = release.assets.filter((asset) => /\.(dll|zip)$/i.test(asset.name));
+                const assets = release.assets.filter((asset) => /\.dll$/i.test(asset.name));
                 if (assets.length === 0) return null;
                 return (
                   <div key={`${repo}-${release.tag_name}`} className="mb-3 min-w-0">
@@ -191,7 +206,7 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
                       {assets.map((asset) => {
                         const choice = { repo, tag: release.tag_name, assetName: asset.name };
                         const key = `${repo}\n${release.tag_name}\n${asset.name}`;
-                        const type: "DLL" | "ZIP" = asset.name.toLowerCase().endsWith(".zip") ? "ZIP" : "DLL";
+                        const type = "DLL";
                         const size = formatSize(asset.size);
                         return (
                           <button

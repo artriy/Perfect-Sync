@@ -6,7 +6,9 @@
 //! Records serialize in camelCase to match the frontend's TypeScript types
 //! (`packageId`, `crewColor`, `gameBuild`).
 
-use crate::types::{LobbyManifest, ManifestMod, ModSource, ModTag};
+use crate::types::{
+    valid_levelimposter_map_id, LobbyManifest, ManifestMod, ModSource, ModTag, MAX_MANIFEST_MAPS,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -18,10 +20,6 @@ use std::sync::Mutex;
 const MAX_PROFILE_ID_BYTES: usize = 64;
 const MAX_DLL_NAME_BYTES: usize = 180;
 const MAX_PROFILE_JSON_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_ZIP_ENTRIES: usize = 4_096;
-const MAX_ZIP_PATH_BYTES: usize = 1_024;
-const MAX_ZIP_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_ZIP_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PLUGIN_BYTES: u64 = 256 * 1024 * 1024;
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -62,6 +60,8 @@ pub struct ProfileRecord {
     pub game_instance_id: Option<String>,
     #[serde(default)]
     pub mods: Vec<InstalledMod>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub levelimposter_maps: Vec<String>,
 }
 
 /// A directory of profiles, each `<root>/<id>/profile.json` plus its BepInEx tree.
@@ -248,6 +248,17 @@ fn validate_record(profile: &ProfileRecord) -> io::Result<()> {
         if !files.insert(file.to_ascii_lowercase()) {
             return Err(invalid(
                 "profile contains duplicate or case-colliding DLL filenames",
+            ));
+        }
+    }
+    if profile.levelimposter_maps.len() > MAX_MANIFEST_MAPS {
+        return Err(invalid("profile contains too many LevelImposter maps"));
+    }
+    let mut maps = HashSet::with_capacity(profile.levelimposter_maps.len());
+    for id in &profile.levelimposter_maps {
+        if !valid_levelimposter_map_id(id) || !maps.insert(id.to_ascii_lowercase()) {
+            return Err(invalid(
+                "profile contains invalid or duplicate LevelImposter map ids",
             ));
         }
     }
@@ -458,6 +469,16 @@ impl ProfileStore {
 /// Encode a profile's enabled mods into a shareable lobby manifest. Versions are
 /// preserved exactly so a recipient reproduces a handshake-compatible set.
 pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
+    let levelimposter_enabled = profile.mods.iter().any(|installed| {
+        installed.enabled
+            && (installed
+                .package_id
+                .eq_ignore_ascii_case("DigiWorm0/LevelImposter")
+                || installed
+                    .repo
+                    .as_deref()
+                    .is_some_and(|repo| repo.eq_ignore_ascii_case("DigiWorm0/LevelImposter")))
+    });
     LobbyManifest {
         v: 1,
         name: Some(profile.name.clone()),
@@ -473,6 +494,11 @@ pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
                 asset: m.asset.clone(),
             })
             .collect(),
+        levelimposter_maps: if levelimposter_enabled {
+            profile.levelimposter_maps.clone()
+        } else {
+            Vec::new()
+        },
         loader: None,
     }
 }
@@ -584,132 +610,6 @@ pub fn remove_plugin(profiles_root: &Path, id: &str, file_name: &str) -> io::Res
     Ok(())
 }
 
-fn normalized_zip_name(name: &str) -> io::Result<(String, bool)> {
-    if name.len() > MAX_ZIP_PATH_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ZIP entry path is too long",
-        ));
-    }
-    let normalized = name.replace('\\', "/");
-    let is_dir = normalized.ends_with('/');
-    let body = normalized.trim_end_matches('/');
-    if body.is_empty()
-        || normalized.starts_with('/')
-        || normalized.starts_with("//")
-        || body
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == ".." || part.contains(':'))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsafe ZIP entry path",
-        ));
-    }
-    Ok((body.to_string(), is_dir))
-}
-
-/// Install exactly one plugin DLL selected from a release ZIP.
-pub fn install_from_zip(
-    profiles_root: &Path,
-    id: &str,
-    bytes: &[u8],
-    only: Option<&str>,
-) -> io::Result<Vec<String>> {
-    validate_profile_id(id)?;
-    if let Some(name) = only {
-        validate_dll_name(name)?;
-    }
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    if archive.len() > MAX_ZIP_ENTRIES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ZIP has too many entries",
-        ));
-    }
-    let mut expanded = 0_u64;
-    let mut candidates = Vec::new();
-    let mut candidate_names = HashSet::new();
-    for index in 0..archive.len() {
-        let file = archive
-            .by_index(index)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let (name, is_dir) = normalized_zip_name(file.name())?;
-        if is_dir || file.is_dir() {
-            continue;
-        }
-        if file.size() > MAX_ZIP_ENTRY_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ZIP entry is too large",
-            ));
-        }
-        expanded = expanded
-            .checked_add(file.size())
-            .filter(|total| *total <= MAX_ZIP_EXPANDED_BYTES)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "ZIP expanded size is too large")
-            })?;
-        let lower = name.to_ascii_lowercase();
-        let plugin_path =
-            lower.ends_with(".dll") && (lower.contains("/plugins/") || !name.contains('/'));
-        if !plugin_path {
-            continue;
-        }
-        let base = name.rsplit('/').next().unwrap_or(&name).to_string();
-        validate_dll_name(&base)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        if only.is_some_and(|wanted| !base.eq_ignore_ascii_case(wanted)) {
-            continue;
-        }
-        if !candidate_names.insert(base.to_ascii_lowercase()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ZIP contains duplicate or case-colliding plugin DLLs",
-            ));
-        }
-        candidates.push((index, base, file.size()));
-    }
-    if candidates.len() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ZIP must contain exactly one selected installable plugin DLL",
-        ));
-    }
-    for index in 0..archive.len() {
-        let mut file = archive
-            .by_index(index)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        if file.is_dir() {
-            continue;
-        }
-        let expected = file.size();
-        let read = io::copy(
-            &mut file.by_ref().take(MAX_ZIP_ENTRY_BYTES + 1),
-            &mut io::sink(),
-        )?;
-        if read != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ZIP entry expanded size does not match its metadata",
-            ));
-        }
-    }
-    let (index, base, expected_size) = candidates.pop().unwrap();
-    if expected_size == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "plugin DLL is empty",
-        ));
-    }
-    let file = archive
-        .by_index(index)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    publish_plugin(profiles_root, id, &base, file)?;
-    Ok(vec![base])
-}
-
 /// Enable/disable a plugin by toggling a `.disabled` suffix (BepInEx only loads `.dll`).
 pub fn set_plugin_enabled(
     profiles_root: &Path,
@@ -798,6 +698,7 @@ mod tests {
                 file: Some("TownOfUsMira.dll".into()),
                 asset: Some("TownOfUsMira.zip".into()),
             }],
+            levelimposter_maps: Vec::new(),
         }
     }
 
@@ -955,6 +856,36 @@ mod tests {
     }
 
     #[test]
+    fn to_manifest_includes_maps_only_with_enabled_levelimposter() {
+        let map_id = "0ed1f569-eaf5-4ef6-b91c-f41ad78d4018";
+        let mut profile = sample_profile();
+        profile.levelimposter_maps.push(map_id.into());
+        profile.mods.push(InstalledMod {
+            package_id: "DigiWorm0/LevelImposter".into(),
+            name: "LevelImposter".into(),
+            repo: Some("DigiWorm0/LevelImposter".into()),
+            version: "v0.21.2-beta".into(),
+            versions: vec!["v0.21.2-beta".into()],
+            enabled: true,
+            source: ModSource::Github,
+            tags: vec![ModTag::Map],
+            managed: false,
+            update: None,
+            file: Some("LevelImposter.dll".into()),
+            asset: Some("LevelImposter.dll".into()),
+        });
+
+        assert_eq!(to_manifest(&profile).levelimposter_maps, [map_id]);
+        profile
+            .mods
+            .iter_mut()
+            .find(|installed| installed.package_id == "DigiWorm0/LevelImposter")
+            .unwrap()
+            .enabled = false;
+        assert!(to_manifest(&profile).levelimposter_maps.is_empty());
+    }
+
+    #[test]
     fn to_manifest_sets_github_ref_for_custom_mod() {
         // a mod NOT in any catalog, added by pasting a GitHub URL
         let p = ProfileRecord {
@@ -977,6 +908,7 @@ mod tests {
                 file: Some("CoolMod.dll".into()),
                 asset: Some("CoolMod.dll".into()),
             }],
+            levelimposter_maps: Vec::new(),
         };
         let m = to_manifest(&p);
         // id is owner/repo; the recipient derives the GitHub repo from it (no ref needed)
@@ -996,55 +928,6 @@ mod tests {
         let dest = install_plugin_dll(tmp.path(), "p1", &src).unwrap();
         assert!(dest.ends_with("Reactor.dll"));
         assert_eq!(fs::read(dest).unwrap(), b"dll-bytes");
-    }
-
-    #[test]
-    fn extracts_plugins_from_zip() {
-        // build an in-memory zip with a bundled plugin and a noise file
-        let mut buf = Vec::new();
-        {
-            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
-            use std::io::Write;
-            zw.start_file("BepInEx/plugins/TheOtherRoles.dll", opts)
-                .unwrap();
-            zw.write_all(b"mod").unwrap();
-            zw.start_file("README.md", opts).unwrap();
-            zw.write_all(b"readme").unwrap();
-            zw.finish().unwrap();
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let installed = install_from_zip(tmp.path(), "p1", &buf, None).unwrap();
-        assert_eq!(installed, vec!["TheOtherRoles.dll".to_string()]);
-        assert!(loader::profile_plugins_dir(tmp.path(), "p1")
-            .join("TheOtherRoles.dll")
-            .exists());
-    }
-
-    #[test]
-    fn extracts_only_named_dll_when_filtered() {
-        let mut buf = Vec::new();
-        {
-            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
-            use std::io::Write;
-            for n in [
-                "BepInEx/plugins/TownOfUsMira.dll",
-                "BepInEx/plugins/Reactor.dll",
-                "BepInEx/plugins/MiraAPI.dll",
-            ] {
-                zw.start_file(n, opts).unwrap();
-                zw.write_all(b"x").unwrap();
-            }
-            zw.finish().unwrap();
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let installed = install_from_zip(tmp.path(), "p1", &buf, Some("TownOfUsMira.dll")).unwrap();
-        assert_eq!(installed, vec!["TownOfUsMira.dll".to_string()]);
-        let plugins = loader::profile_plugins_dir(tmp.path(), "p1");
-        assert!(plugins.join("TownOfUsMira.dll").exists());
-        assert!(!plugins.join("Reactor.dll").exists());
-        assert!(!plugins.join("MiraAPI.dll").exists());
     }
 
     #[test]
@@ -1132,29 +1015,5 @@ mod tests {
             assert!(install_plugin_bytes(tmp.path(), "safe", name, b"x").is_err());
         }
         assert_eq!(fs::read(sentinel).unwrap(), b"keep");
-    }
-
-    #[test]
-    fn zip_requires_one_dll_and_preserves_existing_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        install_plugin_bytes(tmp.path(), "safe", "Mod.dll", b"old").unwrap();
-        let mut bytes = Vec::new();
-        {
-            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
-            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
-            use std::io::Write;
-            writer
-                .start_file("BepInEx/plugins/Mod.dll", options)
-                .unwrap();
-            writer.write_all(b"new").unwrap();
-            writer
-                .start_file("BepInEx/plugins/Other.DLL", options)
-                .unwrap();
-            writer.write_all(b"other").unwrap();
-            writer.finish().unwrap();
-        }
-        assert!(install_from_zip(tmp.path(), "safe", &bytes, None).is_err());
-        let plugin = loader::profile_plugins_dir(tmp.path(), "safe").join("Mod.dll");
-        assert_eq!(fs::read(plugin).unwrap(), b"old");
     }
 }

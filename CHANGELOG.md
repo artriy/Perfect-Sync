@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.1.1 (experimental)
+
+- Launch EpicGamesStarter with interactive input and an isolated Legendary token
+  store on Windows, Linux, and macOS, preventing Among Us's incompatible
+  `EGSAuth.json` from crashing the first-time Epic login.
+- Keep a modal, stage-aware progress surface visible while applying lobby codes,
+  installing mod batches, changing releases, and downloading LevelImposter maps.
+- Create and synchronize managed maps at
+  `BepInEx\plugins\LevelImposter`, including the directory when absent.
+- List profile-installed LevelImposter maps in the map browser and allow each
+  managed map to be removed and synchronized from the app.
+- Automatically include and show Region Install with Town of Us - Mira alongside
+  MiraAPI and Reactor, overriding stale cached dependency policy.
+
+- Default Town of Us - Mira to `TownOfUsMira.dll`, ignore stale cached ZIP rules,
+  and expose every direct DLL from the chosen release in the install review.
+- Retry LevelImposter banners through a bounded native image proxy when WebView loading
+  fails, and keep Windows verbatim path prefixes out of every user-facing label.
+- Display the application version in the title bar so corrected builds are identifiable.
+- Accept current signed LevelImposter `.lim` map assets from the official storage
+  bucket while retaining strict host, bucket, map ID, and size checks.
+- Allow exact release changes for installed managed dependencies and reset release
+  picker state after each completed install so another version can be chosen immediately.
+- Close Add Mod, Settings, and release dialogs by clicking their shaded backdrop.
+- Explain GitHub API-limit HTTP 403 responses with token and retry guidance.
+
 ## v0.1.0 (experimental)
 
 This is an early, experimental release. Nothing here is official or stable yet:
@@ -32,6 +58,20 @@ versions, stores, and compatibility runtimes.
 - Provide named profiles, per-profile game-instance assignment, multiple role mods,
   release selection, lobby/share codes, per-mod diffs, and explicit confirmation for
   unknown direct assets or lobby mods.
+- Select multiple catalog mods, review the latest version and default DLL for each,
+  choose any other direct DLL asset from that release, override mod and dependency
+  versions, include or exclude each automatic dependency, then install the confirmed
+  set as one profile mutation.
+- Restrict mod releases to direct `.dll` assets, rejecting mod archives at the command
+  boundary. Import a local computer DLL into one profile and keep it out of lobby codes.
+- Trust LevelImposter v0.21.2-beta as a catalog map loader. Open its map browser from
+  either the catalog or the installed mod, search the live community index, view map
+  banners, download multiple arbitrary `.lim2` maps, and synchronize profile-owned
+  maps while preserving maps installed outside Perfect-Sync.
+- Include each profile's exact LevelImposter map selection in lobby codes, show the map
+  count during preview, and download the shared selection when applying the code.
+- Adopt byte-identical unmanaged game DLLs during profile synchronization; retain and
+  explain conflicts when an unmanaged DLL differs from the selected profile version.
 - Require HTTPS for network resources; verify release asset size and any same-operation
   SHA-256 metadata; enforce bounded ZIP/path extraction; and pin both the archive and
   extracted shape, size, and SHA-256 for the Epic launch helper. Mod integrity checks

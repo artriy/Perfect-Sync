@@ -104,6 +104,8 @@ pub struct LobbyManifest {
     pub mods: Vec<ManifestMod>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub loader: Option<LoaderPins>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "maps")]
+    pub levelimposter_maps: Vec<String>,
 }
 
 pub const LOBBY_SCHEMA_VERSION: u8 = 1;
@@ -113,6 +115,7 @@ pub const MAX_REPO_ID_LEN: usize = 140;
 pub const MAX_VERSION_LEN: usize = 128;
 pub const MAX_RELEASE_TAG_LEN: usize = 255;
 pub const MAX_ASSET_NAME_LEN: usize = 255;
+pub const MAX_MANIFEST_MAPS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ManifestValidationError {
@@ -147,6 +150,12 @@ impl LobbyManifest {
                 limit: MAX_MANIFEST_MODS,
             });
         }
+        if self.levelimposter_maps.len() > MAX_MANIFEST_MAPS {
+            return Err(ManifestValidationError::ExcessiveInput {
+                field: "LevelImposter map count",
+                limit: MAX_MANIFEST_MAPS,
+            });
+        }
 
         if let Some(loader) = &self.loader {
             if let Some(version) = &loader.bepinex {
@@ -177,8 +186,31 @@ impl LobbyManifest {
                 ));
             }
         }
+
+        if !self.levelimposter_maps.is_empty() && !ids.contains("digiworm0/levelimposter") {
+            return Err(ManifestValidationError::Malformed(
+                "LevelImposter maps require the LevelImposter mod",
+            ));
+        }
+
+        let mut maps = HashSet::with_capacity(self.levelimposter_maps.len());
+        for map in &self.levelimposter_maps {
+            if !valid_levelimposter_map_id(map) || !maps.insert(map.to_ascii_lowercase()) {
+                return Err(ManifestValidationError::Malformed(
+                    "invalid or duplicate LevelImposter map id",
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+pub fn valid_levelimposter_map_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 pub(crate) fn canonical_repo_id(id: &str) -> String {

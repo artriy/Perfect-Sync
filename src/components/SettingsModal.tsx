@@ -16,6 +16,7 @@ import { inspectGame, loaderStatus, pickFolder, reinstallLoader, type LoaderStat
 import { useModalFocus } from "../lib/useModalFocus";
 import { TrustBadge } from "./TrustBadge";
 import type { GameInstance, GithubTokenAction, Settings, Store, Trust } from "../lib/types";
+import { displayPath } from "../lib/displayPath";
 
 interface SettingsModalProps {
   open: boolean;
@@ -415,11 +416,14 @@ export function SettingsModal({
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           transition={{ duration: 0.18 }}
+          onClick={(event) => {
+            if (event.target === event.currentTarget) requestClose();
+          }}
         >
           <div
-            className="absolute inset-0 bg-[rgba(6,4,18,0.5)]"
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 bg-[rgba(6,4,18,0.5)]"
             style={{ backdropFilter: "blur(2px)" }}
-            onClick={requestClose}
           />
           <motion.div
             ref={modalRef}
@@ -488,7 +492,7 @@ export function SettingsModal({
                             </span>
                           </span>
                           <span className="block truncate font-mono text-[10.5px] text-ink-faint">
-                            {instance.path}
+                            {displayPath(instance.path)}
                           </span>
                         </span>
                       </button>
@@ -540,7 +544,9 @@ export function SettingsModal({
                   <div className="flex items-center gap-2">
                     <div className="glass flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-2.5 text-ink-dim">
                       <FolderOpen size={16} className="shrink-0 opacity-75" />
-                      <span className="truncate font-mono text-[11.5px] text-ink">{selected.path}</span>
+                      <span className="truncate font-mono text-[11.5px] text-ink">
+                        {displayPath(selected.path)}
+                      </span>
                     </div>
                     <button
                       type="button"

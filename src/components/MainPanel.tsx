@@ -5,6 +5,7 @@ import { ModRow } from "./ModRow";
 import { LaunchBar } from "./LaunchBar";
 import type { GameInstance, GameStatus, Profile, Trust } from "../lib/types";
 import { useModalFocus } from "../lib/useModalFocus";
+import { displayPath } from "../lib/displayPath";
 
 interface MainPanelProps {
   profile: Profile;
@@ -21,6 +22,7 @@ interface MainPanelProps {
   onAddMod: () => void;
   onSetup: () => void;
   onSelectGameInstance: (id: string) => void;
+  onBrowseMaps: () => void;
   onManageGameInstances: () => void;
   trustOf: (id: string) => Trust;
 }
@@ -121,8 +123,11 @@ export function MainPanel(props: MainPanelProps) {
               </select>
               <CaretDown size={12} weight="bold" className="pointer-events-none absolute right-2.5 text-ink-faint" />
             </label>
-            <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-ink-faint" title={selectedGame.path}>
-              {selectedGame.path}
+            <span
+              className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-ink-faint"
+              title={displayPath(selectedGame.path)}
+            >
+              {displayPath(selectedGame.path)}
             </span>
           </>
         ) : (
@@ -243,6 +248,11 @@ export function MainPanel(props: MainPanelProps) {
               onToggle={() => props.onToggle(mod.packageId)}
               onRemove={() => props.onRemove(mod.packageId)}
               onPickRelease={() => props.onPickRelease(mod.packageId)}
+              onBrowseMaps={
+                mod.packageId.toLowerCase() === "digiworm0/levelimposter"
+                  ? props.onBrowseMaps
+                  : undefined
+              }
             />
           ))
         )}

@@ -189,6 +189,17 @@ pub struct ResolvedDownload {
 pub trait Http {
     fn get_text(&self, url: &str) -> Result<String, ResolveError>;
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ResolveError>;
+
+    fn get_bytes_with_progress(
+        &self,
+        url: &str,
+        on_progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<Vec<u8>, ResolveError> {
+        let bytes = self.get_bytes(url)?;
+        let size = bytes.len() as u64;
+        on_progress(size, Some(size));
+        Ok(bytes)
+    }
 }
 
 /// Real HTTPS client (blocking) used at runtime.
@@ -278,12 +289,32 @@ impl Http for UreqHttp {
     }
 
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ResolveError> {
+        self.get_bytes_with_progress(url, &mut |_, _| {})
+    }
+
+    fn get_bytes_with_progress(
+        &self,
+        url: &str,
+        on_progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<Vec<u8>, ResolveError> {
+        let response = self.call(url)?;
+        let total = response
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok());
+        let mut reader = response.into_reader().take(MAX_DOWNLOAD + 1);
         let mut bytes = Vec::new();
-        self.call(url)?
-            .into_reader()
-            .take(MAX_DOWNLOAD + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| ResolveError::Http(error.to_string()))?;
+        let mut buffer = [0_u8; 64 * 1024];
+        on_progress(0, total);
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| ResolveError::Http(error.to_string()))?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            on_progress(bytes.len() as u64, total);
+        }
         if bytes.len() as u64 > MAX_DOWNLOAD {
             return Err(ResolveError::Http("download too large".into()));
         }
@@ -363,33 +394,39 @@ pub fn parse_repo(input: &str) -> Option<String> {
     }
 }
 
-/// Choose an asset only when the architecture is known and the catalog rule or
-/// conservative DLL/ZIP fallback identifies exactly one candidate.
+/// Choose an asset only when the architecture is known and the catalog rule,
+/// configured DLL name, or conservative fallback identifies exactly one DLL.
 pub fn pick_asset<'a>(rel: &'a Release, rules: &AssetRules, arch: &str) -> Option<&'a Asset> {
     if arch != "x86" && arch != "x64" {
         return None;
     }
-    let names: Vec<String> = rel.assets.iter().map(|asset| asset.name.clone()).collect();
-    if let Some(name) = catalog::select_asset(rules, arch, &names) {
-        return rel.assets.iter().find(|asset| &asset.name == name);
-    }
     if let Some(dll) = &rules.dll_name {
-        if let Some(asset) = rel.assets.iter().find(|asset| &asset.name == dll) {
+        if let Some(asset) = rel
+            .assets
+            .iter()
+            .find(|asset| asset.name.eq_ignore_ascii_case(dll))
+        {
             return Some(asset);
         }
+    }
+    let names: Vec<String> = rel
+        .assets
+        .iter()
+        .filter(|asset| asset.name.to_ascii_lowercase().ends_with(".dll"))
+        .map(|asset| asset.name.clone())
+        .collect();
+    if let Some(name) = catalog::select_asset(rules, arch, &names) {
+        return rel.assets.iter().find(|asset| asset.name == *name);
     }
     if rules.per_arch.contains_key(arch) {
         return None;
     }
-    let candidates: Vec<&Asset> = rel
+    let mut candidates = rel
         .assets
         .iter()
-        .filter(|asset| {
-            let name = asset.name.to_ascii_lowercase();
-            name.ends_with(".dll") || name.ends_with(".zip")
-        })
-        .collect();
-    (candidates.len() == 1).then(|| candidates[0])
+        .filter(|asset| asset.name.to_ascii_lowercase().ends_with(".dll"));
+    let selected = candidates.next()?;
+    candidates.next().is_none().then_some(selected)
 }
 
 fn canonical_repo(repo: &str) -> Result<String, ResolveError> {
@@ -628,13 +665,13 @@ mod tests {
     }
 
     #[test]
-    fn picks_only_unambiguous_asset_for_known_arch() {
+    fn picks_only_dll_assets_for_known_arch() {
         let cat = parse(CATALOG).unwrap();
         let rules = &cat.get("AU-Avengers/TOU-Mira").unwrap().asset_rules;
         let rel = parse_release(RELEASE_JSON).unwrap();
         assert_eq!(
             pick_asset(&rel, rules, "x86").unwrap().name,
-            "TouMira-v1.6.3-x86-steam-itch.zip"
+            "TownOfUsMira.dll"
         );
         assert!(pick_asset(&rel, rules, "arm64").is_none());
 
@@ -649,18 +686,17 @@ mod tests {
             "x86"
         )
         .is_none());
-        assert!(pick_asset(
-            &release(vec![asset("a.dll"), asset("a.zip")]),
-            &empty_rules,
-            "x86"
-        )
-        .is_none());
         assert_eq!(
-            pick_asset(&release(vec![asset("bundle.zip")]), &empty_rules, "x64")
-                .unwrap()
-                .name,
-            "bundle.zip"
+            pick_asset(
+                &release(vec![asset("a.dll"), asset("a.zip")]),
+                &empty_rules,
+                "x86"
+            )
+            .unwrap()
+            .name,
+            "a.dll"
         );
+        assert!(pick_asset(&release(vec![asset("bundle.zip")]), &empty_rules, "x64").is_none());
     }
 
     #[test]
@@ -744,6 +780,21 @@ mod tests {
     }
 
     #[test]
+    fn mock_download_progress_reports_verified_byte_count() {
+        let http = MockHttp {
+            body: "good".into(),
+        };
+        let mut updates = Vec::new();
+        let bytes = http
+            .get_bytes_with_progress("https://x/a", &mut |received, total| {
+                updates.push((received, total));
+            })
+            .unwrap();
+        assert_eq!(bytes, b"good");
+        assert_eq!(updates, vec![(4, Some(4))]);
+    }
+
+    #[test]
     fn resolve_latest_via_mock() {
         let cat = parse(CATALOG).unwrap();
         let rules = &cat.get("AU-Avengers/TOU-Mira").unwrap().asset_rules;
@@ -752,6 +803,6 @@ mod tests {
         };
         let result = resolve_latest(&http, "AU-Avengers/TOU-Mira", rules, "x86").unwrap();
         assert_eq!(result.version, "1.6.3");
-        assert_eq!(result.asset_name, "TouMira-v1.6.3-x86-steam-itch.zip");
+        assert_eq!(result.asset_name, "TownOfUsMira.dll");
     }
 }

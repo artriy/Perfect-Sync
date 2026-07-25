@@ -75,6 +75,7 @@ mod tests {
                     asset: None,
                 })
                 .collect(),
+            levelimposter_maps: Vec::new(),
             loader: None,
         }
     }

@@ -8,15 +8,8 @@
       "summary": "The Mira-API rebuild of Town of Us.",
       "repo": "AU-Avengers/TOU-Mira",
       "tags": ["role", "all-client"],
-      "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor"],
-      "assetRules": {
-        "perArch": {
-          "x86": { "match": "(?i)x86.*(steam|itch)", "prefer": "zip" },
-          "x64": { "match": "(?i)x64.*(epic|msstore)", "prefer": "zip" }
-        },
-        "dllName": "TownOfUsMira.dll",
-        "bundlesLoader": true
-      }
+      "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor", "miniduikboot/Mini.RegionInstall"],
+      "assetRules": { "perArch": {}, "dllName": "TownOfUsMira.dll" }
     },
     {
       "id": "All-Of-Us-Mods/MiraAPI",
@@ -35,6 +28,15 @@
       "tags": ["library"],
       "dependencies": [],
       "assetRules": { "perArch": {}, "dllName": "Reactor.dll" }
+    },
+    {
+      "id": "miniduikboot/Mini.RegionInstall",
+      "name": "Region Install",
+      "summary": "Custom server region installer.",
+      "repo": "miniduikboot/Mini.RegionInstall",
+      "tags": ["all-client"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "Mini.RegionInstall.dll" }
     },
     {
       "id": "EnhancedNetwork/TownofHost-Enhanced",

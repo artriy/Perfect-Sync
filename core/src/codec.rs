@@ -113,6 +113,7 @@ mod tests {
                 v: "1.6.3".into(),
                 asset: None,
             }],
+            levelimposter_maps: Vec::new(),
             loader: None,
         }
     }
@@ -129,6 +130,39 @@ mod tests {
         let code = encode_unchecked(&sample());
         assert!(code.starts_with("PERFECT-"));
         assert_eq!(decode(&code).unwrap(), sample());
+    }
+
+    #[test]
+    fn levelimposter_maps_round_trip_and_require_the_mod() {
+        let map_id = "0ed1f569-eaf5-4ef6-b91c-f41ad78d4018";
+        let mut manifest = sample();
+        manifest.mods.push(ManifestMod {
+            id: "DigiWorm0/LevelImposter".into(),
+            v: "v0.21.2-beta".into(),
+            asset: Some("LevelImposter.dll".into()),
+        });
+        manifest.levelimposter_maps.push(map_id.into());
+        let code = encode(&manifest).unwrap();
+        assert_eq!(decode(&code).unwrap(), manifest);
+
+        let mut missing_mod = sample();
+        missing_mod.levelimposter_maps.push(map_id.into());
+        assert_eq!(
+            encode(&missing_mod),
+            Err(CodecError::MalformedManifest(
+                "LevelImposter maps require the LevelImposter mod"
+            ))
+        );
+
+        manifest
+            .levelimposter_maps
+            .push(map_id.to_ascii_uppercase());
+        assert_eq!(
+            encode(&manifest),
+            Err(CodecError::MalformedManifest(
+                "invalid or duplicate LevelImposter map id"
+            ))
+        );
     }
 
     #[test]
@@ -496,6 +530,7 @@ mod tests {
             platform: None,
             game_build: Some(version),
             mods,
+            levelimposter_maps: Vec::new(),
             loader: None,
         };
         assert_eq!(decode(&encode(&manifest).unwrap()).unwrap(), manifest);

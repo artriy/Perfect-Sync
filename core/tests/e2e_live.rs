@@ -58,6 +58,24 @@ fn live_install_latest_bepinex_from_build_server() {
 
 #[test]
 #[ignore]
+fn live_resolve_town_of_us_to_bare_dll() {
+    let cat = catalog::parse(CATALOG).unwrap();
+    let rules = &cat.get("AU-Avengers/TOU-Mira").unwrap().asset_rules;
+    let http = resolver::UreqHttp::new(None);
+
+    let resolved = resolver::resolve_latest(&http, "AU-Avengers/TOU-Mira", rules, "x64")
+        .expect("resolve Town of Us - Mira latest");
+
+    println!(
+        "resolved: {} {} ({} bytes) -> {}",
+        resolved.asset_name, resolved.version, resolved.size, resolved.url
+    );
+    assert_eq!(resolved.asset_name, "TownOfUsMira.dll");
+    assert!(resolved.url.ends_with("/TownOfUsMira.dll"));
+}
+
+#[test]
+#[ignore]
 fn live_end_to_end_reactor_install() {
     // 1. Resolve the latest Reactor release for x86 (Steam/Epic/itch).
     let cat = catalog::parse(CATALOG).unwrap();
@@ -76,18 +94,15 @@ fn live_end_to_end_reactor_install() {
     assert!(!bytes.is_empty(), "downloaded asset should not be empty");
     println!("downloaded {} bytes", bytes.len());
 
-    // 3. Install into a temp profile (bare-dll or zip path).
+    // 3. Install the bare DLL into a temp profile.
+    assert!(
+        resolved.asset_name.to_ascii_lowercase().ends_with(".dll"),
+        "mod resolution must never select an archive"
+    );
     let tmp = tempfile::tempdir().unwrap();
     let profiles_root = tmp.path();
-    let dest = if resolved.asset_name.to_lowercase().ends_with(".dll") {
-        let dl = tmp.path().join(&resolved.asset_name);
-        std::fs::write(&dl, &bytes).unwrap();
-        profile::install_plugin_dll(profiles_root, "live", &dl).unwrap()
-    } else {
-        let installed = profile::install_from_zip(profiles_root, "live", &bytes, None).unwrap();
-        assert!(!installed.is_empty(), "zip should contain a plugin dll");
-        loader::profile_plugins_dir(profiles_root, "live").join(&installed[0])
-    };
+    let dest =
+        profile::install_plugin_bytes(profiles_root, "live", &resolved.asset_name, &bytes).unwrap();
     assert!(dest.exists(), "installed plugin should exist");
     assert!(std::fs::metadata(&dest).unwrap().len() > 0);
     println!("installed plugin at {}", dest.display());
@@ -115,6 +130,7 @@ fn live_end_to_end_reactor_install() {
                 file: Some("Reactor.dll".into()),
                 asset: Some("Reactor.dll".into()),
             }],
+            levelimposter_maps: Vec::new(),
         })
         .unwrap();
     assert!(store.load("live").unwrap().is_some());

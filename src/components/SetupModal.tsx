@@ -4,6 +4,7 @@ import { CheckCircle, FolderOpen, GameController, GearSix, Warning } from "@phos
 import { ensureLoader, inspectGame, loaderStatus, pickFolder, type LoaderStatus } from "../lib/bridge";
 import { useModalFocus } from "../lib/useModalFocus";
 import type { GameInstall, Runtime } from "../lib/types";
+import { displayPath } from "../lib/displayPath";
 
 interface SetupModalProps {
   open: boolean;
@@ -259,7 +260,7 @@ export function SetupModal({ open, detected, profileId, onFinish }: SetupModalPr
                           >
                             <GameController size={18} className="shrink-0 text-ink-dim" />
                             <div className="min-w-0">
-                              <div className="truncate text-[13px] text-ink">{game.path}</div>
+                              <div className="truncate text-[13px] text-ink">{displayPath(game.path)}</div>
                               <div className="text-[12px] text-ink-faint">
                                 {game.store} · {game.arch}
                                 {game.runtime && game.runtime !== "native" ? ` · ${game.runtime}` : ""}
@@ -295,7 +296,9 @@ export function SetupModal({ open, detected, profileId, onFinish }: SetupModalPr
                   <span className={LABEL}>Among Us folder</span>
                   <div className="glass flex items-center gap-2 rounded-xl px-3.5 py-3">
                     <GameController size={18} className="shrink-0 text-ink-dim" />
-                    <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">{chosen}</span>
+                    <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">
+                      {displayPath(chosen)}
+                    </span>
                     <button
                       type="button"
                       onClick={() => {

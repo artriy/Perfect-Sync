@@ -1,4 +1,4 @@
-import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrent as getCurrentDeepLinks, onOpenUrl } from "@tauri-apps/plugin-deep-link";
@@ -7,7 +7,11 @@ import type {
   DiffItem,
   GameInstall,
   GithubTokenAction,
+  LevelImposterMap,
   ModTag,
+  ModInstallOption,
+  ModInstallSelection,
+  OperationProgress,
   Profile,
   ProfileMod,
   Runtime,
@@ -19,13 +23,58 @@ import { CATALOG, PROFILES } from "../data/mock";
 /** True when running inside the Tauri shell (vs a plain browser via `pnpm dev`). */
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  return tauriInvoke<T>(cmd, args);
+async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await tauriInvoke<T>(cmd, args);
+  } catch (reason: unknown) {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    if (/^HTTP status 403$/i.test(message.trim())) {
+      throw "HTTP 403: GitHub's API limit is exhausted. Add a GitHub token in Settings, or retry after the rate-limit reset.";
+    }
+    throw reason;
+  }
+}
+
+type ProgressHandler = (progress: OperationProgress) => void;
+
+function progressChannel(onProgress?: ProgressHandler): Channel<OperationProgress> {
+  return new Channel<OperationProgress>((progress) => onProgress?.(progress));
+}
+
+
+async function simulateBrowserTransfers(
+  files: string[],
+  onProgress?: ProgressHandler,
+): Promise<void> {
+  if (!onProgress) return;
+  onProgress?.({ phase: "resolving", message: "Resolving exact releases and dependencies" });
+  await new Promise<void>((resolve) => {
+    window.setTimeout(resolve, 160);
+  });
+  for (const [fileIndex, file] of files.entries()) {
+    const bytesTotal = (3 + fileIndex) * 1024 * 1024;
+    for (let chunk = 0; chunk <= 5; chunk += 1) {
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, 90);
+      });
+      onProgress?.({
+        phase: "downloading",
+        message: `Downloading ${file}`,
+        bytesReceived: Math.round(bytesTotal * (chunk / 5)),
+        bytesTotal,
+      });
+    }
+  }
+  onProgress?.({ phase: "finalizing", message: "Verifying files and saving the profile" });
+  await new Promise<void>((resolve) => {
+    window.setTimeout(resolve, 180);
+  });
 }
 
 export interface Preview {
   name: string;
   items: DiffItem[];
+  levelImposterMaps: string[];
 }
 
 // ----------------------------------------------------------- window controls
@@ -86,16 +135,27 @@ export async function listReleases(repo: string): Promise<GhRelease[]> {
   if (!parsed) throw new Error("Enter a valid GitHub repository or URL.");
   const normalized = `${parsed[1]}/${parsed[2]}`;
   const assetStem = parsed[2].replace(/\.git$/i, "") || "mod";
+  const assetNames = normalized.toLowerCase() === "au-avengers/tou-mira"
+    ? ["TownOfUsMira.dll", "MiraAPI.dll"]
+    : [`${assetStem}.dll`];
   return fixtureVersions(normalized).map((version) => ({
     tag_name: version,
-    assets: [
-      {
-        name: `${assetStem}.dll`,
-        browser_download_url: `https://github.com/${normalized}/releases/download/${encodeURIComponent(version)}/${encodeURIComponent(assetStem)}.dll`,
-        size: 1024 * 1024,
-      },
-    ],
+    assets: assetNames.map((name) => ({
+      name,
+      browser_download_url: `https://github.com/${normalized}/releases/download/${encodeURIComponent(version)}/${encodeURIComponent(name)}`,
+      size: 1024 * 1024,
+    })),
   }));
+}
+
+/** List every direct DLL asset, with the catalog default first for each release. */
+export async function listInstallOptions(repo: string, profileId: string): Promise<ModInstallOption[]> {
+  if (inTauri) return invoke<ModInstallOption[]>("list_install_options", { repo, profileId });
+  return (await listReleases(repo)).flatMap((release) =>
+    release.assets
+      .filter((asset) => /\.dll$/i.test(asset.name))
+      .map((asset) => ({ tag: release.tag_name, assetName: asset.name, size: asset.size })),
+  );
 }
 
 function replaceBrowserProfile(profile: Profile): Profile {
@@ -114,11 +174,22 @@ export async function installAsset(
   assetName: string,
   arch: string,
   confirmed: boolean,
+  onProgress?: ProgressHandler,
 ): Promise<Profile> {
   if (!confirmed) throw new Error("Confirm the exact release asset before installing.");
+  if (!assetName.toLowerCase().endsWith(".dll")) throw new Error("Only .dll mod files can be installed.");
   if (inTauri) {
-    return invoke<Profile>("install_asset", { profileId: profile.id, repo, tag, assetName, arch, confirmed });
+    return invoke<Profile>("install_asset", {
+      profileId: profile.id,
+      repo,
+      tag,
+      assetName,
+      arch,
+      confirmed,
+      onProgress: progressChannel(onProgress),
+    });
   }
+  await simulateBrowserTransfers([assetName], onProgress);
   const catalog = browserCatalog.find((item) => item.repo === repo || item.id === repo);
   const existing = profile.mods.find((mod) => mod.repo === repo || mod.packageId === repo);
   const versions = fixtureVersions(repo);
@@ -142,6 +213,206 @@ export async function installAsset(
       ? profile.mods.map((candidate) => (candidate === existing ? mod : candidate))
       : [mod, ...profile.mods],
   });
+}
+
+/** Install an exact, reviewed set of release assets as one profile mutation. */
+export async function installAssets(
+  profile: Profile,
+  selections: ModInstallSelection[],
+  confirmed: boolean,
+  onProgress?: ProgressHandler,
+): Promise<Profile> {
+  if (!confirmed) throw new Error("Review the selected versions before installing.");
+  if (selections.some((selection) => !selection.assetName.toLowerCase().endsWith(".dll"))) {
+    throw new Error("Only .dll mod files can be installed.");
+  }
+  if (inTauri) {
+    return invoke<Profile>("install_assets", {
+      profileId: profile.id,
+      selections,
+      confirmed,
+      onProgress: progressChannel(onProgress),
+    });
+  }
+  await simulateBrowserTransfers(selections.map((selection) => selection.assetName), onProgress);
+  const nextMods = [...profile.mods];
+  for (const selection of selections) {
+    const catalog = browserCatalog.find(
+      (item) => item.id === selection.id || item.repo === selection.repo,
+    );
+    const position = nextMods.findIndex(
+      (mod) => mod.packageId === selection.id || mod.repo === selection.repo,
+    );
+    const previous = position >= 0 ? nextMods[position] : undefined;
+    const versions = previous?.versions.filter((version) => version !== selection.tag) ?? [];
+    versions.unshift(selection.tag);
+    const installed: ProfileMod = {
+      packageId: catalog?.id ?? selection.id,
+      name: catalog?.name ?? selection.name,
+      repo: selection.repo,
+      version: selection.tag,
+      versions,
+      enabled: true,
+      source: catalog ? "catalog" : "github",
+      tags: catalog?.tags ?? [],
+      managed: selection.managed,
+      asset: selection.assetName,
+    };
+    if (position >= 0) nextMods[position] = installed;
+    else nextMods.push(installed);
+  }
+  return replaceBrowserProfile({ ...profile, mods: nextMods });
+}
+/** Pick and install one bare local DLL. Local files are intentionally non-shareable. */
+export async function installLocalMod(profile: Profile): Promise<Profile | null> {
+  if (!inTauri) throw new Error("Local DLL import is available in the desktop app.");
+  const selected = await openDialog({
+    directory: false,
+    multiple: false,
+    title: "Select a mod DLL",
+    filters: [{ name: "Among Us mod DLL", extensions: ["dll"] }],
+  });
+  if (selected === null) return null;
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  if (!path?.toLowerCase().endsWith(".dll")) {
+    throw new Error("Only .dll mod files can be installed.");
+  }
+  return invoke<Profile>("install_local_mod", { profileId: profile.id, path });
+}
+
+
+const browserInstalledMaps = new Map<string, Set<string>>();
+
+interface BrowserLevelImposterCallback {
+  v: number;
+  error: string;
+  data?: Array<{
+    id: string;
+    name: string;
+    authorName?: string;
+    description?: string;
+    thumbnailURL?: string;
+  }>;
+}
+
+interface BrowserLevelImposterSearch {
+  hits: Array<{
+    objectID: string;
+    name: string;
+    authorName?: string;
+    description?: string;
+    thumbnailURL?: string;
+  }>;
+}
+
+/** Retry a blocked native WebView banner through the bounded Rust proxy. */
+export async function fetchLevelImposterBanner(url: string): Promise<string> {
+  if (!inTauri) throw new Error("Banner proxy is available only in the desktop app.");
+  return invoke<string>("fetch_levelimposter_banner", { url });
+}
+
+export async function searchLevelImposterMaps(query: string): Promise<LevelImposterMap[]> {
+  if (inTauri) return invoke<LevelImposterMap[]>("search_levelimposter_maps", { query });
+  const normalized = query.trim();
+  if (!normalized) {
+    const response = await fetch("/levelimposter-api/maps/top");
+    if (!response.ok) throw new Error(`LevelImposter search returned HTTP ${response.status}.`);
+    const payload = await response.json() as BrowserLevelImposterCallback;
+    if (payload.v !== 1 || payload.error || !Array.isArray(payload.data)) {
+      throw new Error(payload.error || "LevelImposter returned invalid map data.");
+    }
+    return payload.data.map((map) => ({
+      id: map.id,
+      name: map.name,
+      authorName: map.authorName ?? "",
+      description: map.description ?? "",
+      thumbnailUrl: map.thumbnailURL,
+    }));
+  }
+
+  const params = new URLSearchParams({
+    query: normalized,
+    hitsPerPage: "40",
+    "x-algolia-application-id": "T5IVXJGKB9",
+    "x-algolia-api-key": "14062d24b40e0b3689a899fc36abd756",
+  });
+  const response = await fetch(`/levelimposter-search?${params}`);
+  if (!response.ok) throw new Error(`LevelImposter search returned HTTP ${response.status}.`);
+  const payload = await response.json() as BrowserLevelImposterSearch;
+  if (!Array.isArray(payload.hits)) throw new Error("LevelImposter returned invalid search data.");
+  return payload.hits.map((hit) => ({
+    id: hit.objectID,
+    name: hit.name,
+    authorName: hit.authorName ?? "",
+    description: hit.description ?? "",
+    thumbnailUrl: hit.thumbnailURL,
+  }));
+}
+
+export async function listLevelImposterMaps(profileId: string): Promise<string[]> {
+  if (inTauri) return invoke<string[]>("list_levelimposter_maps", { profileId });
+  const profile = browserProfiles.find((candidate) => candidate.id === profileId);
+  return [...(profile?.levelImposterMaps ?? browserInstalledMaps.get(profileId) ?? [])];
+}
+
+export async function installLevelImposterMaps(
+  profile: Profile,
+  mapIds: string[],
+  onProgress?: ProgressHandler,
+): Promise<Profile> {
+  if (inTauri) {
+    return invoke<Profile>("install_levelimposter_maps", {
+      profileId: profile.id,
+      mapIds,
+      onProgress: progressChannel(onProgress),
+    });
+  }
+  await simulateBrowserTransfers(
+    [
+      ...(profile.mods.some((mod) => mod.packageId === "DigiWorm0/LevelImposter")
+        ? []
+        : ["LevelImposter.dll"]),
+      ...mapIds.map((id) => `${id}.lim`),
+    ],
+    onProgress,
+  );
+  let installed = profile;
+  if (!profile.mods.some((mod) => mod.packageId === "DigiWorm0/LevelImposter")) {
+    installed = await installAssets(
+      profile,
+      [{
+        id: "DigiWorm0/LevelImposter",
+        repo: "DigiWorm0/LevelImposter",
+        name: "LevelImposter",
+        tag: "v0.21.2-beta",
+        assetName: "LevelImposter.dll",
+        managed: false,
+      }],
+      true,
+    );
+  }
+  const current = new Set(installed.levelImposterMaps ?? browserInstalledMaps.get(profile.id) ?? []);
+  for (const id of mapIds) current.add(id);
+  const levelImposterMaps = [...current].sort();
+  browserInstalledMaps.set(profile.id, new Set(levelImposterMaps));
+  return replaceBrowserProfile({ ...installed, levelImposterMaps });
+}
+
+export async function removeLevelImposterMaps(
+  profile: Profile,
+  mapIds: string[],
+): Promise<Profile> {
+  if (inTauri) {
+    return invoke<Profile>("remove_levelimposter_maps", {
+      profileId: profile.id,
+      mapIds,
+    });
+  }
+  const current = new Set(profile.levelImposterMaps ?? browserInstalledMaps.get(profile.id) ?? []);
+  for (const id of mapIds) current.delete(id);
+  const levelImposterMaps = [...current].sort();
+  browserInstalledMaps.set(profile.id, new Set(levelImposterMaps));
+  return replaceBrowserProfile({ ...profile, levelImposterMaps });
 }
 
 /** Native folder picker (Tauri only). Returns the chosen path or null. */
@@ -380,6 +651,7 @@ interface BrowserManifest {
   name?: string;
   gameBuild?: string;
   mods: BrowserManifestMod[];
+  maps?: string[];
   platform?: unknown;
   loader?: unknown;
 }
@@ -487,7 +759,7 @@ function validateManifest(value: unknown): BrowserManifest {
   if (!value || typeof value !== "object") throw new Error("Malformed lobby manifest.");
   const manifest = value as Partial<BrowserManifest>;
   const manifestKeys = Object.keys(manifest);
-  if (manifestKeys.some((key) => !["v", "name", "platform", "gameBuild", "mods", "loader"].includes(key))) {
+  if (manifestKeys.some((key) => !["v", "name", "platform", "gameBuild", "mods", "maps", "loader"].includes(key))) {
     throw new Error("Malformed lobby manifest.");
   }
   if (
@@ -499,6 +771,18 @@ function validateManifest(value: unknown): BrowserManifest {
   if (manifest.v !== 1) throw new Error(`Unsupported lobby schema version ${String(manifest.v)}.`);
   if (manifest.platform != null || manifest.loader != null) throw new Error("This lobby uses an unsupported feature.");
   if (!Array.isArray(manifest.mods) || manifest.mods.length > 64) throw new Error("Malformed lobby manifest.");
+  if (!Array.isArray(manifest.maps ?? []) || (manifest.maps?.length ?? 0) > 4_096) {
+    throw new Error("Malformed lobby manifest.");
+  }
+  const mapIds = new Set<string>();
+  for (const id of manifest.maps ?? []) {
+    if (typeof id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(id)) {
+      throw new Error("Malformed lobby manifest.");
+    }
+    const identity = id.toLowerCase();
+    if (mapIds.has(identity)) throw new Error("Lobby contains a duplicate LevelImposter map.");
+    mapIds.add(identity);
+  }
   const identities = new Set<string>();
   for (const mod of manifest.mods) {
     if (!mod || typeof mod !== "object" || Object.keys(mod).some((key) => !["id", "v", "a"].includes(key))) {
@@ -525,6 +809,9 @@ function validateManifest(value: unknown): BrowserManifest {
     if (identities.has(identity)) throw new Error("Lobby contains a duplicate mod repository.");
     identities.add(identity);
   }
+  if (mapIds.size > 0 && !identities.has("digiworm0/levelimposter")) {
+    throw new Error("LevelImposter maps require the LevelImposter mod.");
+  }
   return manifest as BrowserManifest;
 }
 
@@ -548,7 +835,14 @@ async function decodeBrowserCode(code: string): Promise<BrowserManifest> {
 
 export async function encodeLobbyCode(profile: Profile): Promise<string> {
   if (inTauri) return invoke<string>("encode_lobby_code", { profile });
+  if (profile.mods.some((mod) => mod.enabled && mod.source === "file")) {
+    throw new Error("Local computer mods cannot be shared. Remove them or disable them before creating a lobby code.");
+  }
   requireCodecApi();
+  const levelImposterEnabled = profile.mods.some((mod) =>
+    mod.enabled && (mod.packageId.toLowerCase() === "digiworm0/levelimposter"
+      || mod.repo?.toLowerCase() === "digiworm0/levelimposter"),
+  );
   const manifest: BrowserManifest = {
     v: 1,
     name: profile.name,
@@ -556,6 +850,7 @@ export async function encodeLobbyCode(profile: Profile): Promise<string> {
     mods: profile.mods
       .filter((mod) => mod.enabled)
       .map((mod) => ({ id: mod.repo ?? mod.packageId, v: mod.version, ...(mod.asset ? { a: mod.asset } : {}) })),
+    ...(levelImposterEnabled && profile.levelImposterMaps?.length ? { maps: profile.levelImposterMaps } : {}),
   };
   const body = bytesToBase64Url(await gzip(new TextEncoder().encode(JSON.stringify(manifest))));
   return `PERFECT-${body}.${(crc32Ascii(body) & 0xffff).toString(16).padStart(4, "0")}`;
@@ -604,6 +899,7 @@ export async function previewCode(code: string, installed: [string, string][]): 
         trust: resolvedPreviewTrust(requested.id, catalog?.name ?? requested.id, catalog?.trust),
       };
     }),
+    levelImposterMaps: manifest.maps ?? [],
   };
 }
 
@@ -612,10 +908,25 @@ export async function applyLobbyCode(
   code: string,
   arch: string,
   gameInstanceId: string | undefined,
+  onProgress?: ProgressHandler,
 ): Promise<Profile> {
-  if (inTauri) return invoke<Profile>("apply_lobby_code", { code, arch, gameInstanceId });
+  if (inTauri) {
+    return invoke<Profile>("apply_lobby_code", {
+      code,
+      arch,
+      gameInstanceId,
+      onProgress: progressChannel(onProgress),
+    });
+  }
   if (!gameInstanceId) throw new Error("Choose an Among Us instance before applying a lobby.");
   const manifest = await decodeBrowserCode(code);
+  await simulateBrowserTransfers(
+    [
+      ...manifest.mods.map((requested) => requested.a ?? `${requested.id.split("/").at(-1) ?? "mod"}.dll`),
+      ...(manifest.maps ?? []).map((id) => `${id}.lim`),
+    ],
+    onProgress,
+  );
   const slug = (manifest.name ?? "imported-lobby")
     .toLowerCase()
     .replace(/[^a-z0-9]+/gu, "-")
@@ -645,6 +956,7 @@ export async function applyLobbyCode(
         asset: requested.a,
       };
     }),
+    levelImposterMaps: manifest.maps ?? [],
   };
   for (const personal of browserSettings.personalMods.filter((candidate) => candidate.enabled !== false)) {
     const identity = personal.repo.toLowerCase();
@@ -672,6 +984,7 @@ export async function applyLobbyCode(
       asset: personal.asset,
     });
   }
+  browserInstalledMaps.set(profile.id, new Set(profile.levelImposterMaps));
   return replaceBrowserProfile(profile);
 }
 

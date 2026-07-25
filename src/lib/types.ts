@@ -48,6 +48,8 @@ export interface Profile {
   /** globally configured Among Us instance used by this profile */
   gameInstanceId?: string;
   mods: ProfileMod[];
+  /** exact LevelImposter maps installed for this profile */
+  levelImposterMaps?: string[];
 }
 
 export interface CatalogItem {
@@ -57,8 +59,41 @@ export interface CatalogItem {
   summary: string;
   tags: ModTag[];
   latest: string;
+  /** catalog package ids installed automatically unless excluded during review */
+  dependencies?: string[];
   /** vetting tier: trusted (curated) | community (listed) | flagged (unknown) */
   trust?: Trust;
+}
+
+export interface ModInstallOption {
+  tag: string;
+  assetName: string;
+  size: number;
+}
+
+export interface ModInstallSelection {
+  id: string;
+  repo: string;
+  name: string;
+  tag: string;
+  assetName: string;
+  /** true when this selection is included only as an auto-managed dependency */
+  managed: boolean;
+}
+
+export interface OperationProgress {
+  phase: "preparing" | "resolving" | "downloading" | "finalizing";
+  message: string;
+  bytesReceived?: number;
+  bytesTotal?: number;
+}
+
+export interface LevelImposterMap {
+  id: string;
+  name: string;
+  thumbnailUrl?: string;
+  authorName: string;
+  description: string;
 }
 
 /** one line in the lobby-code apply diff */

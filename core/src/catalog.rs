@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_x86_steam_asset() {
+    fn direct_dll_rule_does_not_select_archives() {
         let cat = parse(SAMPLE).unwrap();
         let rules = &cat.get("AU-Avengers/TOU-Mira").unwrap().asset_rules;
         let names = vec![
@@ -294,14 +294,9 @@ mod tests {
             "TouMira-v1.6.3-x86-steam-itch.zip".to_string(),
             "TownOfUsMira.dll".to_string(),
         ];
-        assert_eq!(
-            select_asset(rules, "x86", &names).unwrap(),
-            "TouMira-v1.6.3-x86-steam-itch.zip"
-        );
-        assert_eq!(
-            select_asset(rules, "x64", &names).unwrap(),
-            "TouMira-v1.6.3-x64-epic-msstore.zip"
-        );
+        assert!(select_asset(rules, "x86", &names).is_none());
+        assert!(select_asset(rules, "x64", &names).is_none());
+        assert_eq!(rules.dll_name.as_deref(), Some("TownOfUsMira.dll"));
     }
 
     fn entry(id: &str, dependencies: &[&str]) -> String {

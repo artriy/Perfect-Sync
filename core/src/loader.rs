@@ -44,6 +44,11 @@ const MAX_MANAGED_MARKER_BYTES: u64 = 1024 * 1024;
 const MAX_MANAGED_PLUGINS: usize = 4_096;
 const MAX_MANAGED_PLUGIN_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MANAGED_PLUGIN_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+const LEVELIMPOSTER_MAP_DIRECTORY: &str = "LevelImposter";
+const MANAGED_LEVELIMPOSTER_MAPS_MARKER: &str = ".perfectsync-maps.json";
+const MAX_MANAGED_LEVELIMPOSTER_MAPS: usize = 4_096;
+const MAX_MANAGED_LEVELIMPOSTER_MAP_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_MANAGED_LEVELIMPOSTER_MAP_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 static PACK_CACHE_LOCK: Mutex<()> = Mutex::new(());
 static LOADER_LOCK: Mutex<()> = Mutex::new(());
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
@@ -1642,7 +1647,7 @@ pub fn sync_profile_plugins(
     crate::profile::reject_reparse(&destination)?;
     recover_interrupted_plugin_sync(&destination)?;
     let marker = destination.join(MANAGED_PLUGINS_MARKER);
-    let previously_owned = read_managed_plugins(&marker)?;
+    let mut previously_owned = read_managed_plugins(&marker)?;
 
     let mut selected = HashMap::<String, (String, PathBuf, u64)>::new();
     let mut total_source_bytes = 0_u64;
@@ -1730,11 +1735,21 @@ pub fn sync_profile_plugins(
                 ));
             }
             let key = name.to_ascii_lowercase();
-            if selected.contains_key(&key) && !previously_owned.contains(&key) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("managed plugin would overwrite unmanaged file {name}"),
-                ));
+            if !previously_owned.contains(&key) {
+                if let Some((_, source, _)) = selected.get(&key) {
+                    let same_file = file_type.is_file()
+                        && regular_file_digest(&entry.path())? == regular_file_digest(source)?;
+                    if same_file {
+                        previously_owned.insert(key.clone());
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "{name} already exists outside Perfect-Sync and differs from the selected profile version. Remove it from the game's BepInEx/plugins folder, or exclude that dependency in Review selection."
+                            ),
+                        ));
+                    }
+                }
             }
             if previously_owned.contains(&key) {
                 if !file_type.is_file() {
@@ -1875,6 +1890,290 @@ pub fn sync_profile_plugins(
     result
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedLevelImposterMaps {
+    names: Vec<String>,
+}
+
+fn valid_levelimposter_map_name(name: &str) -> bool {
+    let Some(id) = name.strip_suffix(".lim2") else {
+        return false;
+    };
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+fn read_managed_levelimposter_maps(marker: &Path) -> io::Result<HashSet<String>> {
+    let metadata = match fs::symlink_metadata(marker) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed LevelImposter map marker is not a regular file",
+            ));
+        }
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(error),
+    };
+    if metadata.len() > MAX_MANAGED_MARKER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed LevelImposter map marker is too large",
+        ));
+    }
+    let managed: ManagedLevelImposterMaps = serde_json::from_slice(&fs::read(marker)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if managed.names.len() > MAX_MANAGED_LEVELIMPOSTER_MAPS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed LevelImposter map marker has too many names",
+        ));
+    }
+    let mut names = HashSet::with_capacity(managed.names.len());
+    for name in managed.names {
+        if !valid_levelimposter_map_name(&name) || !names.insert(name.to_ascii_lowercase()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed LevelImposter map marker has invalid names",
+            ));
+        }
+    }
+    Ok(names)
+}
+
+fn copy_bounded_levelimposter_map(
+    source: &Path,
+    destination: &Path,
+    expected_len: u64,
+) -> io::Result<()> {
+    let mut input = File::open(source)?;
+    if !input.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "profile LevelImposter map is not a regular file",
+        ));
+    }
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)?;
+    let copied = {
+        let mut limited = Read::take(&mut input, MAX_MANAGED_LEVELIMPOSTER_MAP_BYTES + 1);
+        io::copy(&mut limited, &mut output)?
+    };
+    if copied != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "profile LevelImposter map changed while it was copied",
+        ));
+    }
+    output.sync_all()
+}
+
+/// Synchronize profile-owned LevelImposter `.lim2` maps while preserving maps
+/// added outside Perfect-Sync. The caller includes this in the game artifact
+/// transaction so any filesystem failure restores the prior map set.
+pub fn sync_levelimposter_maps(
+    profiles_root: &Path,
+    profile_id: &str,
+    game_dir: &Path,
+) -> io::Result<()> {
+    let _guard = SYNC_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("map sync lock is poisoned"))?;
+    let source = checked_profile_bepinex_dir(profiles_root, profile_id)?
+        .join("plugins")
+        .join(LEVELIMPOSTER_MAP_DIRECTORY);
+    let destination = game_dir
+        .join("BepInEx")
+        .join("plugins")
+        .join(LEVELIMPOSTER_MAP_DIRECTORY);
+    crate::profile::reject_reparse(game_dir)?;
+    crate::profile::reject_reparse(&game_dir.join("BepInEx"))?;
+    crate::profile::reject_reparse(&game_dir.join("BepInEx").join("plugins"))?;
+    crate::profile::reject_reparse(&destination)?;
+
+    let mut selected = HashMap::<String, (String, PathBuf, u64)>::new();
+    let mut total_bytes = 0_u64;
+    match fs::read_dir(&source) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "profile LevelImposter maps contain a symlink",
+                    ));
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let name = entry.file_name().into_string().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "profile LevelImposter map name is not Unicode",
+                    )
+                })?;
+                if !valid_levelimposter_map_name(&name) {
+                    continue;
+                }
+                if selected.len() >= MAX_MANAGED_LEVELIMPOSTER_MAPS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "profile has too many LevelImposter maps",
+                    ));
+                }
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if !metadata.is_file()
+                    || metadata.len() == 0
+                    || metadata.len() > MAX_MANAGED_LEVELIMPOSTER_MAP_BYTES
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "profile LevelImposter map has an invalid size",
+                    ));
+                }
+                total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "LevelImposter map size overflow",
+                    )
+                })?;
+                if total_bytes > MAX_MANAGED_LEVELIMPOSTER_MAP_TOTAL_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "profile LevelImposter maps exceed the aggregate size limit",
+                    ));
+                }
+                let key = name.to_ascii_lowercase();
+                if selected
+                    .insert(key, (name, entry.path(), metadata.len()))
+                    .is_some()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "profile LevelImposter maps collide case-insensitively",
+                    ));
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let marker = destination.join(MANAGED_LEVELIMPOSTER_MAPS_MARKER);
+    let previously_owned = read_managed_levelimposter_maps(&marker)?;
+    if !destination.exists() && selected.is_empty() && previously_owned.is_empty() {
+        return Ok(());
+    }
+    if destination.exists() {
+        let metadata = fs::symlink_metadata(&destination)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "game LevelImposter map path is not a regular directory",
+            ));
+        }
+        for entry in fs::read_dir(&destination)? {
+            let entry = entry?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "game LevelImposter map name is not Unicode",
+                )
+            })?;
+            if name == MANAGED_LEVELIMPOSTER_MAPS_MARKER {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "game LevelImposter maps contain a symlink",
+                ));
+            }
+            let key = name.to_ascii_lowercase();
+            if selected.contains_key(&key) && !previously_owned.contains(&key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("managed LevelImposter map would overwrite unmanaged file {name}"),
+                ));
+            }
+            if previously_owned.contains(&key) && !file_type.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed LevelImposter map target is not a regular file",
+                ));
+            }
+        }
+    } else {
+        fs::create_dir_all(&destination)?;
+    }
+
+    for name in &previously_owned {
+        let target = destination.join(name);
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed LevelImposter map target changed type",
+                ));
+            }
+            Ok(_) => fs::remove_file(target)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut managed_names = Vec::with_capacity(selected.len());
+    for (name, source, expected_len) in selected.values() {
+        let target = destination.join(name);
+        let temporary = crate::profile::unique_sibling(&target, "map-sync")?;
+        let result = copy_bounded_levelimposter_map(source, &temporary, *expected_len)
+            .and_then(|()| fs::rename(&temporary, &target));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
+        managed_names.push(name.clone());
+    }
+    managed_names.sort_by_key(|name| name.to_ascii_lowercase());
+    let marker_json = serde_json::to_vec(&ManagedLevelImposterMaps {
+        names: managed_names,
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if marker_json.len() as u64 > MAX_MANAGED_MARKER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed LevelImposter map marker would be too large",
+        ));
+    }
+    let temporary_marker = crate::profile::unique_sibling(&marker, "map-marker")?;
+    let marker_result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_marker)?;
+        file.write_all(&marker_json)?;
+        file.sync_all()?;
+        drop(file);
+        match fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::rename(&temporary_marker, &marker)
+    })();
+    if marker_result.is_err() {
+        let _ = fs::remove_file(temporary_marker);
+    }
+    marker_result
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2032,6 +2331,63 @@ mod tests {
         fs::create_dir_all(&empty).unwrap();
         sync_profile_plugins(&profiles, "p2", &game).unwrap();
         assert!(!game_plugins.join("TheOtherRoles.dll").exists());
+    }
+
+    #[test]
+    fn sync_levelimposter_maps_creates_exact_plugin_subdirectory() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles = temp.path().join("profiles");
+        let game = temp.path().join("game");
+        let map = "0ed1f569-eaf5-4ef6-b91c-f41ad78d4018.lim2";
+        let source = profile_plugins_dir(&profiles, "p1").join(LEVELIMPOSTER_MAP_DIRECTORY);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join(map), b"selected").unwrap();
+
+        sync_levelimposter_maps(&profiles, "p1", &game).unwrap();
+
+        let destination = game.join("BepInEx").join("plugins").join("LevelImposter");
+        assert_eq!(fs::read(destination.join(map)).unwrap(), b"selected");
+        assert!(destination
+            .join(MANAGED_LEVELIMPOSTER_MAPS_MARKER)
+            .is_file());
+    }
+
+    #[test]
+    fn sync_levelimposter_maps_replaces_owned_maps_and_preserves_unmanaged_maps() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles = temp.path().join("profiles");
+        let game = temp.path().join("game");
+        let destination = game
+            .join("BepInEx")
+            .join("plugins")
+            .join(LEVELIMPOSTER_MAP_DIRECTORY);
+        let first = "0ed1f569-eaf5-4ef6-b91c-f41ad78d4018.lim2";
+        let stale = "ef1d13ec-64ce-4c2c-a45d-816fc4ff46da.lim2";
+        let unmanaged = "33eaaab4-b5fb-90f7-fb39-a41291409f93.lim2";
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join(stale), b"stale").unwrap();
+        fs::write(destination.join(unmanaged), b"user map").unwrap();
+        fs::write(
+            destination.join(MANAGED_LEVELIMPOSTER_MAPS_MARKER),
+            serde_json::to_vec(&ManagedLevelImposterMaps {
+                names: vec![stale.into()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let source = profile_plugins_dir(&profiles, "p1").join(LEVELIMPOSTER_MAP_DIRECTORY);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join(first), b"selected").unwrap();
+
+        sync_levelimposter_maps(&profiles, "p1", &game).unwrap();
+        assert_eq!(fs::read(destination.join(first)).unwrap(), b"selected");
+        assert!(!destination.join(stale).exists());
+        assert_eq!(fs::read(destination.join(unmanaged)).unwrap(), b"user map");
+
+        sync_levelimposter_maps(&profiles, "empty", &game).unwrap();
+        assert!(!destination.join(first).exists());
+        assert_eq!(fs::read(destination.join(unmanaged)).unwrap(), b"user map");
     }
 
     #[test]
@@ -2416,6 +2772,28 @@ mod tests {
         ] {
             assert_eq!(fs::read(root.join(relative)).unwrap(), proxy);
         }
+    }
+
+    #[test]
+    fn sync_adopts_an_identical_unmanaged_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game_plugins = tmp.path().join("game/BepInEx/plugins");
+        let profile_plugins = tmp.path().join("profiles/p1/BepInEx/plugins");
+        fs::create_dir_all(&game_plugins).unwrap();
+        fs::create_dir_all(&profile_plugins).unwrap();
+        fs::write(game_plugins.join("Reactor.dll"), b"same reactor").unwrap();
+        fs::write(profile_plugins.join("Reactor.dll"), b"same reactor").unwrap();
+
+        sync_profile_plugins(&tmp.path().join("profiles"), "p1", &tmp.path().join("game")).unwrap();
+
+        assert_eq!(
+            read_managed_plugins(&game_plugins.join(MANAGED_PLUGINS_MARKER)).unwrap(),
+            HashSet::from(["reactor.dll".to_string()])
+        );
+        assert_eq!(
+            fs::read(game_plugins.join("Reactor.dll")).unwrap(),
+            b"same reactor"
+        );
     }
 
     #[test]

@@ -4,12 +4,19 @@ import { Sidebar } from "./components/Sidebar";
 import { MainPanel } from "./components/MainPanel";
 import { LobbyCodeModal } from "./components/LobbyCodeModal";
 import { AddModPanel } from "./components/AddModPanel";
+import { BatchInstallReview } from "./components/BatchInstallReview";
+import { MapBrowserPanel } from "./components/MapBrowserPanel";
 import { SettingsModal } from "./components/SettingsModal";
 import { ReleasePicker } from "./components/ReleasePicker";
 import { ShareModal } from "./components/ShareModal";
 import { SetupModal } from "./components/SetupModal";
 import { LaunchWarning } from "./components/LaunchWarning";
 import { Toast, type ToastState } from "./components/Toast";
+import {
+  OperationProgressModal,
+  type OperationActivity,
+  type OperationScope,
+} from "./components/OperationProgressModal";
 import * as bridge from "./lib/bridge";
 import { CREW } from "./lib/palette";
 import type {
@@ -17,6 +24,9 @@ import type {
   CatalogItem,
   GameInstall,
   GameInstance,
+  LevelImposterMap,
+  ModInstallSelection,
+  OperationProgress,
   GithubTokenAction,
   Profile,
   Runtime,
@@ -50,8 +60,18 @@ interface StartupResult {
   errors: string[];
 }
 
+interface TrackedOperation {
+  scope: OperationScope;
+  title: string;
+  message: string;
+}
+
 function messageFrom(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : String(error);
+  if (/^HTTP status 403$/i.test(message.trim())) {
+    return "HTTP 403: the remote server refused the request. GitHub commonly returns this when its API limit is exhausted; add a GitHub token in Settings or retry after the rate-limit reset.";
+  }
+  return message;
 }
 
 export function App() {
@@ -60,11 +80,13 @@ export function App() {
   const [activeId, setActiveId] = useState("");
   const [running, setRunningState] = useState(false);
   const [operationBusy, setOperationBusy] = useState(false);
+  const [operationActivity, setOperationActivity] = useState<OperationActivity | null>(null);
 
   const operationRef = useRef(false);
   const runningRef = useRef(false);
   const launchSession = useRef(0);
   const startupPromiseRef = useRef<Promise<StartupResult> | null>(null);
+  const operationActivityId = useRef(0);
 
   const [games, setGames] = useState<GameInstall[]>([]);
   const [settings, setSettings] = useState<Settings>(EMPTY_SETTINGS);
@@ -74,6 +96,10 @@ export function App() {
   const [startupError, setStartupError] = useState<string | null>(null);
 
   const [addOpen, setAddOpen] = useState(false);
+  const [selectedCatalogIds, setSelectedCatalogIds] = useState<string[]>([]);
+  const [batchTargets, setBatchTargets] = useState<CatalogItem[]>([]);
+  const [mapsOpen, setMapsOpen] = useState(false);
+  const [mapsReturnToAdd, setMapsReturnToAdd] = useState(false);
   const [lobbyOpen, setLobbyOpen] = useState(false);
   const [lobbyCode, setLobbyCode] = useState<string | undefined>(undefined);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -120,6 +146,31 @@ export function App() {
     try {
       return await action();
     } finally {
+      endOperation();
+    }
+  };
+
+  const trackedExclusive = async <T,>(
+    descriptor: TrackedOperation,
+    action: (report: (progress: OperationProgress) => void) => Promise<T>,
+  ): Promise<T> => {
+    if (!beginOperation()) throw OPERATION_BUSY;
+    const id = ++operationActivityId.current;
+    setOperationActivity({
+      id,
+      scope: descriptor.scope,
+      title: descriptor.title,
+      phase: "preparing",
+      message: descriptor.message,
+      startedAt: Date.now(),
+    });
+    const report = (progress: OperationProgress) => {
+      setOperationActivity((current) => current?.id === id ? { ...current, ...progress } : current);
+    };
+    try {
+      return await action(report);
+    } finally {
+      setOperationActivity((current) => current?.id === id ? null : current);
       endOperation();
     }
   };
@@ -427,13 +478,25 @@ export function App() {
     }
   };
 
-  const addCatalog = async (item: CatalogItem): Promise<void> => {
+  const openAddPanel = () => {
     if (operationRef.current || runningRef.current) return;
-    if (active.mods.some((mod) => mod.packageId === item.id)) {
-      notify(`${item.name} is already in this profile`, "error");
-      return;
-    }
-    setPickerTarget({ repo: item.repo, name: item.name, trust: item.trust ?? "flagged", returnToAdd: true });
+    setSelectedCatalogIds([]);
+    setMapsOpen(false);
+    setAddOpen(true);
+  };
+
+  const toggleCatalogSelection = (id: string) => {
+    setSelectedCatalogIds((current) =>
+      current.includes(id) ? current.filter((selected) => selected !== id) : [...current, id],
+    );
+  };
+
+  const reviewCatalogSelection = () => {
+    const selected = new Set(selectedCatalogIds);
+    const targets = catalog.filter((item) => selected.has(item.id));
+    if (targets.length === 0) return;
+    setBatchTargets(targets);
+    setAddOpen(false);
   };
 
   const addUrl = async (url: string): Promise<void> => {
@@ -446,6 +509,163 @@ export function App() {
       return;
     }
     setPickerTarget({ repo, name, trust: trustOf(repo), returnToAdd: true });
+  };
+
+  const addLocalMod = async (): Promise<void> => {
+    try {
+      await exclusive(async () => {
+        const profile = profiles.find((candidate) => candidate.id === active.id);
+        if (!profile) throw new Error("Profile no longer exists.");
+        const installed = await bridge.installLocalMod(profile);
+        if (!installed) return;
+        patchProfile(installed);
+        notify("Added local DLL", "success");
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
+    }
+  };
+
+  const installSelectedMods = async (selections: ModInstallSelection[]): Promise<void> => {
+    try {
+      await trackedExclusive(
+        {
+          scope: "mods",
+          title: `Installing ${selections.length} mod${selections.length === 1 ? "" : "s"}`,
+          message: "Preparing the reviewed versions and files",
+        },
+        async (report) => {
+          const profile = profiles.find((candidate) => candidate.id === active.id);
+          const instance = gameForProfile(profile);
+          if (!profile || !instance) throw new Error("Assign an Among Us instance before installing mods.");
+          const installed = await bridge.installAssets(profile, selections, true, report);
+          const warnings: string[] = [];
+          report({ phase: "finalizing", message: "Checking installed versions for updates" });
+          let refreshed = installed;
+          try {
+            refreshed = await refreshProfileUpdates(installed);
+          } catch (error) {
+            warnings.push(`Update refresh failed: ${messageFrom(error)}`);
+          }
+          patchProfile(refreshed);
+          report({ phase: "finalizing", message: "Checking the BepInEx loader" });
+          const loaderWarning = await ensureLoaderInternal(refreshed);
+          if (loaderWarning) warnings.push(loaderWarning);
+          report({ phase: "finalizing", message: "Refreshing the trusted catalog" });
+          try {
+            setCatalog(await bridge.loadCatalog());
+          } catch (error) {
+            warnings.push(`Catalog reload failed: ${messageFrom(error)}`);
+          }
+          setBatchTargets([]);
+          setSelectedCatalogIds([]);
+          const count = selections.length;
+          notify(
+            warnings.length > 0
+              ? `Installed ${count} mod${count === 1 ? "" : "s"}. ${warnings.join(" ")}`
+              : `Installed ${count} mod${count === 1 ? "" : "s"}`,
+            warnings.length > 0 ? "error" : "success",
+          );
+        },
+      );
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
+    }
+  };
+
+  const installSelectedMaps = async (maps: LevelImposterMap[]): Promise<void> => {
+    try {
+      await trackedExclusive(
+        {
+          scope: "maps",
+          title: `Installing ${maps.length} map${maps.length === 1 ? "" : "s"}`,
+          message: "Preparing LevelImposter map downloads",
+        },
+        async (report) => {
+          const profile = profiles.find((candidate) => candidate.id === active.id);
+          const instance = gameForProfile(profile);
+          if (!profile || !instance) throw new Error("Assign an Among Us instance before installing maps.");
+          const count = maps.length;
+          const installed = await bridge.installLevelImposterMaps(
+            profile,
+            maps.map((map) => map.id),
+            (progress) => {
+              const currentMap = progress.phase === "downloading"
+                ? maps.find((map) => progress.message.includes(map.id))
+                : undefined;
+              report(currentMap
+                ? { ...progress, message: `Downloading ${currentMap.name} by ${currentMap.authorName}` }
+                : progress);
+            },
+          );
+          report({ phase: "finalizing", message: "Synchronizing maps with the game folder" });
+          patchProfile(installed);
+          let syncError: string | null = null;
+          let warning: string | null = null;
+          try {
+            warning = await bridge.syncProfile(instance.path, installed.id);
+          } catch (error) {
+            syncError = messageFrom(error);
+          }
+          report({ phase: "finalizing", message: "Checking installed versions for updates" });
+          let refreshed = installed;
+          try {
+            refreshed = await refreshProfileUpdates(installed);
+          } catch (error) {
+            notify(`Maps installed, but update refresh failed: ${messageFrom(error)}`, "error");
+          }
+          patchProfile(refreshed);
+          setMapsOpen(false);
+          setMapsReturnToAdd(false);
+          setSelectedCatalogIds([]);
+          const mapFolder = "BepInEx\\plugins\\LevelImposter";
+          notify(
+            syncError
+              ? `Downloaded ${count} map${count === 1 ? "" : "s"} to the profile, but could not synchronize ${mapFolder}: ${syncError}`
+              : warning
+                ? `Downloaded ${count} map${count === 1 ? "" : "s"} to ${mapFolder}. ${warning}`
+                : `Downloaded ${count} map${count === 1 ? "" : "s"} to ${mapFolder} for ${profile.name}`,
+            syncError || warning ? "error" : "success",
+          );
+        },
+      );
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
+    }
+  };
+
+  const removeInstalledMaps = async (mapIds: string[]): Promise<void> => {
+    try {
+      await exclusive(async () => {
+        const profile = profiles.find((candidate) => candidate.id === active.id);
+        const instance = gameForProfile(profile);
+        if (!profile || !instance) throw new Error("Assign an Among Us instance before removing maps.");
+        const removed = await bridge.removeLevelImposterMaps(profile, mapIds);
+        patchProfile(removed);
+        let syncError: string | null = null;
+        let warning: string | null = null;
+        try {
+          warning = await bridge.syncProfile(instance.path, removed.id);
+        } catch (error) {
+          syncError = messageFrom(error);
+        }
+        const count = mapIds.length;
+        notify(
+          syncError
+            ? `Removed ${count} map${count === 1 ? "" : "s"} from the profile, but could not synchronize the game: ${syncError}`
+            : warning
+              ? `Removed ${count} map${count === 1 ? "" : "s"}. ${warning}`
+              : `Removed ${count} LevelImposter map${count === 1 ? "" : "s"}`,
+          syncError || warning ? "error" : "success",
+        );
+      });
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
+    }
   };
 
   const renameProfile = async (name: string) => {
@@ -552,8 +772,8 @@ export function App() {
     const target = pickerTarget;
     if (!target || target.repo !== repo) return;
     try {
-      await exclusive(async () => {
-        if (target.personal) {
+      if (target.personal) {
+        await exclusive(async () => {
           const previous = settings.personalMods.find((personal) => personal.repo === target.repo);
           const normalized = await bridge.saveSettings({
             ...settings,
@@ -571,36 +791,58 @@ export function App() {
           setSettings(normalized);
           setPickerTarget(null);
           notify(`${target.name} will be added to every lobby you join`);
-          return;
-        }
+        });
+        return;
+      }
 
-        const profile = profiles.find((candidate) => candidate.id === active.id);
-        const instance = gameForProfile(profile);
-        if (!profile || !instance) throw new Error("Assign an Among Us instance before installing a mod.");
-        notify(`Installing ${assetName}…`);
-        const installed = await bridge.installAsset(profile, target.repo, tag, assetName, instance.arch, true);
-        const warnings: string[] = [];
-        let refreshed = installed;
-        try {
-          refreshed = await refreshProfileUpdates(installed);
-        } catch (error) {
-          warnings.push(`Update refresh failed: ${messageFrom(error)}`);
-        }
-        patchProfile(refreshed);
-        setPickerTarget(null);
-        if (target.returnToAdd) setAddOpen(false);
-        const loaderWarning = await ensureLoaderInternal(refreshed);
-        if (loaderWarning) warnings.push(loaderWarning);
-        try {
-          setCatalog(await bridge.loadCatalog());
-        } catch (error) {
-          warnings.push(`Catalog reload failed: ${messageFrom(error)}`);
-        }
-        notify(
-          warnings.length > 0 ? `Installed ${assetName}. ${warnings.join(" ")}` : `Installed ${assetName}`,
-          warnings.length > 0 ? "error" : "success",
-        );
-      });
+      const replacing = active.mods.some(
+        (mod) => mod.repo === target.repo || mod.packageId === target.repo,
+      );
+      await trackedExclusive(
+        {
+          scope: "release",
+          title: replacing ? `Changing ${target.name} to ${tag}` : `Installing ${target.name}`,
+          message: `Preparing ${assetName}`,
+        },
+        async (report) => {
+          const profile = profiles.find((candidate) => candidate.id === active.id);
+          const instance = gameForProfile(profile);
+          if (!profile || !instance) throw new Error("Assign an Among Us instance before installing a mod.");
+          const installed = await bridge.installAsset(
+            profile,
+            target.repo,
+            tag,
+            assetName,
+            instance.arch,
+            true,
+            report,
+          );
+          const warnings: string[] = [];
+          report({ phase: "finalizing", message: "Checking installed versions for updates" });
+          let refreshed = installed;
+          try {
+            refreshed = await refreshProfileUpdates(installed);
+          } catch (error) {
+            warnings.push(`Update refresh failed: ${messageFrom(error)}`);
+          }
+          patchProfile(refreshed);
+          report({ phase: "finalizing", message: "Checking the BepInEx loader" });
+          const loaderWarning = await ensureLoaderInternal(refreshed);
+          if (loaderWarning) warnings.push(loaderWarning);
+          report({ phase: "finalizing", message: "Refreshing the trusted catalog" });
+          try {
+            setCatalog(await bridge.loadCatalog());
+          } catch (error) {
+            warnings.push(`Catalog reload failed: ${messageFrom(error)}`);
+          }
+          setPickerTarget(null);
+          if (target.returnToAdd) setAddOpen(false);
+          notify(
+            warnings.length > 0 ? `Installed ${assetName}. ${warnings.join(" ")}` : `Installed ${assetName}`,
+            warnings.length > 0 ? "error" : "success",
+          );
+        },
+      );
     } catch (error) {
       if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
       throw error;
@@ -740,30 +982,45 @@ export function App() {
 
   const applyLobby = async (doLaunch: boolean, code: string) => {
     try {
-      await exclusive(async () => {
-        const instance = activeGame;
-        if (!instance) throw new Error("Choose a concrete Among Us instance before applying a lobby.");
-        notify("Setting up lobby…");
-        let built = await bridge.applyLobbyCode(code, instance.arch, instance.id);
-        try {
-          built = await refreshProfileUpdates(built);
-        } catch (error) {
-          notify(`Lobby installed, but update refresh failed: ${messageFrom(error)}`, "error");
-        }
-        const normalized = await bridge.saveSettings({ ...settings, activeProfile: built.id });
-        setSettings(normalized);
-        setProfiles((current) => [...current.filter((profile) => profile.id !== built.id), built]);
-        setActiveId(built.id);
-        setLobbyOpen(false);
-        const loaderWarning = await ensureLoaderInternal(built);
-        if (doLaunch) {
-          if (loaderWarning) throw new Error(loaderWarning);
-          await launchInternal(built, false);
-        } else {
-          const warning = (await bridge.syncProfile(instance.path, built.id)) ?? loaderWarning;
-          notify(warning ? `Lobby profile ready: ${built.name}. ${warning}` : `Lobby profile ready: ${built.name}`);
-        }
-      });
+      await trackedExclusive(
+        {
+          scope: "lobby",
+          title: doLaunch ? "Setting up and launching lobby" : "Setting up shared lobby",
+          message: "Reading the shared profile and exact versions",
+        },
+        async (report) => {
+          const instance = activeGame;
+          if (!instance) throw new Error("Choose a concrete Among Us instance before applying a lobby.");
+          const warnings: string[] = [];
+          let built = await bridge.applyLobbyCode(code, instance.arch, instance.id, report);
+          report({ phase: "finalizing", message: "Checking installed versions for updates" });
+          try {
+            built = await refreshProfileUpdates(built);
+          } catch (error) {
+            warnings.push(`Update refresh failed: ${messageFrom(error)}`);
+          }
+          report({ phase: "finalizing", message: "Selecting the new lobby profile" });
+          const normalized = await bridge.saveSettings({ ...settings, activeProfile: built.id });
+          setSettings(normalized);
+          setProfiles((current) => [...current.filter((profile) => profile.id !== built.id), built]);
+          setActiveId(built.id);
+          report({ phase: "finalizing", message: "Checking the BepInEx loader" });
+          const loaderWarning = await ensureLoaderInternal(built);
+          if (doLaunch) {
+            if (loaderWarning) throw new Error(loaderWarning);
+            report({ phase: "finalizing", message: `Starting ${built.name}` });
+            await launchInternal(built, false);
+            setLobbyOpen(false);
+            if (warnings.length > 0) notify(`Lobby launched. ${warnings.join(" ")}`, "error");
+          } else {
+            report({ phase: "finalizing", message: "Synchronizing the profile with Among Us" });
+            const warning = (await bridge.syncProfile(instance.path, built.id)) ?? loaderWarning;
+            setLobbyOpen(false);
+            const details = [warning, ...warnings].filter(Boolean).join(" ");
+            notify(details ? `Lobby profile ready: ${built.name}. ${details}` : `Lobby profile ready: ${built.name}`, details ? "error" : "success");
+          }
+        },
+      );
     } catch (error) {
       if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }
@@ -858,6 +1115,8 @@ export function App() {
 
   const topLevelOverlayOpen =
     addOpen ||
+    batchTargets.length > 0 ||
+    mapsOpen ||
     lobbyOpen ||
     settingsOpen ||
     pickerTarget !== null ||
@@ -873,9 +1132,7 @@ export function App() {
         aria-hidden={topLevelOverlayOpen}
       >
       <TopBar
-        onAddMod={() => {
-          if (!busy) setAddOpen(true);
-        }}
+        onAddMod={openAddPanel}
         onPasteCode={openLobbyFromCode}
         onOpenSettings={() => {
           if (!busy) setSettingsOpen(true);
@@ -928,8 +1185,10 @@ export function App() {
             onRename={(name) => void renameProfile(name)}
             onDelete={deleteActiveProfile}
             onLaunch={() => void doLaunchProfile(active)}
-            onAddMod={() => {
-              if (!busy) setAddOpen(true);
+            onAddMod={openAddPanel}
+            onBrowseMaps={() => {
+              setMapsReturnToAdd(false);
+              if (!busy) setMapsOpen(true);
             }}
             onSetup={() => void setupMods(active)}
             onSelectGameInstance={(id) => void selectGameInstance(id)}
@@ -945,13 +1204,68 @@ export function App() {
         open={addOpen}
         profileName={active.name}
         catalog={catalog}
+        installedIds={active.mods.flatMap((mod) => [mod.packageId, mod.repo ?? mod.packageId])}
+        selectedIds={selectedCatalogIds}
         onClose={() => {
-          if (!operationRef.current) setAddOpen(false);
+          if (!operationRef.current) {
+            setAddOpen(false);
+            setSelectedCatalogIds([]);
+          }
         }}
-        onAddCatalog={addCatalog}
+        onToggleCatalog={toggleCatalogSelection}
+        onReview={reviewCatalogSelection}
+        onBrowseMaps={() => {
+          if (!operationRef.current) {
+            setMapsReturnToAdd(true);
+            setAddOpen(false);
+            setMapsOpen(true);
+          }
+        }}
         onAddUrl={addUrl}
+        onAddLocal={addLocalMod}
         onRemoveCatalog={removeCatalogItem}
         onMoveCatalog={moveCatalogItem}
+      />
+      <MapBrowserPanel
+        open={mapsOpen}
+        profileId={active.id}
+        profileName={active.name}
+        levelImposterInstalled={active.mods.some(
+          (mod) =>
+            mod.packageId.toLowerCase() === "digiworm0/levelimposter" ||
+            mod.repo?.toLowerCase() === "digiworm0/levelimposter",
+        )}
+        busy={operationBusy}
+        onClose={() => {
+          if (!operationRef.current) {
+            setMapsOpen(false);
+            if (mapsReturnToAdd) setAddOpen(true);
+            setMapsReturnToAdd(false);
+          }
+        }}
+        onInstall={installSelectedMaps}
+        onRemove={removeInstalledMaps}
+      />
+      <BatchInstallReview
+        open={batchTargets.length > 0}
+        profileId={active.id}
+        profileName={active.name}
+        items={batchTargets}
+        catalog={catalog}
+        busy={operationBusy}
+        onBack={() => {
+          if (!operationRef.current) {
+            setBatchTargets([]);
+            setAddOpen(true);
+          }
+        }}
+        onClose={() => {
+          if (!operationRef.current) {
+            setBatchTargets([]);
+            setSelectedCatalogIds([]);
+          }
+        }}
+        onInstall={installSelectedMods}
       />
       <LobbyCodeModal
         open={lobbyOpen}
@@ -1011,6 +1325,7 @@ export function App() {
           if (!operationRef.current) setLaunchWarn(null);
         }}
       />
+      <OperationProgressModal activity={operationActivity} />
       <Toast toast={toast} onDismiss={() => setToast(null)} />
     </div>
   );

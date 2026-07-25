@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { CaretDown, CaretUp, GithubLogo, MagnifyingGlass, Plus, TrashSimple, X } from "@phosphor-icons/react";
+import { CaretDown, CaretUp, Check, FileArrowUp, GithubLogo, MagnifyingGlass, MapTrifold, Plus, TrashSimple, X } from "@phosphor-icons/react";
 import { Pill, primaryTag } from "./Pill";
 import { TrustBadge } from "./TrustBadge";
 import type { CatalogItem } from "../lib/types";
@@ -11,13 +11,32 @@ interface AddModPanelProps {
   profileName: string;
   catalog: CatalogItem[];
   onClose: () => void;
-  onAddCatalog: (item: CatalogItem) => Promise<void>;
+  installedIds: string[];
+  selectedIds: string[];
+  onToggleCatalog: (id: string) => void;
+  onReview: () => void;
+  onBrowseMaps: () => void;
   onAddUrl: (url: string) => Promise<void>;
+  onAddLocal: () => Promise<void>;
   onRemoveCatalog: (id: string) => Promise<void>;
   onMoveCatalog: (id: string, dir: "up" | "down") => Promise<void>;
 }
 
-export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog, onAddUrl, onRemoveCatalog, onMoveCatalog }: AddModPanelProps) {
+export function AddModPanel({
+  open,
+  profileName,
+  catalog,
+  installedIds,
+  selectedIds,
+  onClose,
+  onToggleCatalog,
+  onReview,
+  onBrowseMaps,
+  onAddUrl,
+  onAddLocal,
+  onRemoveCatalog,
+  onMoveCatalog,
+}: AddModPanelProps) {
   const reduce = useReducedMotion();
   const panelRef = useRef<HTMLElement>(null);
   const openRef = useRef(open);
@@ -49,6 +68,8 @@ export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog,
 
   const looksLikeRepo = /github\.com\/.+\/.+/i.test(url.trim());
   const normalizedQuery = query.toLowerCase();
+  const installed = new Set(installedIds.map((id) => id.toLowerCase()));
+  const selected = new Set(selectedIds);
   const results = catalog.filter(
     (item) => item.name.toLowerCase().includes(normalizedQuery) || item.summary.toLowerCase().includes(normalizedQuery),
   );
@@ -83,8 +104,16 @@ export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog,
   return (
     <AnimatePresence>
       {open && (
-        <motion.div className="fixed inset-0 z-40" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-          <div className="absolute inset-0 bg-[rgba(6,4,18,0.45)]" onClick={closePanel} />
+        <motion.div
+          className="fixed inset-0 z-40"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          onClick={(event) => {
+            if (event.target === event.currentTarget) closePanel();
+          }}
+        >
+          <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-[rgba(6,4,18,0.45)]" />
 
           <motion.aside
             ref={panelRef}
@@ -136,8 +165,21 @@ export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog,
                 </button>
               </label>
             </div>
+            <div className="px-5 pb-3">
+              <button
+                type="button"
+                onClick={() => void runAction("local", onAddLocal)}
+                disabled={actionsDisabled}
+                aria-label="Add DLL from this computer"
+                className="ring-focus glass flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2.5 text-[13px] font-semibold text-ink disabled:opacity-40"
+              >
+                <FileArrowUp size={16} />
+                {pending === "local" ? "Adding local DLL…" : "Choose a .dll from this computer"}
+              </button>
+              <p className="mt-1.5 px-1 text-[11px] leading-snug text-ink-faint">Local DLLs stay on this profile and cannot be included in lobby codes.</p>
+            </div>
 
-            {actionError && <p className="mx-5 mb-3 rounded-xl bg-[rgba(226,59,59,0.12)] px-3 py-2 text-[12.5px] break-words text-[#ff8a8a]" role="alert">Catalog action failed: {actionError}</p>}
+            {actionError && <p className="mx-5 mb-3 rounded-xl bg-[rgba(226,59,59,0.12)] px-3 py-2 text-[12.5px] break-words text-[#ff8a8a]" role="alert">Could not add mod: {actionError}</p>}
 
             <div className="flex items-center gap-3 px-5 pb-2">
               <div className="h-px flex-1 bg-white/10" />
@@ -173,7 +215,9 @@ export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog,
                 const moveUpKey = `move:${item.id}:up`;
                 const moveDownKey = `move:${item.id}:down`;
                 const removeKey = `remove:${item.id}`;
-                const addKey = `add:${item.id}`;
+                const isInstalled = installed.has(item.id.toLowerCase()) || installed.has(item.repo.toLowerCase());
+                const isSelected = selected.has(item.id);
+                const supportsMaps = item.id.toLowerCase() === "digiworm0/levelimposter";
                 return (
                   <div key={item.id} className="glass min-w-0 shrink-0 overflow-hidden rounded-2xl p-3.5" aria-label={identity}>
                     <div className="flex min-w-0 items-center gap-2">
@@ -216,15 +260,43 @@ export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog,
                           </button>
                         </div>
                       ) : (
-                        <button
-                          type="button"
-                          onClick={() => void runAction(addKey, () => onAddCatalog(item))}
-                          disabled={actionsDisabled}
-                          aria-label={`Add ${item.name} to ${profileName}`}
-                          className="ring-focus accent-grad flex shrink-0 items-center gap-1 rounded-lg px-3 py-1.5 text-[12.5px] font-semibold text-[#0d0820] transition-transform active:scale-[0.96] disabled:opacity-50"
-                        >
-                          <Plus size={13} weight="bold" /> {pending === addKey ? "Adding…" : "Add"}
-                        </button>
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          {supportsMaps && (
+                            <button
+                              type="button"
+                              onClick={onBrowseMaps}
+                              disabled={actionsDisabled}
+                              aria-label="Browse LevelImposter maps"
+                              className="ring-focus glass flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-[12.5px] font-semibold text-ink disabled:opacity-50"
+                            >
+                              <MapTrifold size={13} /> Maps
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => onToggleCatalog(item.id)}
+                            disabled={actionsDisabled || isInstalled}
+                            aria-pressed={isSelected}
+                            aria-label={
+                              isInstalled
+                                ? `${item.name} is already installed`
+                                : isSelected
+                                  ? `Remove ${item.name} from selection`
+                                  : `Select ${item.name} for ${profileName}`
+                            }
+                            className={`ring-focus flex min-w-[78px] items-center justify-center gap-1 rounded-lg px-3 py-1.5 text-[12.5px] font-semibold transition-transform active:scale-[0.96] disabled:opacity-50 ${
+                              isSelected ? "glass text-ink" : "accent-grad text-[#0d0820]"
+                            }`}
+                          >
+                            {isInstalled ? (
+                              "Installed"
+                            ) : isSelected ? (
+                              <><Check size={13} weight="bold" /> Selected</>
+                            ) : (
+                              <><Plus size={13} weight="bold" /> Select</>
+                            )}
+                          </button>
+                        </div>
                       )}
                     </div>
                   </div>
@@ -233,6 +305,25 @@ export function AddModPanel({ open, profileName, catalog, onClose, onAddCatalog,
               {!manage && results.length === 0 && <p className="px-1 py-6 text-center text-[13px] text-ink-faint">No catalog match. Paste the GitHub URL above to add it anyway.</p>}
               {manage && catalog.length === 0 && <p className="px-1 py-6 text-center text-[13px] text-ink-faint">Your catalog is empty. Paste a GitHub URL above to add a mod.</p>}
             </div>
+            {!manage && (
+              <div className="border-t border-white/10 px-5 py-4">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-[12.5px] text-ink-dim">
+                    {selectedIds.length === 0
+                      ? "Select one or more mods to continue"
+                      : `${selectedIds.length} mod${selectedIds.length === 1 ? "" : "s"} selected`}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={onReview}
+                    disabled={actionsDisabled || selectedIds.length === 0}
+                    className="ring-focus accent-grad rounded-xl px-4 py-2.5 text-[13.5px] font-bold text-[#0d0820] disabled:opacity-40"
+                  >
+                    Review selection
+                  </button>
+                </div>
+              </div>
+            )}
           </motion.aside>
         </motion.div>
       )}

@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Perfect-Sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.artriy.perfectsync",
   "build": {
     "frontendDist": "../dist",
@@ -24,8 +24,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
-      "devCsp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data: blob: https://firebasestorage.googleapis.com https://storage.googleapis.com; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "devCsp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420; img-src 'self' data: blob: https://firebasestorage.googleapis.com https://storage.googleapis.com; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
     }
   },
   "bundle": {

@@ -42,6 +42,7 @@ interface ModRowProps {
   onToggle: () => void;
   onRemove: () => Promise<void>;
   onPickRelease: () => void;
+  onBrowseMaps?: () => void;
   trust?: Trust;
 }
 
@@ -56,7 +57,7 @@ function errorMessage(error: unknown): string {
   }
 }
 
-export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRelease }: ModRowProps) {
+export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRelease, onBrowseMaps }: ModRowProps) {
   const reduce = useReducedMotion();
   const tag = mod.tags.length ? primaryTag(mod.tags) : null;
   const Glyph = (tag && ICON[tag]) || PuzzlePiece;
@@ -68,6 +69,7 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
   const titleId = useId();
   const descriptionId = useId();
   const unavailable = busy || removing;
+  const levelImposter = mod.packageId.toLowerCase() === "digiworm0/levelimposter";
 
   const closeConfirm = useCallback(() => {
     if (removeInFlight.current) return;
@@ -159,33 +161,54 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
             </span>
           )}
 
-          {mod.managed ? (
-            <>
-              <span
-                className="glass-2 max-w-40 truncate rounded-lg px-2.5 py-1.5 font-mono text-[12.5px] text-ink-faint"
-                title={mod.version}
-                aria-label={`Installed version ${mod.version}`}
-              >
-                {mod.version}
-              </span>
-              <span className="sr-only">Enable, version, and remove controls are unavailable because this mod is automatically managed.</span>
-            </>
-          ) : (
-            <>
-              <button
-                type="button"
-                onClick={() => {
-                  if (!unavailable) onPickRelease();
-                }}
-                disabled={unavailable}
-                aria-label={`Choose version and file for ${mod.name}; current version ${mod.version}`}
-                title={`Choose version / file (current: ${mod.version})`}
-                className="ring-focus glass-2 flex min-w-0 max-w-48 items-center gap-1.5 rounded-lg px-2.5 py-1.5 font-mono text-[12.5px] text-ink-dim transition-colors hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <span className="truncate">{mod.version}</span>
-                <CaretDown size={12} weight="bold" className="shrink-0 opacity-70" aria-hidden="true" />
-              </button>
+          {levelImposter && onBrowseMaps && (
+            <button
+              type="button"
+              onClick={() => {
+                if (!unavailable) onBrowseMaps();
+              }}
+              disabled={unavailable}
+              aria-label="Add or manage LevelImposter maps"
+              className="ring-focus glass-2 flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12.5px] font-semibold text-ink-dim transition-colors hover:text-ink disabled:opacity-50"
+            >
+              <MapTrifold size={14} weight="bold" /> Maps
+            </button>
+          )}
 
+          {mod.source === "file" ? (
+            <span
+              className="glass-2 max-w-48 truncate rounded-lg px-2.5 py-1.5 font-mono text-[12.5px] text-ink-faint"
+              title="Local computer file"
+              aria-label={`${mod.name} is a local computer file`}
+            >
+              Local file
+            </span>
+          ) : mod.tags.includes("loader") ? (
+            <span
+              className="glass-2 max-w-40 truncate rounded-lg px-2.5 py-1.5 font-mono text-[12.5px] text-ink-faint"
+              title={mod.version}
+              aria-label={`Installed version ${mod.version}`}
+            >
+              {mod.version}
+            </span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                if (!unavailable) onPickRelease();
+              }}
+              disabled={unavailable}
+              aria-label={`Choose version and file for ${mod.name}; current version ${mod.version}`}
+              title={`Choose version / file (current: ${mod.version})`}
+              className="ring-focus glass-2 flex min-w-0 max-w-48 items-center gap-1.5 rounded-lg px-2.5 py-1.5 font-mono text-[12.5px] text-ink-dim transition-colors hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <span className="truncate">{mod.version}</span>
+              <CaretDown size={12} weight="bold" className="shrink-0 opacity-70" aria-hidden="true" />
+            </button>
+          )}
+
+          {!mod.managed && (
+            <>
               <Toggle
                 on={mod.enabled}
                 onChange={() => {
@@ -205,6 +228,9 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
                 <TrashSimple size={16} aria-hidden="true" />
               </button>
             </>
+          )}
+          {mod.managed && !mod.tags.includes("loader") && (
+            <span className="sr-only">Enable and remove controls are unavailable because this dependency is automatically managed. Its installed version can still be changed.</span>
           )}
         </div>
       </motion.div>

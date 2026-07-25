@@ -5,6 +5,7 @@ import {
   Check,
   DownloadSimple,
   LinkSimple,
+  MapTrifold,
   Play,
   ShieldCheck,
   Warning,
@@ -22,6 +23,7 @@ interface PreviewedLobby {
   code: string;
   rows: DiffItem[];
   name: string;
+  levelImposterMaps: string[];
 }
 
 interface Confirmation {
@@ -77,7 +79,12 @@ export function LobbyCodeModal({ open, initialCode, installed, trustOf, personal
     previewCode(value, installedSnapshot)
       .then((preview) => {
         if (!openRef.current || installedRef.current !== installedSnapshot || sessionRef.current !== session || requestRef.current !== request) return;
-        setPreviewed({ code: value, rows: preview.items, name: preview.name });
+        setPreviewed({
+          code: value,
+          rows: preview.items,
+          name: preview.name,
+          levelImposterMaps: preview.levelImposterMaps,
+        });
         setMode("diff");
       })
       .catch((reason: unknown) => {
@@ -202,6 +209,7 @@ export function LobbyCodeModal({ open, initialCode, installed, trustOf, personal
                 <ResultStep
                   mode={mode}
                   diff={rows}
+                  levelImposterMaps={previewed?.levelImposterMaps ?? []}
                   personalMods={personalMods}
                   trustOf={trustOf}
                   error={error}
@@ -267,6 +275,7 @@ function InputStep({
 function ResultStep({
   mode,
   diff,
+  levelImposterMaps,
   name,
   previewedCode,
   personalMods,
@@ -279,6 +288,7 @@ function ResultStep({
 }: {
   mode: Mode;
   diff: DiffItem[];
+  levelImposterMaps: string[];
   name: string;
   previewedCode: string;
   personalMods: PersonalMod[];
@@ -323,6 +333,28 @@ function ResultStep({
               ? <p className="glass rounded-xl px-3.5 py-4 text-[13px] break-words text-[#ff8a8a] sm:col-span-2">This code could not be read: {error}</p>
               : diff.map((item, index) => <DiffRow key={`${item.repo ?? item.name}-${item.to ?? "current"}-${index}`} item={item} />)}
         </div>
+
+        {mode !== "decoding" && !error && levelImposterMaps.length > 0 && (
+          <>
+            <span className="mt-4 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
+              LevelImposter maps
+            </span>
+            <div
+              className="glass flex items-center gap-3 rounded-xl px-3.5 py-3"
+              title={levelImposterMaps.join("\n")}
+            >
+              <span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-[rgba(91,227,176,0.16)] text-[#aef3d8]">
+                <MapTrifold size={17} weight="fill" />
+              </span>
+              <div className="min-w-0">
+                <p className="text-[13.5px] font-semibold text-ink">
+                  {levelImposterMaps.length} exact map{levelImposterMaps.length === 1 ? "" : "s"}
+                </p>
+                <p className="text-[11.5px] text-ink-faint">Downloaded from LevelImposter and applied to this lobby profile.</p>
+              </div>
+            </div>
+          </>
+        )}
 
         {mode !== "decoding" && !error && flaggedCount > 0 && (
           <div
