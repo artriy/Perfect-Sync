@@ -220,6 +220,8 @@ jobs:
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+      - name: Build frontend for Rust context
+        run: pnpm build
       - name: Test Rust workspace on build host
         run: cargo test --workspace --all-targets --all-features --locked
 
