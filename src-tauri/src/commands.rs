@@ -5269,7 +5269,7 @@ mod tests {
         committed.name = "Committed".into();
         stage_store.save(&committed).unwrap();
         write_profile_recovery_journal(&paths.journal, id, ProfileRecoveryAction::Publish).unwrap();
-        fs::rename(&root.join(id), &paths.backup_root.join(id)).unwrap();
+        fs::rename(root.join(id), paths.backup_root.join(id)).unwrap();
 
         let recovered = recovered_profile_store(&root).unwrap();
         let listed = recovered.list().unwrap();
@@ -5301,7 +5301,7 @@ mod tests {
         fs::create_dir(&paths.stage_root).unwrap();
         fs::create_dir(&paths.backup_root).unwrap();
         write_profile_recovery_journal(&paths.journal, id, ProfileRecoveryAction::Publish).unwrap();
-        fs::rename(&root.join(id), &paths.backup_root.join(id)).unwrap();
+        fs::rename(root.join(id), paths.backup_root.join(id)).unwrap();
 
         let recovered = recovered_profile_store(&root).unwrap();
 
@@ -5331,7 +5331,7 @@ mod tests {
         fs::create_dir(&paths.backup_root).unwrap();
         copy_profile_tree(&root.join(id), &paths.stage_root.join(id)).unwrap();
         write_profile_recovery_journal(&paths.journal, id, ProfileRecoveryAction::Publish).unwrap();
-        fs::rename(&root.join(id), &paths.backup_root.join(id)).unwrap();
+        fs::rename(root.join(id), paths.backup_root.join(id)).unwrap();
         copy_profile_tree(&paths.backup_root.join(id), &root.join(id)).unwrap();
 
         let error = recovered_profile_store(&root).err().unwrap();

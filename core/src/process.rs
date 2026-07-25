@@ -16,27 +16,35 @@ pub const GAME_EXE: &str = "Among Us.exe";
 /// Construct a background child process without allocating a console window on
 /// Windows. Use `interactive_command` for helpers that require user input.
 pub fn command<S: AsRef<OsStr>>(program: S) -> Command {
-    let mut command = Command::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = Command::new(program);
         command.creation_flags(CREATE_NO_WINDOW);
+        command
     }
-    command
+    #[cfg(not(windows))]
+    {
+        Command::new(program)
+    }
 }
 
 /// Construct an interactive child process with inherited standard streams.
 /// Windows gets a dedicated visible console so GUI parents cannot hide prompts.
 pub fn interactive_command<S: AsRef<OsStr>>(program: S) -> Command {
-    let mut command = Command::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let mut command = Command::new(program);
         command.creation_flags(CREATE_NEW_CONSOLE);
+        command
     }
-    command
+    #[cfg(not(windows))]
+    {
+        Command::new(program)
+    }
 }
 
 /// Launch a console helper with usable standard handles. Windows must bypass
