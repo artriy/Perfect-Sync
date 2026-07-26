@@ -39,7 +39,7 @@ interface LobbyCodeModalProps {
   personalMods: PersonalMod[];
   busyReason?: string;
   onClose: () => void;
-  onApply: (launch: boolean, code: string) => void;
+  onApply: (launch: boolean, code: string, mods: readonly { repo?: string }[]) => void;
 }
 
 export function LobbyCodeModal({ open, initialCode, installed, trustOf, personalMods, busyReason, onClose, onApply }: LobbyCodeModalProps) {
@@ -139,7 +139,10 @@ export function LobbyCodeModal({ open, initialCode, installed, trustOf, personal
       setConfirmation({ code: previewed.code, launch });
       return;
     }
-    onApply(launch, previewed.code);
+    onApply(launch, previewed.code, [
+      ...previewed.rows,
+      ...personalMods.filter((mod) => mod.enabled !== false),
+    ]);
   };
 
   const confirmApply = () => {
@@ -149,7 +152,10 @@ export function LobbyCodeModal({ open, initialCode, installed, trustOf, personal
     }
     const { launch, code: confirmedCode } = confirmation;
     setConfirmation(null);
-    onApply(launch, confirmedCode);
+    onApply(launch, confirmedCode, [
+      ...previewed.rows,
+      ...personalMods.filter((mod) => mod.enabled !== false),
+    ]);
   };
 
   const rows = previewed?.rows ?? [];

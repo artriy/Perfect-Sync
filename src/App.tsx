@@ -12,6 +12,7 @@ import { ReleasePicker } from "./components/ReleasePicker";
 import { ShareModal } from "./components/ShareModal";
 import { SetupModal, type SetupSelection } from "./components/SetupModal";
 import { LaunchWarning } from "./components/LaunchWarning";
+import { MainModWarning } from "./components/MainModWarning";
 import { Toast, type ToastState } from "./components/Toast";
 import {
   OperationProgressModal,
@@ -20,6 +21,7 @@ import {
 } from "./components/OperationProgressModal";
 import * as bridge from "./lib/bridge";
 import { CREW } from "./lib/palette";
+import { findMainMods, type MainMod, type MainModCandidate } from "./lib/mainMods";
 import type {
   Arch,
   CatalogItem,
@@ -88,6 +90,7 @@ export function App() {
   const launchSession = useRef(0);
   const startupPromiseRef = useRef<Promise<StartupResult> | null>(null);
   const operationActivityId = useRef(0);
+  const mainModWarningResolver = useRef<((confirmed: boolean) => void) | null>(null);
 
   const [games, setGames] = useState<GameInstall[]>([]);
   const [settings, setSettings] = useState<Settings>(EMPTY_SETTINGS);
@@ -108,6 +111,10 @@ export function App() {
   const [setupOpen, setSetupOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [launchWarn, setLaunchWarn] = useState<Profile | null>(null);
+  const [mainModWarning, setMainModWarning] = useState<{
+    mods: MainMod[];
+    actionLabel: string;
+  } | null>(null);
   const [pickerTarget, setPickerTarget] = useState<{
     repo: string;
     name: string;
@@ -126,6 +133,29 @@ export function App() {
     if (kind === "success") {
       window.setTimeout(() => setToast((current) => (current?.id === id ? null : current)), 2600);
     }
+  };
+
+  const requestMainModConfirmation = (
+    existing: readonly MainModCandidate[],
+    incoming: readonly MainModCandidate[],
+    actionLabel: string,
+  ): Promise<boolean> => {
+    if (findMainMods(incoming).length === 0) return Promise.resolve(true);
+    const mods = findMainMods([...existing, ...incoming]);
+    if (mods.length <= 1) return Promise.resolve(true);
+    if (mainModWarningResolver.current) return Promise.resolve(false);
+
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    mainModWarningResolver.current = resolve;
+    setMainModWarning({ mods, actionLabel });
+    return promise;
+  };
+
+  const resolveMainModWarning = (confirmed: boolean) => {
+    const resolve = mainModWarningResolver.current;
+    mainModWarningResolver.current = null;
+    setMainModWarning(null);
+    resolve?.(confirmed);
   };
 
   const setRunning = (value: boolean) => {
@@ -195,6 +225,12 @@ export function App() {
       window.removeEventListener("keydown", useKeyboardFocus, true);
       delete root.dataset.inputModality;
     };
+  }, []);
+
+  useEffect(() => () => {
+    const resolve = mainModWarningResolver.current;
+    mainModWarningResolver.current = null;
+    resolve?.(false);
   }, []);
 
   // StrictMode replays effects. The startup promise is created synchronously
@@ -550,6 +586,13 @@ export function App() {
   };
 
   const installSelectedMods = async (selections: ModInstallSelection[]): Promise<void> => {
+    const currentProfile = profiles.find((candidate) => candidate.id === active.id);
+    const confirmed = await requestMainModConfirmation(
+      currentProfile?.mods ?? [],
+      selections,
+      "Install anyway",
+    );
+    if (!confirmed) return;
     try {
       await trackedExclusive(
         {
@@ -763,11 +806,14 @@ export function App() {
   const pickRelease = async (repo: string, tag: string, assetName: string) => {
     const target = pickerTarget;
     if (!target || target.repo !== repo) return;
+    const replacing = active.mods.some(
+      (mod) => mod.repo === target.repo || mod.packageId === target.repo,
+    );
+    if (
+      !replacing &&
+      !await requestMainModConfirmation(active.mods, [{ repo: target.repo }], "Install anyway")
+    ) return;
     try {
-
-      const replacing = active.mods.some(
-        (mod) => mod.repo === target.repo || mod.packageId === target.repo,
-      );
       await trackedExclusive(
         {
           scope: "release",
@@ -945,7 +991,17 @@ export function App() {
     setLobbyOpen(true);
   };
 
-  const applyLobby = async (doLaunch: boolean, code: string) => {
+  const applyLobby = async (
+    doLaunch: boolean,
+    code: string,
+    mods: readonly MainModCandidate[],
+  ) => {
+    const confirmed = await requestMainModConfirmation(
+      [],
+      mods,
+      doLaunch ? "Apply & launch anyway" : "Apply anyway",
+    );
+    if (!confirmed) return;
     try {
       await trackedExclusive(
         {
@@ -1054,7 +1110,15 @@ export function App() {
     store?: string,
     runtime?: Runtime,
     selection?: SetupSelection,
-  ) => {
+  ): Promise<boolean> => {
+    if (
+      selection?.kind === "tou" &&
+      !await requestMainModConfirmation(
+        active.mods,
+        [{ repo: "AU-Avengers/TOU-Mira" }],
+        "Install anyway",
+      )
+    ) return false;
     try {
       await trackedExclusive(
         {
@@ -1127,6 +1191,7 @@ export function App() {
           patchProfile(savedProfile);
         },
       );
+      return true;
     } catch (error) {
       if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
       throw error;
@@ -1188,7 +1253,8 @@ export function App() {
     firstRun ||
     setupOpen ||
     updateReviewOpen ||
-    launchWarn !== null;
+    launchWarn !== null ||
+    mainModWarning !== null;
 
   return (
     <div className="flex h-[100dvh] flex-col max-[720px]:h-auto max-[720px]:min-h-[100dvh]">
@@ -1412,6 +1478,15 @@ export function App() {
           if (!operationRef.current) setLaunchWarn(null);
         }}
       />
+      {mainModWarning && (
+        <MainModWarning
+          key={mainModWarning.mods.map((mod) => mod.id).join("|")}
+          mods={mainModWarning.mods}
+          actionLabel={mainModWarning.actionLabel}
+          onCancel={() => resolveMainModWarning(false)}
+          onConfirm={() => resolveMainModWarning(true)}
+        />
+      )}
       <OperationProgressModal activity={operationActivity} />
       <Toast toast={toast} onDismiss={() => setToast(null)} />
     </div>

@@ -26,6 +26,9 @@
   game-instance data.
 - Accept pinned BepInEx build identifiers containing SemVer `+` metadata in the
   validated loader cache path.
+- Warn before installs, Town of Us setup, or shared-lobby application would
+  combine known main mods, and require explicit incompatibility acknowledgment
+  before continuing. Final Suspect is included in this safeguard.
 
 ## v0.1.2 (experimental)
 

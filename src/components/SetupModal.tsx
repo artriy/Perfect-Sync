@@ -26,7 +26,7 @@ interface SetupModalProps {
     store?: string,
     runtime?: Runtime,
     selection?: SetupSelection,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   onInstallLoader: (
     gamePath: string,
     profileId: string,
@@ -344,7 +344,10 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
         : "Saving setup…",
     );
     try {
-      await finishRef.current(game.path, game.arch, game.store, game.runtime, selection);
+      const completed = await finishRef.current(game.path, game.arch, game.store, game.runtime, selection);
+      if (!completed && openRef.current && sessionRef.current === session) {
+        setMessage("Setup canceled. No changes were made.");
+      }
     } catch (error) {
       if (openRef.current && sessionRef.current === session) {
         setMessage(`Setup failed: ${error instanceof Error ? error.message : String(error)}`);
