@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import perfectSyncLogo from "../assets/perfect-sync-logo.svg";
-import { Copy, FirstAid, GearSix, LinkSimple, Minus, Plus, Square, X } from "@phosphor-icons/react";
+import { Copy, GearSix, LinkSimple, Minus, Plus, Square, X } from "@phosphor-icons/react";
 import {
   onWindowResized,
   winClose,
@@ -13,10 +13,9 @@ interface TopBarProps {
   onAddMod: () => void;
   onJoinLobby: () => void;
   onOpenSettings: () => void;
-  onOpenMaintenance: () => void;
 }
 
-export function TopBar({ onAddMod, onJoinLobby, onOpenSettings, onOpenMaintenance }: TopBarProps) {
+export function TopBar({ onAddMod, onJoinLobby, onOpenSettings }: TopBarProps) {
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
@@ -62,7 +61,7 @@ export function TopBar({ onAddMod, onJoinLobby, onOpenSettings, onOpenMaintenanc
         />
         <div data-tauri-drag-region className="flex items-baseline gap-1.5 font-semibold tracking-tight">
           <span data-tauri-drag-region>Perfect-Sync</span>
-          <span data-tauri-drag-region className="font-mono text-[11px] font-medium text-ink-faint max-[600px]:hidden">v0.1.2</span>
+          <span data-tauri-drag-region className="font-mono text-[11px] font-medium text-ink-faint max-[600px]:hidden">v0.1.3</span>
         </div>
       </div>
 
@@ -84,15 +83,6 @@ export function TopBar({ onAddMod, onJoinLobby, onOpenSettings, onOpenMaintenanc
       >
         <Plus size={15} weight="bold" className="text-accent-2" aria-hidden="true" />
         <span className="max-[600px]:sr-only">Add mod</span>
-      </button>
-
-      <button
-        type="button"
-        aria-label="Health and maintenance"
-        onClick={onOpenMaintenance}
-        className="ring-focus glass grid h-10 w-10 shrink-0 place-items-center rounded-xl text-ink-dim transition-colors hover:text-crew-cyan"
-      >
-        <FirstAid size={18} />
       </button>
 
       <button

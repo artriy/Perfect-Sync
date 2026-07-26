@@ -76,9 +76,16 @@ fn live_town_of_us_release_includes_version_matched_cosmetics() {
 
     let release = resolver::fetch_release_by_tag(&http, tou_cosmetics::PACKAGE_ID, &plugin.version)
         .expect("resolve the exact selected Town of Us release");
-    let pack =
-        tou_cosmetics::select_release_pack(&release, "x86", perfect_sync_core::types::Store::Steam)
-            .expect("select the matching Steam cosmetics pack");
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| {
+            let name = asset.name.to_ascii_lowercase();
+            name.ends_with(".zip") && name.contains("x86") && name.contains("steam")
+        })
+        .expect("select the matching Steam cosmetics pack");
+    let pack = resolver::resolved_asset(&http, &release, asset)
+        .expect("resolve the selected pack's download metadata");
     assert_eq!(pack.version, plugin.version);
     assert!(pack.asset_name.to_ascii_lowercase().contains("x86"));
     assert!(pack.asset_name.to_ascii_lowercase().contains("steam"));

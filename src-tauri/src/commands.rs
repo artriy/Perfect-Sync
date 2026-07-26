@@ -35,6 +35,32 @@ const DEFAULT_CATALOG_URL: &str =
 const MAX_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_USER_CATALOG_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CATALOG_ENVELOPE_BYTES: u64 = MAX_CATALOG_BYTES * 2 + MAX_USER_CATALOG_BYTES + 64 * 1024;
+const DOORSTOP_FIX_VERSION: &str = "4.5.1";
+const DOORSTOP_FIX_URL: &str =
+    "https://github.com/Pietrodjaowjao/UnityDoorstop/releases/download/v4.5.1/doorstop_win_release.zip";
+const DOORSTOP_FIX_SIZE: usize = 34_391;
+const DOORSTOP_FIX_SHA256: &str =
+    "c729811c724395d871e97ff2f49be71963951147ed8b878cb0be5d2e439b55b7";
+const PINNED_LOADER_VERSION: &str = "be.753+0d275a4";
+const PINNED_LOADER_X86_URL: &str =
+    "https://builds.bepinex.dev/projects/bepinex_be/753/BepInEx-Unity.IL2CPP-win-x86-6.0.0-be.753%2B0d275a4.zip";
+const PINNED_LOADER_X64_URL: &str =
+    "https://builds.bepinex.dev/projects/bepinex_be/753/BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.753%2B0d275a4.zip";
+const TOU_MIRA_ID: &str = "AU-Avengers/TOU-Mira";
+const TOU_BUNDLED_DEPENDENCY_IDS: &[&str] = &[
+    "All-Of-Us-Mods/MiraAPI",
+    "NuclearPowered/Reactor",
+    "miniduikboot/Mini.RegionInstall",
+];
+const TOU_BUNDLED_PLUGIN_FILES: &[&str] = &["Mini.RegionInstall.dll", "MiraAPI.dll", "Reactor.dll"];
+const PRIORITY_CATALOG_IDS: &[&str] = &[
+    "TheOtherRolesAU/TheOtherRoles",
+    TOU_MIRA_ID,
+    "EnhancedNetwork/TownofHost-Enhanced",
+    "Mehzxzz/TownOfExtra",
+    LEVELIMPOSTER_ID,
+];
+const MAX_TOU_PACKAGE_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const LEVELIMPOSTER_API: &str = "https://api.levelimposter.net";
 const LEVELIMPOSTER_ALGOLIA_URL: &str =
     "https://T5IVXJGKB9-dsn.algolia.net/1/indexes/LevelImposter-Maps";
@@ -344,12 +370,18 @@ fn game_artifact_transaction<T>(
         PathBuf::from(DISABLED_DOORSTOP),
         PathBuf::from("doorstop_config.ini"),
         PathBuf::from(".doorstop_version"),
+        PathBuf::from("changelog.txt"),
         PathBuf::from("steam_appid.txt"),
         PathBuf::from("dotnet"),
         PathBuf::from("BepInEx").join(APP_LOADER_MARKER),
+        PathBuf::from("BepInEx").join(loader::DOORSTOP_PATCH_MARKER),
+        PathBuf::from("BepInEx").join(loader::MANAGED_TOU_PACKAGE_MARKER),
+        PathBuf::from(loader::DOORSTOP_PATCH_TRANSACTION),
         PathBuf::from("BepInEx/core"),
         PathBuf::from("BepInEx/config"),
+        PathBuf::from("BepInEx/patchers"),
         PathBuf::from("BepInEx/interop"),
+        PathBuf::from("BepInEx/unity-libs"),
         PathBuf::from("BepInEx/cache"),
         PathBuf::from("BepInEx/plugins"),
     ];
@@ -1118,8 +1150,30 @@ fn apply_bundled_display_policy(list: &mut [CatalogListItem]) {
     for item in list {
         if let Some(authoritative) = bundled.get(&item.id) {
             item.dependencies = authoritative.dependencies.clone();
+            item.included = catalog_item(authoritative.clone()).included;
         }
     }
+}
+
+fn catalog_display_rank(item: &CatalogListItem) -> usize {
+    PRIORITY_CATALOG_IDS
+        .iter()
+        .position(|id| id.eq_ignore_ascii_case(&item.id))
+        .unwrap_or_else(|| {
+            if item.tags.contains(&ModTag::Library)
+                || TOU_BUNDLED_DEPENDENCY_IDS
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(&item.id))
+            {
+                usize::MAX
+            } else {
+                PRIORITY_CATALOG_IDS.len()
+            }
+        })
+}
+
+fn apply_default_catalog_order(list: &mut [CatalogListItem]) {
+    list.sort_by_key(catalog_display_rank);
 }
 
 fn recovered_profile_store(root: &Path) -> Result<ProfileStore, String> {
@@ -1173,6 +1227,135 @@ fn profile_arch(profile_id: &str) -> Result<String, String> {
         .map_err(|error| error.to_string())?
         .ok_or("profile not found")?;
     saved_game_arch(record.game_instance_id.as_deref())
+}
+
+fn profile_store_runtime(profile_id: &str) -> Result<(Store, Runtime), String> {
+    validate_profile_id(profile_id)?;
+    let record = store()?
+        .load(profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("profile not found")?;
+    let saved = settings::load().map_err(|error| error.to_string())?;
+    let instance = match record.game_instance_id.as_deref() {
+        Some(id) => saved
+            .game_instances
+            .iter()
+            .find(|instance| instance.id == id)
+            .ok_or("unknown game instance")?,
+        None => saved
+            .game_instances
+            .first()
+            .ok_or("save a game instance before resolving Town of Us assets")?,
+    };
+    Ok((instance.store, instance.runtime))
+}
+
+fn is_tou_mira(identity: &str) -> bool {
+    identity.eq_ignore_ascii_case(TOU_MIRA_ID)
+}
+
+fn tou_package_key(version: &str, asset_name: &str) -> String {
+    let mut identity = Vec::with_capacity(version.len() + asset_name.len() + 1);
+    identity.extend_from_slice(version.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(asset_name.as_bytes());
+    sha256_hex(&identity)
+}
+
+fn tou_package_cache_path(version: &str, asset_name: &str) -> PathBuf {
+    settings::cache_dir()
+        .join("tou-mira")
+        .join(format!("{}.zip", tou_package_key(version, asset_name)))
+}
+
+fn cache_tou_package(version: &str, asset_name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_TOU_PACKAGE_CACHE_BYTES {
+        return Err("Town of Us package has an invalid download size".into());
+    }
+    let path = tou_package_cache_path(version, asset_name);
+    if let Some(existing) = read_bounded(&path, MAX_TOU_PACKAGE_CACHE_BYTES)? {
+        if existing == bytes {
+            return Ok(path);
+        }
+    }
+    atomic_write(&path, bytes)?;
+    Ok(path)
+}
+
+fn tou_asset_fragment(arch: &str, store: Store, runtime: Runtime) -> Result<&'static str, String> {
+    match arch {
+        "x64" => Ok("x64-epic-msstore.zip"),
+        "x86" if runtime != Runtime::Native => Ok("x86-macos-linux.zip"),
+        "x86" if matches!(store, Store::Steam | Store::Itch | Store::Manual) => {
+            Ok("x86-steam-itch.zip")
+        }
+        "x86" => Err("Town of Us has no x86 Epic/MS Store package for native Windows".into()),
+        _ => Err("Among Us executable architecture is unsupported".into()),
+    }
+}
+
+fn pick_profile_asset<'a>(
+    release: &'a Release,
+    repo: &str,
+    rules: &AssetRules,
+    arch: &str,
+    store: Store,
+    runtime: Runtime,
+) -> Result<Option<&'a resolver::Asset>, String> {
+    if !is_tou_mira(repo) {
+        return Ok(resolver::pick_asset(release, rules, arch));
+    }
+    let fragment = tou_asset_fragment(arch, store, runtime)?;
+    let mut matches = release.assets.iter().filter(|asset| {
+        let name = asset.name.to_ascii_lowercase();
+        name.ends_with(".zip") && name.contains(fragment)
+    });
+    let selected = matches.next();
+    if selected.is_some() && matches.next().is_some() {
+        return Err(format!(
+            "Town of Us release {} has multiple {fragment} packages",
+            release.tag
+        ));
+    }
+    Ok(selected)
+}
+
+fn resolve_profile_tag(
+    http: &dyn Http,
+    repo: &str,
+    tag: &str,
+    rules: &AssetRules,
+    arch: &str,
+    store: Store,
+    runtime: Runtime,
+) -> Result<ResolvedDownload, String> {
+    if !is_tou_mira(repo) {
+        return resolver::resolve_tag(http, repo, tag, rules, arch)
+            .map_err(|error| error.to_string());
+    }
+    let release =
+        resolver::fetch_release_by_tag(http, repo, tag).map_err(|error| error.to_string())?;
+    let asset = pick_profile_asset(&release, repo, rules, arch, store, runtime)?
+        .ok_or_else(|| format!("Town of Us {tag} has no compatible full package"))?;
+    resolver::resolved_asset(http, &release, asset).map_err(|error| error.to_string())
+}
+
+fn resolve_profile_latest(
+    http: &dyn Http,
+    repo: &str,
+    rules: &AssetRules,
+    arch: &str,
+    store: Store,
+    runtime: Runtime,
+) -> Result<ResolvedDownload, String> {
+    if !is_tou_mira(repo) {
+        return resolver::resolve_latest(http, repo, rules, arch)
+            .map_err(|error| error.to_string());
+    }
+    let release = resolver::fetch_latest_release(http, repo).map_err(|error| error.to_string())?;
+    let asset = pick_profile_asset(&release, repo, rules, arch, store, runtime)?
+        .ok_or_else(|| format!("Town of Us {} has no compatible full package", release.tag))?;
+    resolver::resolved_asset(http, &release, asset).map_err(|error| error.to_string())
 }
 
 fn arch_str(a: Arch) -> String {
@@ -1487,9 +1670,17 @@ fn install_resolved(
     Err("Only .dll files and catalog-declared .zip packages can be installed.".into())
 }
 
-/// Resolve the newest BepInEx loader (id + download url) for `arch`.
-/// Preferred: scrape the latest build from builds.bepinex.dev (always current,
-/// never hardcoded). Fallbacks: BepInEx Among Us pack API, then a fixed url.
+fn pinned_loader(arch: &str) -> Result<(String, String), String> {
+    let url = match arch {
+        "x86" => PINNED_LOADER_X86_URL,
+        "x64" => PINNED_LOADER_X64_URL,
+        _ => return Err("Among Us executable architecture is unsupported".into()),
+    };
+    Ok((PINNED_LOADER_VERSION.to_string(), url.to_string()))
+}
+
+/// Resolve the newest BepInEx loader for the explicit Advanced action.
+/// The normal setup and reinstall paths use the pinned build instead.
 fn resolve_loader(http: &dyn Http, arch: &str) -> Result<(String, String), String> {
     let loader = bundled_catalog()
         .loader
@@ -1542,77 +1733,188 @@ fn download_loader_for_ensure(
         Err(error) => Err(error),
     }
 }
+fn download_doorstop_fix(http: &dyn Http) -> Result<Vec<u8>, String> {
+    let bytes = http
+        .get_bytes(DOORSTOP_FIX_URL)
+        .map_err(|error| format!("could not download the BepInEx compatibility fix: {error}"))?;
+    if bytes.len() != DOORSTOP_FIX_SIZE {
+        return Err(format!(
+            "BepInEx compatibility fix size mismatch: expected {DOORSTOP_FIX_SIZE} bytes, received {}",
+            bytes.len()
+        ));
+    }
+    if sha256_hex(&bytes) != DOORSTOP_FIX_SHA256 {
+        return Err("BepInEx compatibility fix failed SHA-256 verification".into());
+    }
+    Ok(bytes)
+}
+
+fn install_loader_and_optional_fix(
+    game_dir: &Path,
+    pack: Option<(&Path, &str)>,
+    fix: Option<&[u8]>,
+) -> Result<(), String> {
+    game_artifact_transaction(game_dir, || {
+        if let Some((pack_root, version)) = pack {
+            loader::install_pack(pack_root, game_dir, version)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(bytes) = fix {
+            let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
+                .map(arch_str)
+                .ok_or("Among Us executable architecture is unsupported")?;
+            loader::install_windows_doorstop_patch(bytes, game_dir, DOORSTOP_FIX_VERSION, &arch)
+                .map_err(|error| error.to_string())?;
+        } else if pack.is_some() {
+            loader::clear_doorstop_patch_marker(game_dir).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })
+}
+
+fn doorstop_fix_is_current(game_dir: &Path, arch: &str) -> bool {
+    loader::has_doorstop_patch(game_dir, DOORSTOP_FIX_VERSION, arch)
+}
 
 /// Install the Doorstop/BepInEx loader for a profile (idempotent). Downloads +
 /// caches the GitHub pack once per arch.
-fn ensure_loader_impl(game_path: &str, profile_id: &str, _arch: &str) -> Result<(), String> {
+fn ensure_loader_impl(
+    game_path: &str,
+    profile_id: &str,
+    _arch: &str,
+    apply_doorstop_fix: bool,
+    http: &dyn Http,
+    reporter: Option<&ProgressReporter>,
+) -> Result<(), String> {
+    if let Some(reporter) = reporter {
+        reporter.stage(
+            "preparing",
+            "Checking the Among Us folder and active profile",
+        );
+    }
     game_is_stopped()?;
     let game_dir = validate_game_target(game_path, Some(profile_id))?;
     restore_doorstop(&game_dir)?;
     validate_game_dir(&game_dir)?;
     let root = settings::profiles_root();
-    recovered_profile_store(&root)?
+    let profile = recovered_profile_store(&root)?
         .load(profile_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "profile not found".to_string())?;
+    if profile_uses_tou_mira(&profile) {
+        if apply_doorstop_fix {
+            return Err(
+                "Town of Us includes its own fixed UnityDoorstop build; the separate compatibility fix is only available for BepInEx-only profiles."
+                    .into(),
+            );
+        }
+        return loader::has_loader(&game_dir)
+            .then_some(())
+            .ok_or_else(|| "The Town of Us BepInEx package is missing. Synchronize the profile to restore its complete release package.".into());
+    }
     let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
         .map(arch_str)
         .ok_or("Among Us executable architecture is unsupported")?;
-    let http = http()?;
+    if let Some(reporter) = reporter {
+        reporter.stage(
+            "resolving",
+            "Checking the pinned BepInEx build and local cache",
+        );
+    }
     let have = loader::has_loader(&game_dir);
-    let Some((id, url)) = resolve_loader_for_ensure(have, || resolve_loader(&http, &arch))? else {
-        return Ok(());
-    };
-    if have && !loader::is_outdated(loader::installed_version(&game_dir).as_deref(), &id) {
+    let resolved = resolve_loader_for_ensure(have, || pinned_loader(&arch))?;
+    let requested_install = resolved.filter(|(id, _)| {
+        !have || loader::is_outdated(loader::installed_version(&game_dir).as_deref(), id)
+    });
+
+    let mut pack_install = None;
+    if let Some((id, url)) = requested_install {
+        let cache = loader::loader_cache_dir(&settings::cache_dir(), &id, &arch)
+            .map_err(|error| error.to_string())?;
+        let pack_root = if let Some(root) = loader::locate_pack_root(&cache) {
+            Some(root)
+        } else {
+            download_loader_for_ensure(have, || {
+                http.get_bytes(&url).map_err(|error| error.to_string())
+            })?
+            .map(|bytes| {
+                loader::publish_pack_cache(&bytes, &cache).map_err(|error| error.to_string())
+            })
+            .transpose()?
+        };
+        if let Some(pack_root) = pack_root {
+            pack_install = Some((pack_root, id));
+        }
+    }
+
+    let needs_fix = apply_doorstop_fix && !doorstop_fix_is_current(&game_dir, &arch);
+    if pack_install.is_none() && !needs_fix {
         return Ok(());
     }
-    let cache_root = settings::cache_dir();
-    let cache =
-        loader::loader_cache_dir(&cache_root, &id, &arch).map_err(|error| error.to_string())?;
-    let pack_root = if let Some(root) = loader::locate_pack_root(&cache) {
-        root
+    if let Some(reporter) = reporter {
+        reporter.stage(
+            "finalizing",
+            "Publishing and configuring the BepInEx loader",
+        );
+    }
+    let fix = if apply_doorstop_fix {
+        Some(download_doorstop_fix(http)?)
     } else {
-        let Some(bytes) = download_loader_for_ensure(have, || {
-            http.get_bytes(&url).map_err(|error| error.to_string())
-        })?
-        else {
-            return Ok(());
-        };
-        loader::publish_pack_cache(&bytes, &cache).map_err(|error| error.to_string())?
+        None
     };
     game_is_stopped()?;
-    game_artifact_transaction(&game_dir, || {
-        loader::install_pack(&pack_root, &game_dir, &id).map_err(|error| error.to_string())
-    })
+    install_loader_and_optional_fix(
+        &game_dir,
+        pack_install
+            .as_ref()
+            .map(|(root, version)| (root.as_path(), version.as_str())),
+        fix.as_deref(),
+    )
 }
 
 /// Force a fresh BepInEx download and rollback-safe replacement while keeping
 /// profile plugins and the prior working loader intact on failure.
-fn reinstall_loader_impl(game_path: &str, profile_id: &str, _arch: &str) -> Result<(), String> {
+fn reinstall_loader_impl(
+    game_path: &str,
+    profile_id: &str,
+    _arch: &str,
+    apply_doorstop_fix: bool,
+    use_latest_loader: bool,
+) -> Result<(), String> {
     game_is_stopped()?;
     let game_dir = validate_game_target(game_path, Some(profile_id))?;
     restore_doorstop(&game_dir)?;
     validate_game_dir(&game_dir)?;
     let root = settings::profiles_root();
-    recovered_profile_store(&root)?
+    let profile = recovered_profile_store(&root)?
         .load(profile_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "profile not found".to_string())?;
+    if profile_uses_tou_mira(&profile) {
+        return Err(
+            "Town of Us owns this profile's BepInEx build. Reinstall or change the Town of Us release instead."
+                .into(),
+        );
+    }
     let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
         .map(arch_str)
         .ok_or("Among Us executable architecture is unsupported")?;
     let http = http()?;
-    let (version, url) = resolve_loader(&http, &arch)?;
+    let (version, url) = if use_latest_loader {
+        resolve_loader(&http, &arch)?
+    } else {
+        pinned_loader(&arch)?
+    };
     let bytes = http.get_bytes(&url).map_err(|error| error.to_string())?;
-    let cache_root = settings::cache_dir();
-    let cache = loader::loader_cache_dir(&cache_root, &version, &arch)
+    let cache = loader::loader_cache_dir(&settings::cache_dir(), &version, &arch)
         .map_err(|error| error.to_string())?;
     let pack_root =
         loader::publish_pack_cache(&bytes, &cache).map_err(|error| error.to_string())?;
+    let fix = apply_doorstop_fix
+        .then(|| download_doorstop_fix(&http))
+        .transpose()?;
     game_is_stopped()?;
-    game_artifact_transaction(&game_dir, || {
-        loader::install_pack(&pack_root, &game_dir, &version).map_err(|error| error.to_string())
-    })
+    install_loader_and_optional_fix(&game_dir, Some((&pack_root, &version)), fix.as_deref())
 }
 
 // ---------- settings + detection ----------
@@ -1849,6 +2151,8 @@ pub struct CatalogListItem {
     pub latest: String,
     #[serde(default)]
     pub dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub included: Vec<String>,
     #[serde(default)]
     pub trust: Trust,
     #[serde(flatten)]
@@ -1856,6 +2160,16 @@ pub struct CatalogListItem {
 }
 
 fn catalog_item(entry: perfect_sync_core::catalog::CatalogEntry) -> CatalogListItem {
+    let included = if is_tou_mira(&entry.id) {
+        vec![
+            "MiraAPI".into(),
+            "Reactor".into(),
+            "Mini.RegionInstall with the Town of Us server config".into(),
+            "Town of Us cosmetics".into(),
+        ]
+    } else {
+        Vec::new()
+    };
     CatalogListItem {
         id: entry.id.clone(),
         name: entry.name,
@@ -1863,6 +2177,7 @@ fn catalog_item(entry: perfect_sync_core::catalog::CatalogEntry) -> CatalogListI
         summary: entry.summary,
         tags: entry.tags,
         dependencies: entry.dependencies,
+        included,
         latest: String::new(),
         trust: Trust::Flagged,
         extra: HashMap::new(),
@@ -1886,6 +2201,8 @@ struct CatalogEnvelope {
     version: u32,
     display: Vec<CatalogListItem>,
     #[serde(default)]
+    order_policy_version: u32,
+    #[serde(default)]
     hosted_ids: Vec<String>,
     #[serde(default)]
     hidden_hosted_ids: Vec<String>,
@@ -1896,6 +2213,8 @@ struct CatalogEnvelope {
 fn catalog_envelope_version() -> u32 {
     1
 }
+
+const CATALOG_ORDER_POLICY_VERSION: u32 = 1;
 
 fn validate_catalog_list(list: &mut [CatalogListItem]) -> Result<(), String> {
     if serde_json::to_vec(list)
@@ -1925,6 +2244,10 @@ fn load_catalog_state() -> Result<CatalogEnvelope, String> {
             if envelope.version != catalog_envelope_version() {
                 return Err("unsupported user catalog envelope version".into());
             }
+            if envelope.order_policy_version < CATALOG_ORDER_POLICY_VERSION {
+                apply_default_catalog_order(&mut envelope.display);
+                envelope.order_policy_version = CATALOG_ORDER_POLICY_VERSION;
+            }
             validate_catalog_list(&mut envelope.display)?;
             if let Some(hosted) = envelope.hosted_catalog.take() {
                 envelope.hosted_catalog = Some(validate_persisted_catalog(hosted)?);
@@ -1934,14 +2257,16 @@ fn load_catalog_state() -> Result<CatalogEnvelope, String> {
     }
     let legacy = legacy_catalog()?;
     let legacy_ids: Vec<String> = legacy.mods.iter().map(|entry| entry.id.clone()).collect();
-    let display = match stored {
+    let mut display = match stored {
         Some(bytes) => serde_json::from_slice::<Vec<CatalogListItem>>(&bytes)
             .map_err(|error| format!("invalid user catalog: {error}"))?,
         None => legacy.mods.iter().cloned().map(catalog_item).collect(),
     };
+    apply_default_catalog_order(&mut display);
     let mut state = CatalogEnvelope {
         version: catalog_envelope_version(),
         display,
+        order_policy_version: CATALOG_ORDER_POLICY_VERSION,
         hosted_ids: legacy_ids,
         hidden_hosted_ids: Vec::new(),
         hosted_catalog: Some(legacy),
@@ -2008,6 +2333,7 @@ fn ensure_display_catalog_state(
         tags,
         latest: String::new(),
         dependencies: Vec::new(),
+        included: Vec::new(),
         trust: Trust::Flagged,
         extra: HashMap::new(),
     });
@@ -2082,6 +2408,7 @@ fn reconcile_hosted(mut state: CatalogEnvelope, hosted: &Catalog) -> CatalogEnve
     }
     apply_bundled_display_policy(&mut output);
     apply_authoritative_trust(&mut output);
+    apply_default_catalog_order(&mut output);
     state.display = output;
     state.hosted_ids = hosted.mods.iter().map(|entry| entry.id.clone()).collect();
     state.hosted_catalog = Some(hosted.clone());
@@ -2401,6 +2728,32 @@ fn install_options(
     options
 }
 
+fn install_options_for_profile(
+    releases: Vec<Release>,
+    repo: &str,
+    rules: &AssetRules,
+    arch: &str,
+    store: Store,
+    runtime: Runtime,
+) -> Result<Vec<ModInstallOption>, String> {
+    if !is_tou_mira(repo) {
+        return Ok(install_options(releases, rules, arch));
+    }
+    let mut options = Vec::new();
+    for release in releases {
+        if let Some(asset) = pick_profile_asset(&release, repo, rules, arch, store, runtime)? {
+            let asset_name = asset.name.clone();
+            let size = asset.size.bytes();
+            options.push(ModInstallOption {
+                tag: release.tag,
+                asset_name,
+                size,
+            });
+        }
+    }
+    Ok(options)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModInstallSelection {
@@ -2533,6 +2886,7 @@ pub async fn list_install_options(
     blocking(move || {
         validate_profile_id(&profile_id)?;
         let arch = profile_arch(&profile_id)?;
+        let (store, runtime) = profile_store_runtime(&profile_id)?;
         let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
         let catalog = catalog()?;
         let rules = catalog_entry_for(&catalog, &repo)
@@ -2540,7 +2894,29 @@ pub async fn list_install_options(
             .unwrap_or_else(default_rules);
         let releases =
             resolver::fetch_releases(&http()?, &repo, 50).map_err(|error| error.to_string())?;
-        Ok(install_options(releases, &rules, &arch))
+        install_options_for_profile(releases, &repo, &rules, &arch, store, runtime)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_tou_setup_options(
+    arch: String,
+    store: Store,
+    runtime: Runtime,
+) -> Result<Vec<ModInstallOption>, String> {
+    blocking(move || {
+        if !matches!(arch.as_str(), "x86" | "x64") {
+            return Err("Among Us executable architecture is unsupported".into());
+        }
+        let catalog = catalog()?;
+        let entry = catalog
+            .get(TOU_MIRA_ID)
+            .ok_or("Town of Us is missing from the trusted catalog")?;
+        let repo = entry.repo.as_deref().unwrap_or(&entry.id);
+        let releases =
+            resolver::fetch_releases(&http()?, repo, 50).map_err(|error| error.to_string())?;
+        install_options_for_profile(releases, repo, &entry.asset_rules, &arch, store, runtime)
     })
     .await
 }
@@ -2844,6 +3220,11 @@ fn mod_position(record: &ProfileRecord, package_id: &str) -> Result<usize, Strin
 }
 
 fn validate_mod_toggle(record: &ProfileRecord, package_id: &str) -> Result<usize, String> {
+    if tou_bundle_dependency(package_id) && profile_has_tou_mira(record) {
+        return Err(format!(
+            "{package_id} is included in the Town of Us package and cannot be toggled separately."
+        ));
+    }
     mod_position(record, package_id)
 }
 
@@ -2854,12 +3235,28 @@ fn remove_mod_from_record(
     catalog: &Catalog,
     package_id: &str,
 ) -> Result<(), String> {
+    if tou_bundle_dependency(package_id) && profile_has_tou_mira(record) {
+        return Err(format!(
+            "{package_id} is included in the Town of Us package and cannot be removed separately."
+        ));
+    }
     let position = mod_position(record, package_id)?;
     let removed = record.mods.remove(position);
+    if is_tou_mira(&removed.package_id) {
+        profile::remove_tou_bundle(stage_root, profile_id).map_err(|error| error.to_string())?;
+    }
     if let Some(file) = removed.file {
         profile::remove_plugin(stage_root, profile_id, &file).map_err(|error| error.to_string())?;
     }
     normalize_dependency_ownership(stage_root, profile_id, record, catalog)
+}
+
+#[derive(Clone, Copy)]
+struct ReleaseAssetTarget<'a> {
+    rules: Option<&'a AssetRules>,
+    arch: &'a str,
+    store: Store,
+    runtime: Runtime,
 }
 
 fn selected_release_asset(
@@ -2867,23 +3264,39 @@ fn selected_release_asset(
     repo: &str,
     tag: &str,
     asset_name: &str,
-    rules: Option<&AssetRules>,
-    arch: &str,
+    target: ReleaseAssetTarget<'_>,
 ) -> Result<ResolvedDownload, String> {
+    let release =
+        resolver::fetch_release_by_tag(http, repo, tag).map_err(|error| error.to_string())?;
+    if is_tou_mira(repo) {
+        let rules = target
+            .rules
+            .ok_or("Town of Us must use its authoritative catalog rules")?;
+        let asset = pick_profile_asset(
+            &release,
+            repo,
+            rules,
+            target.arch,
+            target.store,
+            target.runtime,
+        )?
+        .ok_or_else(|| format!("Town of Us {tag} has no compatible full package"))?;
+        return resolver::resolved_asset(http, &release, asset).map_err(|error| error.to_string());
+    }
+
     let lower = asset_name.to_ascii_lowercase();
     if !lower.ends_with(".dll") && !lower.ends_with(".zip") {
         return Err("Only .dll files and catalog-selected .zip packages can be installed.".into());
     }
-    let release =
-        resolver::fetch_release_by_tag(http, repo, tag).map_err(|error| error.to_string())?;
     let asset = release
         .assets
         .iter()
         .find(|asset| asset.name == asset_name)
         .ok_or("selected file not found in that release")?;
     if lower.ends_with(".zip") {
-        let selected = rules
-            .and_then(|rules| resolver::pick_asset(&release, rules, arch))
+        let selected = target
+            .rules
+            .and_then(|rules| resolver::pick_asset(&release, rules, target.arch))
             .is_some_and(|selected| selected.name == asset.name);
         if !selected {
             return Err(
@@ -2931,6 +3344,8 @@ struct InstallContext<'a> {
     http: &'a dyn Http,
     catalog: &'a Catalog,
     arch: &'a str,
+    store: Store,
+    runtime: Runtime,
 }
 
 struct InstallRequest {
@@ -2942,11 +3357,207 @@ struct InstallRequest {
     resolved: ResolvedDownload,
 }
 
+fn tou_bundle_dependency(package_id: &str) -> bool {
+    TOU_BUNDLED_DEPENDENCY_IDS
+        .iter()
+        .any(|dependency| dependency.eq_ignore_ascii_case(package_id))
+}
+
+fn profile_has_tou_mira(record: &ProfileRecord) -> bool {
+    record
+        .mods
+        .iter()
+        .any(|installed| is_tou_mira(&installed.package_id))
+}
+
+fn profile_uses_tou_mira(record: &ProfileRecord) -> bool {
+    record
+        .mods
+        .iter()
+        .any(|installed| installed.enabled && is_tou_mira(&installed.package_id))
+}
+
+fn safe_nonempty_plugin(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0 && !is_reparse(&metadata))
+}
+
+fn reuse_installed_dependency(
+    context: &InstallContext<'_>,
+    record: &mut ProfileRecord,
+    id: &str,
+    requirements: &[String],
+) -> Result<bool, String> {
+    let Some(position) = record
+        .mods
+        .iter()
+        .position(|installed| installed.package_id.eq_ignore_ascii_case(id))
+    else {
+        return Ok(false);
+    };
+    let installed = record.mods[position].clone();
+    if !requirements.is_empty()
+        && !perfect_sync_core::version::satisfies_all(&installed.version, requirements)
+    {
+        if !installed.managed {
+            let name = context
+                .catalog
+                .get(id)
+                .map_or(id, |entry| entry.name.as_str());
+            return Err(format!(
+                "{} {} does not satisfy required version {}.",
+                name,
+                installed.version,
+                requirements.join(", ")
+            ));
+        }
+        return Ok(false);
+    }
+    let Some(file) = installed.file.as_deref() else {
+        return Ok(false);
+    };
+    if profile::validate_dll_name(file).is_err() {
+        return Ok(false);
+    }
+    if !installed.enabled {
+        profile::set_plugin_enabled(context.stage_root, context.profile_id, file, true)
+            .map_err(|error| error.to_string())?;
+        record.mods[position].enabled = true;
+    }
+    let plugins = context
+        .stage_root
+        .join(context.profile_id)
+        .join("BepInEx")
+        .join("plugins");
+    if !safe_nonempty_plugin(&plugins.join(file)) {
+        return Ok(false);
+    }
+    if is_tou_mira(&installed.package_id) {
+        let Ok(files) = profile::tou_bundle_files(context.stage_root, context.profile_id) else {
+            return Ok(false);
+        };
+        return Ok(!files.is_empty()
+            && files.iter().all(|relative| {
+                safe_nonempty_plugin(
+                    &context
+                        .stage_root
+                        .join(context.profile_id)
+                        .join("BepInEx")
+                        .join(relative),
+                )
+            }));
+    }
+    Ok(true)
+}
+
+fn tou_shadowed_plugin_files(record: &ProfileRecord) -> Vec<String> {
+    if !profile_uses_tou_mira(record) {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = TOU_BUNDLED_PLUGIN_FILES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    for file in record
+        .mods
+        .iter()
+        .filter(|installed| tou_bundle_dependency(&installed.package_id))
+        .filter_map(|installed| installed.file.as_deref())
+    {
+        if !names.iter().any(|name| name.eq_ignore_ascii_case(file)) {
+            names.push(file.to_string());
+        }
+    }
+    names
+}
+
+fn install_tou_record(
+    context: &InstallContext<'_>,
+    record: &mut ProfileRecord,
+    request: InstallRequest,
+) -> Result<(), String> {
+    if !request
+        .resolved
+        .asset_name
+        .to_ascii_lowercase()
+        .ends_with(".zip")
+    {
+        return Err("Town of Us must be installed from its complete release ZIP".into());
+    }
+    let bytes =
+        download_resolved(context.http, &request.resolved).map_err(|error| error.to_string())?;
+    let previous = record.mods.iter().position(|installed| {
+        installed
+            .package_id
+            .eq_ignore_ascii_case(&request.package_id)
+    });
+    let previous_versions = previous
+        .map(|position| record.mods[position].versions.clone())
+        .unwrap_or_default();
+    let previous_file = previous.and_then(|position| record.mods[position].file.clone());
+
+    profile::remove_tou_bundle(context.stage_root, context.profile_id)
+        .map_err(|error| error.to_string())?;
+    if let Some(file) = previous_file {
+        profile::remove_plugin(context.stage_root, context.profile_id, &file)
+            .map_err(|error| error.to_string())?;
+    }
+
+    let file =
+        profile::install_tou_bundle_zip_bytes(context.stage_root, context.profile_id, &bytes)
+            .map_err(|error| error.to_string())?;
+    cache_tou_package(
+        &request.resolved.version,
+        &request.resolved.asset_name,
+        &bytes,
+    )?;
+    let previous = record.mods.iter().position(|installed| {
+        installed
+            .package_id
+            .eq_ignore_ascii_case(&request.package_id)
+    });
+    let preserve_explicit_root =
+        request.managed && previous.is_some_and(|position| !record.mods[position].managed);
+    let mut versions = previous_versions;
+    if !versions.contains(&request.resolved.version) {
+        versions.insert(0, request.resolved.version.clone());
+    }
+    let installed = InstalledMod {
+        package_id: request.package_id,
+        name: request.name,
+        repo: Some(request.repo),
+        version: request.resolved.version.clone(),
+        versions,
+        enabled: true,
+        source: ModSource::Github,
+        tags: request.tags,
+        managed: request.managed && !preserve_explicit_root,
+        update: None,
+        file: Some(file),
+        asset: Some(request.resolved.asset_name),
+    };
+    if let Some(position) = previous {
+        record.mods[position] = installed;
+    } else {
+        record.mods.push(installed);
+    }
+    Ok(())
+}
+
 fn install_record(
     context: &InstallContext<'_>,
     record: &mut ProfileRecord,
     request: InstallRequest,
 ) -> Result<(), String> {
+    if is_tou_mira(&request.package_id) {
+        return install_tou_record(context, record, request);
+    }
+    if tou_bundle_dependency(&request.package_id) && profile_has_tou_mira(record) {
+        return Err(format!(
+            "{} is auto-included at the release-matched version by Town of Us - Mira",
+            request.name
+        ));
+    }
     let InstallRequest {
         package_id,
         name,
@@ -3040,22 +3651,8 @@ fn install_catalog_latest(
         .catalog
         .get(id)
         .ok_or("catalog dependency is missing")?;
-    if managed {
-        if let Some(installed) = record.mods.iter().find(|installed| {
-            installed.package_id.eq_ignore_ascii_case(&entry.id) && !installed.managed
-        }) {
-            if requirements.is_empty()
-                || perfect_sync_core::version::satisfies_all(&installed.version, requirements)
-            {
-                return Ok(());
-            }
-            return Err(format!(
-                "{} {} does not satisfy required version {}.",
-                entry.name,
-                installed.version,
-                requirements.join(", ")
-            ));
-        }
+    if managed && reuse_installed_dependency(context, record, &entry.id, requirements)? {
+        return Ok(());
     }
     let repo = entry
         .repo
@@ -3063,8 +3660,14 @@ fn install_catalog_latest(
         .or_else(|| resolver::parse_repo(&entry.id))
         .ok_or_else(|| format!("cannot resolve source for {}", entry.id))?;
     let resolved = if requirements.is_empty() {
-        resolver::resolve_latest(context.http, &repo, &entry.asset_rules, context.arch)
-            .map_err(|error| error.to_string())?
+        resolve_profile_latest(
+            context.http,
+            &repo,
+            &entry.asset_rules,
+            context.arch,
+            context.store,
+            context.runtime,
+        )?
     } else {
         let releases =
             resolver::fetch_releases(context.http, &repo, 20).map_err(|error| error.to_string())?;
@@ -3073,7 +3676,14 @@ fn install_catalog_latest(
             if !perfect_sync_core::version::satisfies_all(&release.tag, requirements) {
                 continue;
             }
-            let Some(asset) = resolver::pick_asset(&release, &entry.asset_rules, context.arch)
+            let Some(asset) = pick_profile_asset(
+                &release,
+                &repo,
+                &entry.asset_rules,
+                context.arch,
+                context.store,
+                context.runtime,
+            )?
             else {
                 continue;
             };
@@ -3210,6 +3820,7 @@ fn install_asset_impl(
     validate_profile_id(&profile_id)?;
     let _ = arch;
     let arch = profile_arch(&profile_id)?;
+    let (store, runtime) = profile_store_runtime(&profile_id)?;
     let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
     let catalog = catalog()?;
     let root_entry = catalog_entry_for(&catalog, &repo).cloned();
@@ -3245,6 +3856,8 @@ fn install_asset_impl(
             http: &http,
             catalog: &catalog,
             arch: &arch,
+            store,
+            runtime,
         };
         for dependency in ordered.iter().filter(|id| {
             root_entry
@@ -3264,8 +3877,12 @@ fn install_asset_impl(
             &repo,
             &tag,
             &asset_name,
-            root_entry.as_ref().map(|entry| &entry.asset_rules),
-            &arch,
+            ReleaseAssetTarget {
+                rules: root_entry.as_ref().map(|entry| &entry.asset_rules),
+                arch: &arch,
+                store,
+                runtime,
+            },
         )?;
         install_record(
             &install,
@@ -3315,6 +3932,7 @@ fn install_assets_impl(
         return Err("Select between 1 and 64 mods and dependencies.".into());
     }
     let arch = profile_arch(&profile_id)?;
+    let (store, runtime) = profile_store_runtime(&profile_id)?;
     let catalog = catalog()?;
     let mut seen = HashSet::with_capacity(selections.len());
     let mut prepared = Vec::with_capacity(selections.len());
@@ -3455,15 +4073,31 @@ fn install_assets_impl(
             http: &http,
             catalog: &catalog,
             arch: &arch,
+            store,
+            runtime,
         };
         for (selection, repo, catalog_entry) in &prepared {
+            if selection.managed {
+                let entry = catalog_entry.as_ref().unwrap();
+                let requirements = plan
+                    .requirements
+                    .get(&entry.id)
+                    .map_or(&[][..], Vec::as_slice);
+                if reuse_installed_dependency(&install, &mut record, &entry.id, requirements)? {
+                    continue;
+                }
+            }
             let resolved = selected_release_asset(
                 &http,
                 repo,
                 &selection.tag,
                 &selection.asset_name,
-                catalog_entry.as_ref().map(|entry| &entry.asset_rules),
-                &arch,
+                ReleaseAssetTarget {
+                    rules: catalog_entry.as_ref().map(|entry| &entry.asset_rules),
+                    arch: &arch,
+                    store,
+                    runtime,
+                },
             )?;
             install_record(
                 &install,
@@ -3824,6 +4458,7 @@ fn install_levelimposter_maps_impl(
     let downloads = download_levelimposter_maps(&http, &normalized)?;
 
     let arch = profile_arch(&profile_id)?;
+    let (store, runtime) = profile_store_runtime(&profile_id)?;
     let catalog = catalog()?;
     let levelimposter = catalog
         .get(LEVELIMPOSTER_ID)
@@ -3862,6 +4497,8 @@ fn install_levelimposter_maps_impl(
                 http: &http,
                 catalog: &catalog,
                 arch: &arch,
+                store,
+                runtime,
             };
             for id in ordered {
                 install_catalog_latest(
@@ -3939,6 +4576,7 @@ fn add_mod_impl(profile_id: String, repo: String, arch: String) -> Result<Profil
     validate_profile_id(&profile_id)?;
     let _ = arch;
     let arch = profile_arch(&profile_id)?;
+    let (store, runtime) = profile_store_runtime(&profile_id)?;
     let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
     let catalog = catalog()?;
     let root_entry = catalog_entry_for(&catalog, &repo).cloned();
@@ -3973,6 +4611,8 @@ fn add_mod_impl(profile_id: String, repo: String, arch: String) -> Result<Profil
             http: &http,
             catalog: &catalog,
             arch: &arch,
+            store,
+            runtime,
         };
         for id in &ordered {
             let managed = root_entry
@@ -3988,8 +4628,7 @@ fn add_mod_impl(profile_id: String, repo: String, arch: String) -> Result<Profil
         }
         if root_entry.is_none() {
             let rules = default_rules();
-            let resolved = resolver::resolve_latest(&http, &repo, &rules, &arch)
-                .map_err(|error| error.to_string())?;
+            let resolved = resolve_profile_latest(&http, &repo, &rules, &arch, store, runtime)?;
             install_record(
                 &install,
                 &mut record,
@@ -4064,6 +4703,7 @@ fn set_mod_version_impl(
     validate_profile_id(&profile_id)?;
     let _ = arch;
     let arch = profile_arch(&profile_id)?;
+    let (store, runtime) = profile_store_runtime(&profile_id)?;
     let catalog = catalog()?;
     let root = settings::profiles_root();
     profile_transaction(&root, &profile_id, |stage_root, stage_store| {
@@ -4099,9 +4739,10 @@ fn set_mod_version_impl(
             http: &http,
             catalog: &catalog,
             arch: &arch,
+            store,
+            runtime,
         };
-        let resolved = resolver::resolve_tag(&http, &repo, &version, &rules, &arch)
-            .map_err(|error| error.to_string())?;
+        let resolved = resolve_profile_tag(&http, &repo, &version, &rules, &arch, store, runtime)?;
         install_record(
             &install,
             &mut record,
@@ -4150,6 +4791,7 @@ pub async fn check_mod_updates(profile_id: String, arch: String) -> Result<Profi
         validate_profile_id(&profile_id)?;
         let _ = arch;
         let arch = profile_arch(&profile_id)?;
+        let (store, runtime) = profile_store_runtime(&profile_id)?;
         let catalog = catalog()?;
         let root = settings::profiles_root();
         profile_transaction(&root, &profile_id, |_stage_root, stage_store| {
@@ -4158,7 +4800,12 @@ pub async fn check_mod_updates(profile_id: String, arch: String) -> Result<Profi
                 .map_err(|error| error.to_string())?
                 .ok_or("profile not found")?;
             let http = http()?;
+            let has_tou_mira = profile_has_tou_mira(&record);
             for installed in &mut record.mods {
+                if has_tou_mira && tou_bundle_dependency(&installed.package_id) {
+                    installed.update = None;
+                    continue;
+                }
                 let Some(repo) = installed
                     .repo
                     .as_deref()
@@ -4170,8 +4817,7 @@ pub async fn check_mod_updates(profile_id: String, arch: String) -> Result<Profi
                 let rules = catalog_entry_for(&catalog, &installed.package_id)
                     .map(|entry| entry.asset_rules.clone())
                     .unwrap_or_else(default_rules);
-                let latest = resolver::resolve_latest(&http, &repo, &rules, &arch)
-                    .map_err(|error| error.to_string())?;
+                let latest = resolve_profile_latest(&http, &repo, &rules, &arch, store, runtime)?;
                 installed.update =
                     perfect_sync_core::version::is_newer(&latest.version, &installed.version)
                         .then_some(latest.version);
@@ -4206,6 +4852,7 @@ pub async fn apply_mod_updates(
         }
         let _ = arch;
         let arch = profile_arch(&profile_id)?;
+        let (store, runtime) = profile_store_runtime(&profile_id)?;
         let catalog = catalog()?;
         let root = settings::profiles_root();
         let reporter = ProgressReporter::new(on_progress);
@@ -4257,15 +4904,23 @@ pub async fn apply_mod_updates(
                         package_ids.len()
                     ),
                 );
-                let resolved =
-                    resolver::resolve_tag(&progress_http, &repo, &version, &rules, &arch)
-                        .map_err(|error| error.to_string())?;
+                let resolved = resolve_profile_tag(
+                    &progress_http,
+                    &repo,
+                    &version,
+                    &rules,
+                    &arch,
+                    store,
+                    runtime,
+                )?;
                 let install = InstallContext {
                     stage_root,
                     profile_id: &profile_id,
                     http: &progress_http,
                     catalog: &catalog,
                     arch: &arch,
+                    store,
+                    runtime,
                 };
                 install_record(
                     &install,
@@ -4351,6 +5006,19 @@ fn apply_lobby_code_impl(
     }
     let _ = arch;
     let arch = saved_game_arch(game_instance_id.as_deref())?;
+    let target_instance = match game_instance_id.as_deref() {
+        Some(instance_id) => settings
+            .game_instances
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or("lobby profile refers to an unknown game instance")?,
+        None => settings
+            .game_instances
+            .first()
+            .ok_or("save a game instance before applying a lobby")?,
+    };
+    let store = target_instance.store;
+    let runtime = target_instance.runtime;
     let display = manifest
         .name
         .clone()
@@ -4413,6 +5081,9 @@ fn apply_lobby_code_impl(
             levelimposter_maps: Vec::new(),
         });
         let previously_owned_maps = record.levelimposter_maps.clone();
+        if profile_has_tou_mira(&record) {
+            profile::remove_tou_bundle(stage_root, &id).map_err(|error| error.to_string())?;
+        }
         for old in &record.mods {
             if let Some(file) = old.file.as_deref() {
                 profile::remove_plugin(stage_root, &id, file).map_err(|error| error.to_string())?;
@@ -4428,6 +5099,8 @@ fn apply_lobby_code_impl(
             http: &http,
             catalog: &catalog,
             arch: &arch,
+            store,
+            runtime,
         };
         for manifest_mod in &manifest.mods {
             let entry = catalog_entry_for(&catalog, &manifest_mod.id);
@@ -4439,10 +5112,20 @@ fn apply_lobby_code_impl(
                 .map(|entry| entry.asset_rules.clone())
                 .unwrap_or_else(default_rules);
             let resolved = if let Some(asset) = manifest_mod.asset.as_deref() {
-                selected_release_asset(&http, &repo, &manifest_mod.v, asset, Some(&rules), &arch)?
+                selected_release_asset(
+                    &http,
+                    &repo,
+                    &manifest_mod.v,
+                    asset,
+                    ReleaseAssetTarget {
+                        rules: Some(&rules),
+                        arch: &arch,
+                        store,
+                        runtime,
+                    },
+                )?
             } else {
-                resolver::resolve_tag(&http, &repo, &manifest_mod.v, &rules, &arch)
-                    .map_err(|error| error.to_string())?
+                resolve_profile_tag(&http, &repo, &manifest_mod.v, &rules, &arch, store, runtime)?
             };
             install_record(
                 &install,
@@ -4486,8 +5169,12 @@ fn apply_lobby_code_impl(
                 &repo,
                 &personal.tag,
                 &personal.asset,
-                entry.map(|entry| &entry.asset_rules),
-                &arch,
+                ReleaseAssetTarget {
+                    rules: entry.map(|entry| &entry.asset_rules),
+                    arch: &arch,
+                    store,
+                    runtime,
+                },
             )?;
             install_record(
                 &install,
@@ -4543,11 +5230,23 @@ pub async fn ensure_loader(
     game_path: String,
     profile_id: String,
     arch: String,
+    apply_doorstop_fix: bool,
+    on_progress: Channel<OperationProgress>,
 ) -> Result<Option<String>, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
+        let reporter = ProgressReporter::new(on_progress);
+        let http = ProgressHttp::new(http()?, reporter.clone());
         with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
-            ensure_loader_impl(&game_path, &profile_id, &arch)?;
+            ensure_loader_impl(
+                &game_path,
+                &profile_id,
+                &arch,
+                apply_doorstop_fix,
+                &http,
+                Some(&reporter),
+            )?;
+            reporter.stage("finalizing", "Configuring the game runtime");
             let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
             let context = runtime_context(&game_dir)?;
             game_is_stopped()?;
@@ -4562,11 +5261,19 @@ pub async fn reinstall_loader(
     game_path: String,
     profile_id: String,
     arch: String,
+    apply_doorstop_fix: bool,
+    use_latest_loader: bool,
 ) -> Result<Option<String>, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
         with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
-            reinstall_loader_impl(&game_path, &profile_id, &arch)?;
+            reinstall_loader_impl(
+                &game_path,
+                &profile_id,
+                &arch,
+                apply_doorstop_fix,
+                use_latest_loader,
+            )?;
             let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
             let context = runtime_context(&game_dir)?;
             game_is_stopped()?;
@@ -4584,6 +5291,7 @@ pub struct LoaderStatus {
     pub preloader: bool,
     pub current: bool,
     pub installed_version: Option<String>,
+    pub doorstop_fix: bool,
     pub dotnet: bool,
     pub steam_appid: bool,
     pub profile_plugins: usize,
@@ -4637,6 +5345,9 @@ pub async fn loader_status(game_path: String, profile_id: String) -> Result<Load
                 .prefix
                 .as_deref()
                 .is_some_and(compat::has_winhttp_override);
+        let arch = game::exe_arch(&game.join(process::GAME_EXE))
+            .map(arch_str)
+            .ok_or("Among Us executable architecture is unsupported")?;
         Ok(LoaderStatus {
             game_found: true,
             winhttp: game.join("winhttp.dll").is_file(),
@@ -4647,6 +5358,7 @@ pub async fn loader_status(game_path: String, profile_id: String) -> Result<Load
                 .is_file(),
             current: loader::has_loader(&game),
             installed_version: loader::installed_version(&game),
+            doorstop_fix: doorstop_fix_is_current(&game, &arch),
             dotnet: game.join("dotnet").join("coreclr.dll").is_file(),
             steam_appid: game.join("steam_appid.txt").is_file(),
             profile_plugins: count_dll(profile_plugins)?,
@@ -4670,53 +5382,52 @@ fn protected_install_hint(game_dir: &Path) -> Option<String> {
     }
 }
 
-fn sync_tou_cosmetics(
-    profiles_root: &Path,
-    profile_id: &str,
-    game_dir: &Path,
+fn load_tou_package_bytes(
+    installed: &InstalledMod,
     arch: &str,
-) -> Result<(), String> {
-    let profile = ProfileStore::new(profiles_root)
-        .load(profile_id)
-        .map_err(|error| error.to_string())?
-        .ok_or("profile not found")?;
-    let plugins = game_dir.join("BepInEx").join("plugins");
-    let Some(version) = tou_cosmetics::active_version(&profile) else {
-        return tou_cosmetics::remove_managed_files(&plugins).map_err(|error| error.to_string());
-    };
-    if tou_cosmetics::installation_is_current(&plugins, version)
-        .map_err(|error| format!("Could not verify Town of Us cosmetics: {error}"))?
-    {
-        return Ok(());
+    store: Store,
+    runtime: Runtime,
+) -> Result<Vec<u8>, String> {
+    let asset_name = installed
+        .asset
+        .as_deref()
+        .ok_or("Town of Us profile is missing its exact release asset")?;
+    let cache_path = tou_package_cache_path(&installed.version, asset_name);
+    if let Some(bytes) = read_bounded(&cache_path, MAX_TOU_PACKAGE_CACHE_BYTES)? {
+        return Ok(bytes);
     }
-
-    let store = launch_store(game_dir)?;
+    let repo = installed
+        .repo
+        .as_deref()
+        .and_then(resolver::parse_repo)
+        .or_else(|| resolver::parse_repo(&installed.package_id))
+        .ok_or("Town of Us profile has no valid release source")?;
+    let catalog = catalog()?;
+    let rules = catalog_entry_for(&catalog, &repo)
+        .map(|entry| entry.asset_rules.clone())
+        .ok_or("Town of Us is missing its authoritative catalog rules")?;
     let http = http()?;
-    let release = resolver::fetch_release_by_tag(&http, tou_cosmetics::PACKAGE_ID, version)
-        .and_then(|release| resolver::hydrate_release_assets(&http, release))
-        .map_err(|error| format!("Could not resolve Town of Us cosmetics: {error}"))?;
-    let resolved = tou_cosmetics::select_release_pack(&release, arch, store)
-        .map_err(|error| error.to_string())?;
-    log::info!(
-        "provisioning Town of Us cosmetics {} from {}",
-        version,
-        resolved.asset_name
-    );
-    let archive = download_resolved(&http, &resolved)
-        .map_err(|error| format!("Could not download Town of Us cosmetics: {error}"))?;
-    let payload = tou_cosmetics::extract_release_pack(&archive, version, &resolved.asset_name)
-        .map_err(|error| error.to_string())?;
-
-    game_is_stopped()?;
-    atomic_write(&plugins.join(tou_cosmetics::BUNDLE_NAME), &payload.bundle)?;
-    atomic_write(&plugins.join(tou_cosmetics::CATALOG_NAME), &payload.catalog)?;
-    atomic_write(&plugins.join(tou_cosmetics::MARKER_NAME), &payload.marker)?;
-    if !tou_cosmetics::installation_is_current(&plugins, version)
-        .map_err(|error| format!("Could not verify installed Town of Us cosmetics: {error}"))?
-    {
-        return Err("Installed Town of Us cosmetics failed verification.".into());
+    let resolved = selected_release_asset(
+        &http,
+        &repo,
+        &installed.version,
+        asset_name,
+        ReleaseAssetTarget {
+            rules: Some(&rules),
+            arch,
+            store,
+            runtime,
+        },
+    )?;
+    if !resolved.asset_name.eq_ignore_ascii_case(asset_name) {
+        return Err(format!(
+            "Town of Us {} no longer resolves to the profile's exact asset {}",
+            installed.version, asset_name
+        ));
     }
-    Ok(())
+    let bytes = download_resolved(&http, &resolved).map_err(|error| error.to_string())?;
+    cache_tou_package(&installed.version, asset_name, &bytes)?;
+    Ok(bytes)
 }
 
 fn prepare_profile(game_path: &str, profile_id: &str) -> Result<Option<String>, String> {
@@ -4725,17 +5436,81 @@ fn prepare_profile(game_path: &str, profile_id: &str) -> Result<Option<String>, 
     let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
         .map(arch_str)
         .ok_or("Among Us executable architecture is unsupported")?;
+    let preserve_doorstop_fix = doorstop_fix_is_current(&game_dir, &arch);
     let profiles_root = settings::profiles_root();
+    let profile = recovered_profile_store(&profiles_root)?
+        .load(profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("profile not found")?;
+    let active_tou = profile
+        .mods
+        .iter()
+        .find(|installed| installed.enabled && is_tou_mira(&installed.package_id));
+    let tou_key = active_tou
+        .map(|installed| {
+            installed
+                .asset
+                .as_deref()
+                .map(|asset| tou_package_key(&installed.version, asset))
+                .ok_or("Town of Us profile is missing its exact release asset")
+        })
+        .transpose()?;
+    let tou_current = !preserve_doorstop_fix
+        && tou_key
+            .as_deref()
+            .map(|key| loader::tou_package_is_current(&game_dir, key))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(false);
+    let tou_package = if let Some(installed) = active_tou.filter(|_| !tou_current) {
+        let (store, runtime) = profile_store_runtime(profile_id)?;
+        Some(load_tou_package_bytes(installed, &arch, store, runtime)?)
+    } else {
+        None
+    };
+    let shadowed_plugin_files = tou_shadowed_plugin_files(&profile);
+
     with_profile_layout(&profiles_root, profile_id, || {
         game_artifact_transaction(&game_dir, || {
             restore_doorstop(&game_dir)?;
             game_is_stopped()?;
-            loader::sync_profile_plugins(&profiles_root, profile_id, &game_dir)
+            if active_tou.is_some() {
+                if let Some(bytes) = tou_package.as_deref() {
+                    tou_cosmetics::remove_managed_files(&game_dir.join("BepInEx").join("plugins"))
+                        .map_err(|error| error.to_string())?;
+                    loader::install_tou_package(
+                        bytes,
+                        &game_dir,
+                        tou_key
+                            .as_deref()
+                            .ok_or("Town of Us package key is missing")?,
+                        PINNED_LOADER_VERSION,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            } else {
+                tou_cosmetics::remove_managed_files(&game_dir.join("BepInEx").join("plugins"))
+                    .map_err(|error| error.to_string())?;
+                loader::remove_tou_package(&game_dir).map_err(|error| error.to_string())?;
+            }
+            loader::sync_profile_plugins_shadowing(
+                &profiles_root,
+                profile_id,
+                &game_dir,
+                &shadowed_plugin_files,
+            )
+            .map_err(|error| error.to_string())?;
+            loader::sync_levelimposter_maps(&profiles_root, profile_id, &game_dir)
                 .map_err(|error| error.to_string())?;
-            sync_tou_cosmetics(&profiles_root, profile_id, &game_dir, &arch)?;
-            loader::sync_levelimposter_maps(&settings::profiles_root(), profile_id, &game_dir)
-                .map_err(|error| error.to_string())?;
-            ensure_loader_impl(game_path, profile_id, &arch)?;
+            let loader_http = http()?;
+            ensure_loader_impl(
+                game_path,
+                profile_id,
+                &arch,
+                active_tou.is_none() && preserve_doorstop_fix,
+                &loader_http,
+                None,
+            )?;
             game_is_stopped()?;
             loader::ensure_steam_appid(&game_dir).map_err(|error| error.to_string())?;
             game_is_stopped()?;
@@ -6029,18 +6804,16 @@ mod tests {
     }
 
     #[test]
-    fn town_of_us_dependency_plan_is_managed_and_dependency_first() {
+    fn town_of_us_dependencies_are_owned_by_the_complete_zip() {
         let catalog = bundled_catalog();
         let root = "AU-Avengers/TOU-Mira".to_string();
         let ordered = deps::resolve(&catalog, std::slice::from_ref(&root))
             .unwrap()
             .ordered;
-        let position = |id: &str| ordered.iter().position(|entry| entry == id).unwrap();
-        assert!(position("NuclearPowered/Reactor") < position("All-Of-Us-Mods/MiraAPI"));
-        assert!(position("All-Of-Us-Mods/MiraAPI") < position(&root));
-        assert!(is_managed_dependency(&root, "NuclearPowered/Reactor"));
-        assert!(is_managed_dependency(&root, "All-Of-Us-Mods/MiraAPI"));
-        assert!(!is_managed_dependency(&root, &root));
+        assert_eq!(ordered, [root]);
+        assert!(tou_bundle_dependency("NuclearPowered/Reactor"));
+        assert!(tou_bundle_dependency("All-Of-Us-Mods/MiraAPI"));
+        assert!(tou_bundle_dependency("miniduikboot/Mini.RegionInstall"));
     }
 
     #[test]
@@ -6076,7 +6849,7 @@ mod tests {
     }
 
     #[test]
-    fn lobby_rows_that_are_required_by_another_root_stay_managed() {
+    fn lobby_rows_only_mark_catalog_dependencies_as_managed() {
         let catalog = bundled_catalog();
         let selected = vec![
             "NuclearPowered/Reactor".to_string(),
@@ -6085,7 +6858,7 @@ mod tests {
         ];
         let managed = selected_dependencies(&catalog, &selected).unwrap();
         assert!(managed.contains("nuclearpowered/reactor"));
-        assert!(managed.contains("all-of-us-mods/miraapi"));
+        assert!(!managed.contains("all-of-us-mods/miraapi"));
         assert!(!managed.contains("au-avengers/tou-mira"));
     }
 
@@ -6142,6 +6915,82 @@ mod tests {
             .join(profile_id)
             .join("BepInEx/plugins/Mira.dll")
             .exists());
+    }
+
+    #[test]
+    fn town_of_us_takeover_keeps_other_mod_dependencies_for_restoration() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_id = "tou-takeover";
+        let catalog = parse(
+            r#"{"schema":1,"mods":[
+                {"id":"AU-Avengers/TOU-Mira","name":"Town of Us","summary":"","repo":"AU-Avengers/TOU-Mira","tags":[],"trust":"trusted","dependencies":[],"assetRules":{}},
+                {"id":"Owner/OtherMod","name":"Other Mod","summary":"","repo":"Owner/OtherMod","tags":[],"trust":"trusted","dependencies":["All-Of-Us-Mods/MiraAPI","miniduikboot/Mini.RegionInstall"],"assetRules":{}},
+                {"id":"All-Of-Us-Mods/MiraAPI","name":"MiraAPI","summary":"","repo":"All-Of-Us-Mods/MiraAPI","tags":[],"trust":"trusted","dependencies":["NuclearPowered/Reactor"],"assetRules":{}},
+                {"id":"NuclearPowered/Reactor","name":"Reactor","summary":"","repo":"NuclearPowered/Reactor","tags":[],"trust":"trusted","dependencies":[],"assetRules":{}},
+                {"id":"miniduikboot/Mini.RegionInstall","name":"Mini","summary":"","repo":"miniduikboot/Mini.RegionInstall","tags":[],"trust":"trusted","dependencies":[],"assetRules":{}}
+            ]}"#,
+        )
+        .unwrap();
+        let installed = |id: &str, file: &str, managed: bool| InstalledMod {
+            package_id: id.into(),
+            name: id.into(),
+            repo: Some(id.into()),
+            version: "v1".into(),
+            versions: vec!["v1".into()],
+            enabled: true,
+            source: ModSource::Github,
+            tags: Vec::new(),
+            managed,
+            update: None,
+            file: Some(file.into()),
+            asset: Some(file.into()),
+        };
+        let mut record = ProfileRecord {
+            id: profile_id.into(),
+            name: "Takeover".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            game_instance_id: None,
+            mods: vec![
+                installed("Owner/OtherMod", "Other.dll", false),
+                installed("All-Of-Us-Mods/MiraAPI", "MiraAPI.dll", true),
+                installed("NuclearPowered/Reactor", "Reactor.dll", true),
+                installed(
+                    "miniduikboot/Mini.RegionInstall",
+                    "Mini.RegionInstall.dll",
+                    true,
+                ),
+                installed("AU-Avengers/TOU-Mira", "TownOfUsMira.dll", false),
+            ],
+            levelimposter_maps: Vec::new(),
+        };
+        for file in [
+            "Other.dll",
+            "MiraAPI.dll",
+            "Reactor.dll",
+            "Mini.RegionInstall.dll",
+            "TownOfUsMira.dll",
+        ] {
+            profile::install_plugin_bytes(temp.path(), profile_id, file, file.as_bytes()).unwrap();
+        }
+
+        normalize_dependency_ownership(temp.path(), profile_id, &mut record, &catalog).unwrap();
+        assert_eq!(record.mods.len(), 5);
+        record
+            .mods
+            .retain(|installed| !is_tou_mira(&installed.package_id));
+        profile::remove_plugin(temp.path(), profile_id, "TownOfUsMira.dll").unwrap();
+        normalize_dependency_ownership(temp.path(), profile_id, &mut record, &catalog).unwrap();
+
+        assert_eq!(record.mods.len(), 4);
+        for file in ["MiraAPI.dll", "Reactor.dll", "Mini.RegionInstall.dll"] {
+            assert!(temp
+                .path()
+                .join(profile_id)
+                .join("BepInEx/plugins")
+                .join(file)
+                .is_file());
+        }
     }
 
     #[test]
@@ -6494,62 +7343,97 @@ mod tests {
     #[test]
     fn bundled_install_policy_overrides_stale_town_of_us_policy() {
         let mut stale = parse(
-            r#"{"schema":1,"mods":[{"id":"AU-Avengers/TOU-Mira","name":"Town of Us - Mira","summary":"stale","repo":"AU-Avengers/TOU-Mira","tags":[],"trust":"trusted","dependencies":[],"assetRules":{"perArch":{"x64":{"match":"(?i)epic-msstore","prefer":"zip"}},"dllName":"TownOfUsMira.dll","bundlesLoader":true}}]}"#,
+            r#"{"schema":1,"mods":[{"id":"NuclearPowered/Reactor","name":"Reactor","summary":"","repo":"NuclearPowered/Reactor","tags":[],"trust":"trusted","dependencies":[],"assetRules":{}},{"id":"AU-Avengers/TOU-Mira","name":"Town of Us - Mira","summary":"stale","repo":"AU-Avengers/TOU-Mira","tags":[],"trust":"trusted","dependencies":["NuclearPowered/Reactor"],"assetRules":{"perArch":{},"dllName":"Wrong.dll","bundlesLoader":false}}]}"#,
         )
         .unwrap();
 
         apply_bundled_install_policy(&mut stale);
 
-        let rules = &stale.get("AU-Avengers/TOU-Mira").unwrap().asset_rules;
-        assert!(rules.per_arch.is_empty());
-        assert_eq!(rules.dll_name.as_deref(), Some("TownOfUsMira.dll"));
-        assert!(!rules.bundles_loader);
+        let entry = stale.get("AU-Avengers/TOU-Mira").unwrap();
+        assert_eq!(entry.asset_rules.per_arch.len(), 2);
         assert_eq!(
-            stale.get("AU-Avengers/TOU-Mira").unwrap().dependencies,
-            [
-                "All-Of-Us-Mods/MiraAPI",
-                "NuclearPowered/Reactor",
-                "miniduikboot/Mini.RegionInstall",
-            ]
+            entry.asset_rules.dll_name.as_deref(),
+            Some("TownOfUsMira.dll")
         );
+        assert!(entry.asset_rules.bundles_loader);
+        assert!(entry.dependencies.is_empty());
     }
 
     #[test]
-    fn bundled_display_policy_exposes_current_town_of_us_dependencies() {
+    fn bundled_display_policy_exposes_current_town_of_us_bundle_contents() {
         let mut item = catalog_item(
             bundled_catalog()
                 .get("AU-Avengers/TOU-Mira")
                 .unwrap()
                 .clone(),
         );
-        item.dependencies.clear();
+        item.dependencies.push("stale/dependency".into());
+        item.included.clear();
 
         apply_bundled_display_policy(std::slice::from_mut(&mut item));
 
-        assert!(item
-            .dependencies
-            .iter()
-            .any(|dependency| dependency == "miniduikboot/Mini.RegionInstall"));
+        assert!(item.dependencies.is_empty());
+        assert_eq!(
+            item.included,
+            [
+                "MiraAPI",
+                "Reactor",
+                "Mini.RegionInstall with the Town of Us server config",
+                "Town of Us cosmetics"
+            ]
+        );
     }
 
     #[test]
-    fn install_review_lists_every_dll_with_catalog_default_first() {
+    fn town_of_us_options_expose_only_the_target_specific_complete_zip() {
         let catalog = bundled_catalog();
         let rules = &catalog.get("AU-Avengers/TOU-Mira").unwrap().asset_rules;
         let release = resolver::parse_release(
-            r#"{"tag_name":"1.6.3-beta2","assets":[{"name":"MiraAPI.dll","browser_download_url":"https://example.invalid/MiraAPI.dll","size":10},{"name":"TouMirav1.6.3b2-x64-epic-msstore.zip","browser_download_url":"https://example.invalid/mod.zip","size":30},{"name":"TownOfUsMira.dll","browser_download_url":"https://example.invalid/TownOfUsMira.dll","size":20}]}"#,
+            r#"{"tag_name":"1.6.3-beta2","assets":[{"name":"MiraAPI.dll","browser_download_url":"https://example.invalid/MiraAPI.dll","size":10},{"name":"TouMirav1.6.3b2-x64-epic-msstore.zip","browser_download_url":"https://example.invalid/x64.zip","size":30},{"name":"TouMirav1.6.3b2-x86-steam-itch.zip","browser_download_url":"https://example.invalid/x86.zip","size":31},{"name":"TouMirav1.6.3b2-x86-macOS-linux.zip","browser_download_url":"https://example.invalid/unix.zip","size":32},{"name":"TownOfUsMira.dll","browser_download_url":"https://example.invalid/TownOfUsMira.dll","size":20}]}"#,
         )
         .unwrap();
 
-        let options = install_options(vec![release], rules, "x64");
-
-        assert_eq!(
-            options
-                .iter()
-                .map(|option| option.asset_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["TownOfUsMira.dll", "MiraAPI.dll"]
-        );
+        for (arch, store, runtime, expected) in [
+            (
+                "x64",
+                Store::Epic,
+                Runtime::Native,
+                "TouMirav1.6.3b2-x64-epic-msstore.zip",
+            ),
+            (
+                "x86",
+                Store::Steam,
+                Runtime::Native,
+                "TouMirav1.6.3b2-x86-steam-itch.zip",
+            ),
+            (
+                "x86",
+                Store::Steam,
+                Runtime::Proton,
+                "TouMirav1.6.3b2-x86-macOS-linux.zip",
+            ),
+        ] {
+            let options = install_options_for_profile(
+                vec![release.clone()],
+                TOU_MIRA_ID,
+                rules,
+                arch,
+                store,
+                runtime,
+            )
+            .unwrap();
+            assert_eq!(options.len(), 1);
+            assert_eq!(options[0].asset_name, expected);
+        }
+        assert!(install_options_for_profile(
+            vec![release],
+            TOU_MIRA_ID,
+            rules,
+            "x86",
+            Store::Epic,
+            Runtime::Native,
+        )
+        .is_err());
     }
 
     #[test]
@@ -6563,6 +7447,7 @@ mod tests {
             .clone();
         let mut state = CatalogEnvelope {
             version: catalog_envelope_version(),
+            order_policy_version: CATALOG_ORDER_POLICY_VERSION,
             display: vec![CatalogListItem {
                 id: "Alias/Repository".into(),
                 name: "Duplicate".into(),
@@ -6570,6 +7455,7 @@ mod tests {
                 summary: String::new(),
                 tags: Vec::new(),
                 dependencies: Vec::new(),
+                included: Vec::new(),
                 latest: String::new(),
                 trust: Trust::Flagged,
                 extra: HashMap::new(),
@@ -6609,6 +7495,7 @@ mod tests {
             summary: String::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            included: Vec::new(),
             latest: String::new(),
             trust: Trust::Flagged,
             extra: HashMap::new(),
@@ -6620,12 +7507,14 @@ mod tests {
             summary: String::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            included: Vec::new(),
             latest: String::new(),
             trust: Trust::Flagged,
             extra: HashMap::new(),
         };
         let state = CatalogEnvelope {
             version: catalog_envelope_version(),
+            order_policy_version: CATALOG_ORDER_POLICY_VERSION,
             display: vec![custom, old_hosted],
             hosted_ids: vec!["Owner/Hosted".into()],
             hidden_hosted_ids: Vec::new(),
@@ -6653,12 +7542,14 @@ mod tests {
             summary: String::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            included: Vec::new(),
             latest: String::new(),
             trust: Trust::Flagged,
             extra: HashMap::new(),
         };
         let state = CatalogEnvelope {
             version: catalog_envelope_version(),
+            order_policy_version: CATALOG_ORDER_POLICY_VERSION,
             display: vec![
                 item("User/Custom"),
                 item("Owner/Hidden"),
@@ -6779,6 +7670,25 @@ mod tests {
     }
 
     #[test]
+    fn pinned_loader_selects_exact_build_753_archive_for_each_arch() {
+        assert_eq!(
+            pinned_loader("x86").unwrap(),
+            (
+                PINNED_LOADER_VERSION.to_string(),
+                PINNED_LOADER_X86_URL.to_string()
+            )
+        );
+        assert_eq!(
+            pinned_loader("x64").unwrap(),
+            (
+                PINNED_LOADER_VERSION.to_string(),
+                PINNED_LOADER_X64_URL.to_string()
+            )
+        );
+        assert!(pinned_loader("arm64").is_err());
+    }
+
+    #[test]
     fn hosted_only_dependency_is_not_authoritative() {
         let hosted = parse(
             r#"{"schema":1,"mods":[
@@ -6817,9 +7727,119 @@ mod tests {
     }
 
     #[test]
-    fn managed_dependency_can_be_disabled_and_removed_by_user_choice() {
+    fn complete_installed_town_of_us_dependency_skips_network_resolution() {
+        struct NoNetwork;
+
+        impl Http for NoNetwork {
+            fn get_text(
+                &self,
+                _url: &str,
+            ) -> Result<String, perfect_sync_core::resolver::ResolveError> {
+                panic!("a complete installed dependency must not fetch release metadata")
+            }
+
+            fn get_bytes(
+                &self,
+                _url: &str,
+            ) -> Result<Vec<u8>, perfect_sync_core::resolver::ResolveError> {
+                panic!("a complete installed dependency must not be downloaded again")
+            }
+        }
+
         let temp = tempfile::tempdir().unwrap();
-        let profile_id = "user-managed-dependency";
+        let profile_id = "cached-tou";
+        let package = epic_zip(&[
+            ("BepInEx/plugins/Mini.RegionInstall.dll", b"mini"),
+            ("BepInEx/plugins/MiraAPI.dll", b"mira"),
+            ("BepInEx/plugins/Reactor.dll", b"reactor"),
+            ("BepInEx/plugins/touhats.bundle", b"bundle"),
+            ("BepInEx/plugins/touhats.catalog", b"catalog"),
+            ("BepInEx/plugins/TownOfUsMira.dll", b"tou"),
+            ("BepInEx/config/at.duikbo.regioninstall.cfg", b"config"),
+        ]);
+        profile::install_tou_bundle_zip_bytes(temp.path(), profile_id, &package).unwrap();
+        let mut record = ProfileRecord {
+            id: profile_id.into(),
+            name: "Cached Town of Us".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            game_instance_id: None,
+            mods: vec![InstalledMod {
+                package_id: TOU_MIRA_ID.into(),
+                name: "Town of Us - Mira".into(),
+                repo: Some(TOU_MIRA_ID.into()),
+                version: "1.6.3-beta2".into(),
+                versions: vec!["1.6.3-beta2".into()],
+                enabled: true,
+                source: ModSource::Github,
+                tags: vec![ModTag::Role, ModTag::AllClient],
+                managed: false,
+                update: None,
+                file: Some("TownOfUsMira.dll".into()),
+                asset: Some("TouMirav1.6.3b2-x86-steam-itch.zip".into()),
+            }],
+            levelimposter_maps: Vec::new(),
+        };
+        let catalog = bundled_catalog();
+        let context = InstallContext {
+            stage_root: temp.path(),
+            profile_id,
+            http: &NoNetwork,
+            catalog: &catalog,
+            arch: "x86",
+            store: Store::Steam,
+            runtime: Runtime::Native,
+        };
+
+        install_catalog_latest(&context, &mut record, TOU_MIRA_ID, true, &[]).unwrap();
+
+        assert_eq!(record.mods.len(), 1);
+        assert!(!record.mods[0].managed);
+    }
+
+    #[test]
+    fn default_catalog_order_prioritizes_major_mods_and_puts_dependencies_last() {
+        let catalog = bundled_catalog();
+        let mut display: Vec<_> = catalog.mods.into_iter().map(catalog_item).collect();
+        apply_default_catalog_order(&mut display);
+
+        assert_eq!(
+            display
+                .iter()
+                .take(PRIORITY_CATALOG_IDS.len())
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            PRIORITY_CATALOG_IDS
+        );
+        let dependency_start = display
+            .iter()
+            .position(|item| catalog_display_rank(item) == usize::MAX)
+            .unwrap();
+        assert!(display[dependency_start..]
+            .iter()
+            .all(|item| catalog_display_rank(item) == usize::MAX));
+    }
+
+    #[test]
+    fn town_of_us_extensions_declare_town_of_us_as_their_dependency() {
+        let catalog = bundled_catalog();
+        for id in [
+            "DivaniNL/TownOfUsMiraDivaniModsAddOn",
+            "Mehzxzz/TownOfExtra",
+            "rewalo/TownOfUsMiraRolesExtension",
+        ] {
+            assert_eq!(
+                catalog.get(id).unwrap().dependencies,
+                vec![TOU_MIRA_ID.to_string()],
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_dependency_cannot_be_removed_while_town_of_us_is_installed() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_id = "managed-tou-dependency";
         let installed = |id: &str, file: &str| InstalledMod {
             package_id: id.into(),
             name: id.into(),
@@ -6835,17 +7855,15 @@ mod tests {
             asset: Some(file.into()),
         };
         profile::install_plugin_bytes(temp.path(), profile_id, "Reactor.dll", b"reactor").unwrap();
-        profile::set_plugin_enabled(temp.path(), profile_id, "Reactor.dll", false).unwrap();
         let mut record = ProfileRecord {
             id: profile_id.into(),
-            name: "User-managed dependency".into(),
+            name: "Managed Town of Us dependency".into(),
             crew_color: "#fff".into(),
             game_build: None,
             game_instance_id: None,
             mods: vec![
                 installed("AU-Avengers/TOU-Mira", "Tou.dll"),
                 InstalledMod {
-                    enabled: false,
                     managed: true,
                     ..installed("NuclearPowered/Reactor", "Reactor.dll")
                 },
@@ -6854,37 +7872,25 @@ mod tests {
         };
         let catalog = bundled_catalog();
 
-        assert_eq!(
-            validate_mod_toggle(&record, "NuclearPowered/Reactor").unwrap(),
-            1
-        );
-        remove_mod_from_record(
+        let error = remove_mod_from_record(
             temp.path(),
             profile_id,
             &mut record,
             &catalog,
             "NuclearPowered/Reactor",
         )
-        .unwrap();
+        .unwrap_err();
 
+        assert!(error.contains("included in the Town of Us package"));
         assert!(record
             .mods
             .iter()
-            .all(|installed| installed.package_id != "NuclearPowered/Reactor"));
-        assert!(record
-            .mods
-            .iter()
-            .any(|installed| installed.package_id == "AU-Avengers/TOU-Mira"));
-        assert!(!temp
+            .any(|installed| installed.package_id == "NuclearPowered/Reactor"));
+        assert!(temp
             .path()
             .join(profile_id)
             .join("BepInEx/plugins/Reactor.dll")
-            .exists());
-        assert!(!temp
-            .path()
-            .join(profile_id)
-            .join("BepInEx/plugins/Reactor.dll.disabled")
-            .exists());
+            .is_file());
     }
 
     #[test]

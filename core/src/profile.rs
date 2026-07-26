@@ -23,6 +23,33 @@ const MAX_PROFILE_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PLUGIN_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PLUGIN_ARCHIVE_ENTRIES: usize = 4_096;
 const MAX_PLUGIN_ARCHIVE_PATH_BYTES: usize = 1_024;
+const MAX_TOU_BUNDLE_FILES: usize = 64;
+const MAX_TOU_BUNDLE_BYTES: u64 = 384 * 1024 * 1024;
+pub const TOU_BUNDLE_MARKER: &str = ".perfectsync-tou-mira.json";
+pub const TOU_ROOT_DLL: &str = "TownOfUsMira.dll";
+const TOU_PACKAGE_ID: &str = "AU-Avengers/TOU-Mira";
+const TOU_BUNDLED_PACKAGE_IDS: &[&str] = &[
+    "All-Of-Us-Mods/MiraAPI",
+    "NuclearPowered/Reactor",
+    "miniduikboot/Mini.RegionInstall",
+];
+pub const TOU_REQUIRED_FILES: &[&str] = &[
+    "plugins/Mini.RegionInstall.dll",
+    "plugins/MiraAPI.dll",
+    "plugins/Reactor.dll",
+    "plugins/touhats.bundle",
+    "plugins/touhats.catalog",
+    "plugins/TownOfUsMira.dll",
+    "config/at.duikbo.regioninstall.cfg",
+];
+
+/// Dependency DLLs supplied by the complete Town of Us game package. Profile
+/// copies are retained separately so they can resume if Town of Us is removed.
+pub const TOU_RUNTIME_PLUGIN_FILES: &[&str] = &[
+    "plugins/Mini.RegionInstall.dll",
+    "plugins/MiraAPI.dll",
+    "plugins/Reactor.dll",
+];
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -48,6 +75,12 @@ pub struct InstalledMod {
     pub file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub asset: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TouBundleManifest {
+    files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -481,6 +514,14 @@ pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
                     .as_deref()
                     .is_some_and(|repo| repo.eq_ignore_ascii_case("DigiWorm0/LevelImposter")))
     });
+    let town_of_us_enabled = profile.mods.iter().any(|installed| {
+        installed.enabled
+            && (installed.package_id.eq_ignore_ascii_case(TOU_PACKAGE_ID)
+                || installed
+                    .repo
+                    .as_deref()
+                    .is_some_and(|repo| repo.eq_ignore_ascii_case(TOU_PACKAGE_ID)))
+    });
     LobbyManifest {
         v: 1,
         name: Some(profile.name.clone()),
@@ -489,7 +530,17 @@ pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
         mods: profile
             .mods
             .iter()
-            .filter(|m| m.enabled && m.source != ModSource::File)
+            .filter(|m| {
+                m.enabled
+                    && m.source != ModSource::File
+                    && !(town_of_us_enabled
+                        && TOU_BUNDLED_PACKAGE_IDS.iter().any(|bundled| {
+                            m.package_id.eq_ignore_ascii_case(bundled)
+                                || m.repo
+                                    .as_deref()
+                                    .is_some_and(|repo| repo.eq_ignore_ascii_case(bundled))
+                        }))
+            })
             .map(|m| ManifestMod {
                 id: m.package_id.clone(),
                 v: m.version.clone(),
@@ -668,6 +719,368 @@ pub fn install_plugin_zip_bytes(
         .by_index(index)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     publish_plugin(profiles_root, id, dll_name, entry)
+}
+
+fn valid_tou_bundle_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_DLL_NAME_BYTES
+        && name.is_ascii()
+        && !name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        && !name.ends_with(['.', ' '])
+        && !is_windows_device_name(name)
+}
+
+fn tou_bundle_relative(entry: &zip::read::ZipFile<'_>) -> io::Result<Option<PathBuf>> {
+    if entry.is_dir() {
+        return Ok(None);
+    }
+    let enclosed = entry.enclosed_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Town of Us ZIP contains an unsafe path",
+        )
+    })?;
+    let components: Vec<_> = enclosed
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(component) => component.to_str(),
+            _ => None,
+        })
+        .collect();
+    let Some(bepinex) = components
+        .iter()
+        .position(|component| component.eq_ignore_ascii_case("BepInEx"))
+    else {
+        return Ok(None);
+    };
+    if components.len() != bepinex + 3 {
+        return Ok(None);
+    }
+    let directory = components[bepinex + 1];
+    let name = components[bepinex + 2];
+    if !valid_tou_bundle_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Town of Us ZIP contains a non-portable package filename",
+        ));
+    }
+    let lower = name.to_ascii_lowercase();
+    let selected = if directory.eq_ignore_ascii_case("plugins") {
+        lower.ends_with(".dll") || lower.ends_with(".bundle") || lower.ends_with(".catalog")
+    } else if directory.eq_ignore_ascii_case("config") {
+        lower.ends_with(".cfg") && !lower.eq("bepinex.cfg")
+    } else {
+        false
+    };
+    Ok(selected.then(|| {
+        PathBuf::from(if directory.eq_ignore_ascii_case("plugins") {
+            "plugins"
+        } else {
+            "config"
+        })
+        .join(name)
+    }))
+}
+
+fn validate_tou_relative(relative: &Path) -> io::Result<()> {
+    let components: Vec<_> = relative.components().collect();
+    if components.len() != 2
+        || !matches!(components[0], Component::Normal(_))
+        || !matches!(components[1], Component::Normal(_))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Town of Us bundle manifest contains an unsafe path",
+        ));
+    }
+    let directory = components[0].as_os_str().to_str().unwrap_or_default();
+    let name = components[1].as_os_str().to_str().unwrap_or_default();
+    if !matches!(directory, "plugins" | "config") || !valid_tou_bundle_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Town of Us bundle manifest contains an invalid file",
+        ));
+    }
+    Ok(())
+}
+
+fn checked_profile_bepinex_dir(
+    profiles_root: &Path,
+    id: &str,
+    create: bool,
+) -> io::Result<PathBuf> {
+    let profile = checked_profile_dir(profiles_root, id, create)?;
+    let bepinex = profile.join("BepInEx");
+    reject_reparse(&bepinex)?;
+    if create {
+        fs::create_dir_all(&bepinex)?;
+        reject_reparse(&bepinex)?;
+    }
+    Ok(bepinex)
+}
+
+fn read_tou_bundle_manifest(bepinex: &Path) -> io::Result<Vec<PathBuf>> {
+    let marker = bepinex.join(TOU_BUNDLE_MARKER);
+    reject_reparse(&marker)?;
+    let metadata = match fs::metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_PROFILE_JSON_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Town of Us bundle marker is invalid",
+        ));
+    }
+    let manifest: TouBundleManifest = serde_json::from_reader(File::open(&marker)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if manifest.files.len() > MAX_TOU_BUNDLE_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Town of Us bundle marker has too many files",
+        ));
+    }
+    let mut seen = HashSet::new();
+    manifest
+        .files
+        .into_iter()
+        .map(|name| {
+            let relative = PathBuf::from(name);
+            validate_tou_relative(&relative)?;
+            let folded = relative
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            if !seen.insert(folded) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Town of Us bundle marker has duplicate files",
+                ));
+            }
+            Ok(relative)
+        })
+        .collect()
+}
+
+/// Return the profile-relative files owned by the complete Town of Us release.
+pub fn tou_bundle_files(profiles_root: &Path, id: &str) -> io::Result<Vec<PathBuf>> {
+    let bepinex = checked_profile_bepinex_dir(profiles_root, id, false)?;
+    read_tou_bundle_manifest(&bepinex)
+}
+
+/// Remove every file owned by a previously installed Town of Us release bundle.
+pub fn remove_tou_bundle(profiles_root: &Path, id: &str) -> io::Result<()> {
+    let bepinex = checked_profile_bepinex_dir(profiles_root, id, false)?;
+    for relative in read_tou_bundle_manifest(&bepinex)? {
+        let target = bepinex.join(&relative);
+        reject_reparse(&target)?;
+        match fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+        {
+            let disabled = target.with_file_name(format!(
+                "{}.disabled",
+                target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+            ));
+            reject_reparse(&disabled)?;
+            match fs::remove_file(disabled) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let marker = bepinex.join(TOU_BUNDLE_MARKER);
+    reject_reparse(&marker)?;
+    match fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Extract the complete, bounded Town of Us plugin/config payload into a
+/// transactionally staged profile. Loader/core files remain app-owned.
+pub fn install_tou_bundle_zip_bytes(
+    profiles_root: &Path,
+    id: &str,
+    bytes: &[u8],
+) -> io::Result<String> {
+    validate_profile_id(id)?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if archive.is_empty() || archive.len() > MAX_PLUGIN_ARCHIVE_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Town of Us ZIP is empty or has too many entries",
+        ));
+    }
+    let mut selected = Vec::new();
+    let mut archive_names = HashSet::new();
+    let mut total_bytes = 0_u64;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if entry.name().len() > MAX_PLUGIN_ARCHIVE_PATH_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Town of Us ZIP contains an overlong path",
+            ));
+        }
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Town of Us ZIP contains a symbolic link",
+            ));
+        }
+        let Some(relative) = tou_bundle_relative(&entry)? else {
+            continue;
+        };
+        if entry.size() == 0 || entry.size() > MAX_PLUGIN_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Town of Us package file is empty or too large",
+            ));
+        }
+        total_bytes = total_bytes.checked_add(entry.size()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Town of Us expanded size overflow",
+            )
+        })?;
+        if total_bytes > MAX_TOU_BUNDLE_BYTES || selected.len() >= MAX_TOU_BUNDLE_FILES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Town of Us package exceeds managed bundle limits",
+            ));
+        }
+        let folded = relative
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if !archive_names.insert(folded.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Town of Us ZIP contains duplicate package files",
+            ));
+        }
+        if TOU_RUNTIME_PLUGIN_FILES
+            .iter()
+            .any(|runtime_file| folded.eq_ignore_ascii_case(runtime_file))
+        {
+            continue;
+        }
+        selected.push((index, relative, entry.size()));
+    }
+    for required in TOU_REQUIRED_FILES {
+        if !archive_names.contains(&required.to_ascii_lowercase()) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Town of Us ZIP is missing required file {required}"),
+            ));
+        }
+    }
+
+    let bepinex = checked_profile_bepinex_dir(profiles_root, id, true)?;
+    let old_files = read_tou_bundle_manifest(&bepinex)?;
+    let old_names: HashSet<String> = old_files
+        .iter()
+        .map(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+        })
+        .collect();
+    for (_, relative, _) in &selected {
+        let destination = bepinex.join(relative);
+        reject_reparse(&destination)?;
+        if destination.exists()
+            && !old_names.contains(
+                &relative
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase(),
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Town of Us package would overwrite an unowned file {}",
+                    relative.display()
+                ),
+            ));
+        }
+    }
+
+    let stage = unique_sibling(&bepinex.join(".perfectsync-tou-mira"), "install")?;
+    fs::create_dir(&stage)?;
+    let result = (|| {
+        for (index, relative, expected_size) in &selected {
+            let mut entry = archive
+                .by_index(*index)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let output_path = stage.join(relative);
+            let parent = output_path
+                .parent()
+                .ok_or_else(|| invalid("Town of Us staged file has no parent"))?;
+            fs::create_dir_all(parent)?;
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&output_path)?;
+            let copied = io::copy(&mut entry.by_ref().take(*expected_size + 1), &mut output)?;
+            if copied != *expected_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Town of Us package file changed size while extracting",
+                ));
+            }
+            output.sync_all()?;
+        }
+        remove_tou_bundle(profiles_root, id)?;
+        for (_, relative, _) in &selected {
+            let destination = bepinex.join(relative);
+            let parent = destination
+                .parent()
+                .ok_or_else(|| invalid("Town of Us destination has no parent"))?;
+            fs::create_dir_all(parent)?;
+            fs::rename(stage.join(relative), destination)?;
+        }
+        let files: Vec<String> = selected
+            .iter()
+            .map(|(_, relative, _)| relative.to_string_lossy().replace('\\', "/"))
+            .collect();
+        let marker_bytes = serde_json::to_vec(&TouBundleManifest { files })
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let marker = bepinex.join(TOU_BUNDLE_MARKER);
+        let temporary = unique_sibling(&marker, "write")?;
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        output.write_all(&marker_bytes)?;
+        output.sync_all()?;
+        drop(output);
+        atomic_replace(&temporary, &marker)?;
+        sync_parent(&bepinex)?;
+        Ok(TOU_ROOT_DLL.to_string())
+    })();
+    let _ = fs::remove_dir_all(&stage);
+    result
 }
 
 /// Remove a plugin file (enabled or `.disabled`) from a profile.
@@ -906,8 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn to_manifest_includes_enabled_libraries() {
-        // Enabled libraries remain part of the exact requested mod set.
+    fn to_manifest_keeps_town_of_us_bundle_dependencies_atomic() {
         let mut p = sample_profile();
         p.mods.push(InstalledMod {
             package_id: "NuclearPowered/Reactor".into(),
@@ -923,15 +1335,15 @@ mod tests {
             file: Some("Reactor.dll".into()),
             asset: Some("Reactor.dll".into()),
         });
+
         let manifest = to_manifest(&p);
-        assert_eq!(manifest.mods.len(), 2);
-        let reactor = manifest
-            .mods
-            .iter()
-            .find(|m| m.id == "NuclearPowered/Reactor")
-            .unwrap();
-        assert_eq!(reactor.v, "2.3.0");
-        assert_eq!(reactor.asset.as_deref(), Some("Reactor.dll"));
+        assert_eq!(manifest.mods.len(), 1);
+        assert_eq!(manifest.mods[0].id, TOU_PACKAGE_ID);
+
+        p.mods[0].enabled = false;
+        let without_tou = to_manifest(&p);
+        assert_eq!(without_tou.mods.len(), 1);
+        assert_eq!(without_tou.mods[0].id, "NuclearPowered/Reactor");
     }
 
     #[test]
@@ -977,6 +1389,77 @@ mod tests {
             archive.finish().unwrap();
         }
         bytes.into_inner()
+    }
+
+    fn tou_profile_zip(identity: u8, include_legacy: bool) -> Vec<u8> {
+        let mut entries = TOU_REQUIRED_FILES
+            .iter()
+            .map(|relative| (format!("Release/BepInEx/{relative}"), vec![identity]))
+            .collect::<Vec<_>>();
+        entries.push(("Release/BepInEx/config/BepInEx.cfg".into(), vec![identity]));
+        if include_legacy {
+            entries.push((
+                "Release/BepInEx/plugins/LegacyBundled.dll".into(),
+                vec![identity],
+            ));
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut archive = zip::ZipWriter::new(&mut bytes);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, contents) in entries {
+                archive.start_file(name, options).unwrap();
+                archive.write_all(&contents).unwrap();
+            }
+            archive.finish().unwrap();
+        }
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn replaces_the_owned_tou_profile_bundle_as_one_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugins = loader::profile_plugins_dir(tmp.path(), "p1");
+        fs::create_dir_all(&plugins).unwrap();
+        fs::write(plugins.join("User.dll"), b"user").unwrap();
+        fs::write(plugins.join("MiraAPI.dll"), b"standalone mira").unwrap();
+
+        let file =
+            install_tou_bundle_zip_bytes(tmp.path(), "p1", &tou_profile_zip(b'1', true)).unwrap();
+        assert_eq!(file, TOU_ROOT_DLL);
+        assert_eq!(fs::read(plugins.join(TOU_ROOT_DLL)).unwrap(), b"1");
+        assert!(plugins.join("LegacyBundled.dll").is_file());
+        assert_eq!(
+            fs::read(plugins.join("MiraAPI.dll")).unwrap(),
+            b"standalone mira"
+        );
+        assert!(tmp
+            .path()
+            .join("p1/BepInEx/config/at.duikbo.regioninstall.cfg")
+            .is_file());
+
+        install_tou_bundle_zip_bytes(tmp.path(), "p1", &tou_profile_zip(b'2', false)).unwrap();
+        assert_eq!(fs::read(plugins.join(TOU_ROOT_DLL)).unwrap(), b"2");
+        assert!(!plugins.join("LegacyBundled.dll").exists());
+        assert_eq!(fs::read(plugins.join("User.dll")).unwrap(), b"user");
+        assert_eq!(
+            fs::read(plugins.join("MiraAPI.dll")).unwrap(),
+            b"standalone mira"
+        );
+
+        remove_tou_bundle(tmp.path(), "p1").unwrap();
+        assert!(!plugins.join(TOU_ROOT_DLL).exists());
+        assert!(!tmp
+            .path()
+            .join("p1/BepInEx")
+            .join(TOU_BUNDLE_MARKER)
+            .exists());
+        assert_eq!(
+            fs::read(plugins.join("MiraAPI.dll")).unwrap(),
+            b"standalone mira"
+        );
+        assert_eq!(fs::read(plugins.join("User.dll")).unwrap(), b"user");
     }
 
     #[test]

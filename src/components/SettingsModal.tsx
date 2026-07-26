@@ -35,8 +35,10 @@ interface SettingsModalProps {
   settings: Settings;
   profileId: string;
   profileGameInstanceId?: string;
+  profileUsesTou: boolean;
   onClose: () => void;
   onSave: (settings: Settings, tokenAction: GithubTokenAction) => Promise<void>;
+  onRunSetup: () => void;
   trustOf: (repo: string) => Trust;
 }
 
@@ -57,8 +59,10 @@ export function SettingsModal({
   settings,
   profileId,
   profileGameInstanceId,
+  profileUsesTou,
   onClose,
   onSave,
+  onRunSetup,
   trustOf,
 }: SettingsModalProps) {
   const reduce = useReducedMotion();
@@ -83,6 +87,7 @@ export function SettingsModal({
   const [draftError, setDraftError] = useState("");
   const [personalError, setPersonalError] = useState("");
   const [loaderNotice, setLoaderNotice] = useState<{ path: string; profileId: string; text: string } | null>(null);
+  const [applyDoorstopFix, setApplyDoorstopFix] = useState(false);
   const [personalUrl, setPersonalUrl] = useState("");
 
   const sessionRef = useRef(0);
@@ -143,6 +148,7 @@ export function SettingsModal({
       setDraftError("");
       setPersonalError("");
       setLoaderNotice(null);
+      setApplyDoorstopFix(false);
       setPersonalUrl("");
       folderPendingRef.current = false;
       reinstallPendingRef.current = false;
@@ -172,7 +178,9 @@ export function SettingsModal({
       .then((value) => {
         if (!isCurrent(identity, request, loaderRequestRef, openRef, sessionRef, profileIdRef, selectedRef)) return;
         setLoaderView(
-          value?.current && value.runtimeReady
+          value?.current &&
+            value.runtimeReady &&
+            (!applyDoorstopFix || value.doorstopFix)
             ? { kind: "ready", path, profileId, value }
             : { kind: "missing", path, profileId, value },
         );
@@ -181,7 +189,7 @@ export function SettingsModal({
         if (!isCurrent(identity, request, loaderRequestRef, openRef, sessionRef, profileIdRef, selectedRef)) return;
         setLoaderView({ kind: "error", path, profileId, message: errorMessage(error) });
       });
-  }, [loaderRetry, open, profileId, selected?.path]);
+  }, [applyDoorstopFix, loaderRetry, open, profileId, selected?.path]);
 
   const beginFolderWork = () => {
     if (folderPendingRef.current) return false;
@@ -345,7 +353,7 @@ export function SettingsModal({
     setDraftError("");
   };
 
-  const reinstall = async () => {
+  const reinstall = async (useLatestLoader = false) => {
     const target = selectedRef.current;
     if (!target || reinstallPendingRef.current) return;
     const identity: RequestIdentity = {
@@ -353,14 +361,32 @@ export function SettingsModal({
       path: target.path,
       profileId: profileIdRef.current,
     };
+    const includeFix = applyDoorstopFix;
+    const sourceName = useLatestLoader ? "latest experimental BepInEx build" : "BepInEx be.753";
     const request = ++installRequestRef.current;
     reinstallPendingRef.current = true;
     setReinstalling(true);
-    setLoaderNotice({ path: identity.path, profileId: identity.profileId, text: "Reinstalling BepInEx…" });
+    setLoaderNotice({
+      path: identity.path,
+      profileId: identity.profileId,
+      text: `Installing ${sourceName}${includeFix ? " with the compatibility fix" : ""}.`,
+    });
     try {
-      const warning = await reinstallLoader(target.path, identity.profileId, target.arch);
+      const warning = await reinstallLoader(
+        target.path,
+        identity.profileId,
+        target.arch,
+        includeFix,
+        useLatestLoader,
+      );
       if (!isCurrent(identity, request, installRequestRef, openRef, sessionRef, profileIdRef, selectedRef)) return;
-      setLoaderNotice({ path: identity.path, profileId: identity.profileId, text: warning ?? "BepInEx reinstalled (latest)." });
+      setLoaderNotice({
+        path: identity.path,
+        profileId: identity.profileId,
+        text:
+          warning ??
+          `${sourceName} installed${includeFix ? " with the compatibility fix" : " without the compatibility fix"}.`,
+      });
       setLoaderRetry((value) => value + 1);
     } catch (error) {
       if (isCurrent(identity, request, installRequestRef, openRef, sessionRef, profileIdRef, selectedRef)) {
@@ -549,7 +575,7 @@ export function SettingsModal({
                   disabled={hasPendingWork}
                   className="ring-focus flex items-center gap-1 rounded-lg px-2 py-1 text-[11.5px] font-semibold text-ink-dim hover:bg-white/10 hover:text-ink disabled:opacity-50"
                 >
-                  <Plus size={12} weight="bold" /> {folderPending ? "Inspecting…" : "Add folder"}
+                  <Plus size={12} weight="bold" /> {folderPending ? "Inspecting" : "Add folder"}
                 </button>
               </div>
               <div className="flex flex-col gap-1.5">
@@ -663,7 +689,7 @@ export function SettingsModal({
                           disabled={hasPendingWork}
                           className="ring-focus shrink-0 rounded-lg bg-[#ffd23f] px-3 py-2 text-[12px] font-bold text-[#241900] disabled:opacity-50"
                         >
-                          {folderPending ? "Copying…" : "Create managed copy"}
+                          {folderPending ? "Copying" : "Create managed copy"}
                         </button>
                       </div>
                     </div>
@@ -946,6 +972,27 @@ export function SettingsModal({
                     Retry status check
                   </button>
                 )}
+                {profileUsesTou ? (
+                  <div className="mt-3 rounded-lg border border-[#9b7bff]/20 bg-[#9b7bff]/8 px-3 py-2.5 text-[12px] leading-relaxed text-ink-dim">
+                    Town of Us owns this profile’s BepInEx and fixed UnityDoorstop build. Change or reinstall the Town of Us release from the profile instead.
+                  </div>
+                ) : (
+                  <>
+                <label className="mt-3 flex cursor-pointer items-start gap-2 text-[12px] text-ink-dim">
+                  <input
+                    type="checkbox"
+                    checked={applyDoorstopFix}
+                    onChange={(event) => setApplyDoorstopFix(event.target.checked)}
+                    disabled={hasPendingWork}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-[#9b7bff]"
+                  />
+                  <span>
+                    Apply optional UnityDoorstop 4.5.1 compatibility fix
+                    <span className="block text-[11px] text-ink-faint">
+                      Off by default. Enable only if the standard loader has startup problems.
+                    </span>
+                  </span>
+                </label>
                 <button
                   type="button"
                   onClick={() => void reinstall()}
@@ -953,13 +1000,52 @@ export function SettingsModal({
                   className="ring-focus glass-2 mt-3 flex items-center gap-1.5 rounded-lg px-3 py-2 text-[12.5px] text-ink-dim hover:text-ink disabled:opacity-50"
                 >
                   <ArrowsClockwise size={14} className={reinstalling ? "animate-spin" : ""} />
-                  {reinstalling ? "Reinstalling BepInEx…" : "Reinstall BepInEx (latest)"}
+                  {reinstalling ? "Reinstalling BepInEx" : "Reinstall BepInEx be.753"}
                 </button>
+                <details className="mt-2 text-[11.5px] text-ink-faint">
+                  <summary className="ring-focus w-fit cursor-pointer rounded-md px-1 py-0.5 hover:text-ink-dim">
+                    Advanced
+                  </summary>
+                  <div className="mt-2 border-l border-white/10 pl-2.5">
+                    <p>Resolve and install the newest experimental BepInEx build instead of pinned be.753.</p>
+                    <button
+                      type="button"
+                      onClick={() => void reinstall(true)}
+                      disabled={hasPendingWork || !selected || visibleLoaderView.kind === "loading"}
+                      className="ring-focus mt-2 rounded-md bg-white/8 px-2.5 py-1.5 text-[11.5px] font-medium text-ink-dim hover:bg-white/12 hover:text-ink disabled:opacity-50"
+                    >
+                      Install latest experimental build
+                    </button>
+                  </div>
+                </details>
+                  </>
+                )}
                 {visibleLoaderNotice && (
                   <p aria-live="polite" className="mt-2 text-[12px] text-ink-dim">
                     {visibleLoaderNotice}
                   </p>
                 )}
+              </div>
+
+              <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
+                Setup assistant
+              </span>
+              <div className="glass flex items-center justify-between gap-3 rounded-xl px-3.5 py-3 max-[480px]:items-start">
+                <div>
+                  <p className="text-[12.5px] text-ink">Run the first-time setup again</p>
+                  <p className="mt-0.5 text-[11px] leading-relaxed text-ink-faint">
+                    Choose another game install, Town of Us release, or BepInEx-only setup.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={onRunSetup}
+                  disabled={hasPendingWork || hasDraftChanges}
+                  title={hasDraftChanges ? "Save or discard your changes first" : undefined}
+                  className="ring-focus glass-2 shrink-0 rounded-lg px-3 py-2 text-[12px] font-semibold text-ink-dim hover:text-ink disabled:opacity-50"
+                >
+                  Run setup
+                </button>
               </div>
 
               {draftError && (
@@ -988,7 +1074,7 @@ export function SettingsModal({
                   disabled={hasPendingWork || !hasDraftChanges}
                   className="ring-focus accent-grad rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820] disabled:opacity-50 max-[520px]:flex-1"
                 >
-                  {saving ? "Saving…" : "Save changes"}
+                  {saving ? "Saving" : "Save changes"}
                 </button>
               </div>
             </div>
@@ -1041,7 +1127,7 @@ function LoaderStatusView({ state, selected }: { state: LoaderView; selected: bo
     return <div className="text-ink-faint">{selected ? "Loader status has not been checked." : "Select an instance above to check the loader."}</div>;
   }
   if (state.kind === "loading") {
-    return <div role="status" className="text-ink-faint">Checking loader status…</div>;
+    return <div role="status" className="text-ink-faint">Checking loader status</div>;
   }
   if (state.kind === "error") {
     return (
@@ -1072,6 +1158,7 @@ function LoaderDetails({ status, incomplete = false }: { status: LoaderStatus; i
         ok={status.current}
         label={status.current && status.installedVersion ? `BepInEx installed (${status.installedVersion})` : "BepInEx loader installed"}
       />
+      <StatusRow ok={status.doorstopFix} label="Latest-game compatibility fix (optional)" />
       <StatusRow ok={status.dotnet} label=".NET runtime" />
       <StatusRow ok={status.steamAppid} label="Steam launch fix" />
       {status.runtime !== "native" && <StatusRow ok={status.runtimeReady} label={`${status.runtime} winhttp override`} />}

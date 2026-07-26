@@ -189,7 +189,7 @@ export function BatchInstallReview({
               <X size={16} weight="bold" />
             </button>
             <h2 className="pr-10 text-[20px] font-semibold text-ink">Review your mods</h2>
-            <p className="mt-1 text-[13px] text-ink-dim">The latest version and catalog file are selected by default. Required dependencies are added automatically, but you can remove them from the profile later. Catalog ZIP packages are safely reduced to their declared plugin DLL.</p>
+            <p className="mt-1 text-[13px] text-ink-dim">The latest compatible release and catalog file are selected by default. Required dependencies are added automatically. Complete bundle packages install their loader, dependencies, configs, and assets from one release ZIP.</p>
 
             {error && <p className="mt-3 rounded-xl bg-[rgba(226,59,59,0.12)] px-3.5 py-2.5 text-[13px] break-words text-[#ff8a8a]" role="alert">Install failed: {error}</p>}
 
@@ -217,6 +217,11 @@ export function BatchInstallReview({
                     </div>
                     <p className="mt-1 truncate font-mono text-[11.5px] text-ink-faint" title={item.repo}>{item.repo}</p>
                     {row.managed && <p className="mt-1 text-[11.5px] text-ink-faint">Required by {row.rootName}. You can remove it from the profile after installation.</p>}
+                    {!row.managed && !!item.included?.length && (
+                      <p className="mt-1 text-[11.5px] text-[#cbbcff]">
+                        This ZIP owns {item.included.join(", ")}; they install and update as one package.
+                      </p>
+                    )}
                     {state.loading ? (
                       <p className="mt-3 text-[12.5px] text-ink-dim" role="status">Finding compatible versions…</p>
                     ) : state.error ? (

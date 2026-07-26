@@ -8,10 +8,9 @@ import { BatchInstallReview } from "./components/BatchInstallReview";
 import { BatchUpdateReview } from "./components/BatchUpdateReview";
 import { MapBrowserPanel } from "./components/MapBrowserPanel";
 import { SettingsModal } from "./components/SettingsModal";
-import { MaintenancePanel } from "./components/MaintenancePanel";
 import { ReleasePicker } from "./components/ReleasePicker";
 import { ShareModal } from "./components/ShareModal";
-import { SetupModal } from "./components/SetupModal";
+import { SetupModal, type SetupSelection } from "./components/SetupModal";
 import { LaunchWarning } from "./components/LaunchWarning";
 import { Toast, type ToastState } from "./components/Toast";
 import {
@@ -106,7 +105,7 @@ export function App() {
   const [lobbyOpen, setLobbyOpen] = useState(false);
   const [lobbyCode, setLobbyCode] = useState<string | undefined>(undefined);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [maintenanceOpen, setMaintenanceOpen] = useState(false);
+  const [setupOpen, setSetupOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [launchWarn, setLaunchWarn] = useState<Profile | null>(null);
   const [pickerTarget, setPickerTarget] = useState<{
@@ -1034,48 +1033,119 @@ export function App() {
     }
   };
 
-  const completeSetup = async (gamePath?: string, selectedArch?: string, store?: string, runtime?: Runtime) => {
+  const installSetupLoader = (
+    gamePath: string,
+    profileId: string,
+    arch: string,
+    applyDoorstopFix: boolean,
+  ): Promise<string | null> =>
+    trackedExclusive(
+      {
+        scope: "setup",
+        title: applyDoorstopFix ? "Installing BepInEx compatibility" : "Installing BepInEx",
+        message: "Checking the Among Us folder and loader cache",
+      },
+      (report) => bridge.ensureLoader(gamePath, profileId, arch, applyDoorstopFix, report),
+    );
+
+  const completeSetup = async (
+    gamePath?: string,
+    selectedArch?: string,
+    store?: string,
+    runtime?: Runtime,
+    selection?: SetupSelection,
+  ) => {
+    try {
+      await trackedExclusive(
+        {
+          scope: "setup",
+          title: selection?.kind === "tou" ? "Installing Town of Us" : "Finishing setup",
+          message: "Saving the selected Among Us installation",
+        },
+        async (report) => {
+          const instances = [...gameInstances];
+          let gameInstanceId = active.gameInstanceId;
+          let selectedInstance: GameInstance | undefined;
+          if (gamePath) {
+            let instance = instances.find(
+              (candidate) =>
+                candidate.path.replaceAll("\\", "/").toLowerCase() ===
+                gamePath.replaceAll("\\", "/").toLowerCase(),
+            );
+            if (!instance) {
+              const detected = games.find((candidate) => candidate.path === gamePath);
+              const instanceStore = (store as Store | undefined) ?? detected?.store ?? "manual";
+              const storeCount = instances.filter((candidate) => candidate.store === instanceStore).length;
+              const baseName = INSTANCE_NAMES[instanceStore];
+              instance = {
+                id: `game-${Date.now().toString(36)}`,
+                name: storeCount === 0 ? baseName : `${baseName} ${storeCount + 1}`,
+                path: gamePath,
+                arch: (selectedArch as Arch | undefined) ?? detected?.arch ?? "x86",
+                store: instanceStore,
+                runtime: runtime ?? detected?.runtime ?? "native",
+              };
+              instances.push(instance);
+            }
+            selectedInstance = instance;
+            gameInstanceId = instance.id;
+          }
+          if (selection?.kind === "tou" && !selectedInstance) {
+            throw new Error("Choose an Among Us installation before setting up Town of Us.");
+          }
+
+          report({ phase: "preparing", message: "Saving the game instance and active profile" });
+          // Keep the existing completion state while a rerun is in progress. Each
+          // successful persistence step is mirrored locally so a failed download
+          // cannot leave the frontend trying to delete a newly assigned instance.
+          const provisional = await bridge.saveSettings({
+            ...settings,
+            gameInstances: instances,
+          });
+          setSettings(provisional);
+          let savedProfile = await bridge.saveProfile({ ...active, gameInstanceId });
+          patchProfile(savedProfile);
+          if (selection?.kind === "tou" && selectedInstance) {
+            report({ phase: "resolving", message: `Resolving Town of Us ${selection.tag}` });
+            savedProfile = await bridge.installAsset(
+              savedProfile,
+              "AU-Avengers/TOU-Mira",
+              selection.tag,
+              selection.assetName,
+              selectedInstance.arch,
+              true,
+              report,
+            );
+            patchProfile(savedProfile);
+            report({ phase: "finalizing", message: "Synchronizing the complete Town of Us package" });
+            await bridge.syncProfile(selectedInstance.path, savedProfile.id);
+          }
+          report({ phase: "finalizing", message: "Marking first-time setup complete" });
+          const normalized = await bridge.saveSettings({ ...provisional, setupComplete: true });
+          setSettings(normalized);
+          setSetupOpen(false);
+          patchProfile(savedProfile);
+        },
+      );
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
+    }
+  };
+
+  const dismissSetup = async () => {
+    if (setupOpen) {
+      setSetupOpen(false);
+      return;
+    }
     try {
       await exclusive(async () => {
-        const instances = [...gameInstances];
-        let gameInstanceId = active.gameInstanceId;
-        if (gamePath) {
-          let instance = instances.find(
-            (candidate) =>
-              candidate.path.replaceAll("\\", "/").toLowerCase() ===
-              gamePath.replaceAll("\\", "/").toLowerCase(),
-          );
-          if (!instance) {
-            const detected = games.find((candidate) => candidate.path === gamePath);
-            const instanceStore = (store as Store | undefined) ?? detected?.store ?? "manual";
-            const storeCount = instances.filter((candidate) => candidate.store === instanceStore).length;
-            const baseName = INSTANCE_NAMES[instanceStore];
-            instance = {
-              id: `game-${Date.now().toString(36)}`,
-              name: storeCount === 0 ? baseName : `${baseName} ${storeCount + 1}`,
-              path: gamePath,
-              arch: (selectedArch as Arch | undefined) ?? detected?.arch ?? "x86",
-              store: instanceStore,
-              runtime: runtime ?? detected?.runtime ?? "native",
-            };
-            instances.push(instance);
-          }
-          gameInstanceId = instance.id;
-        }
-        // Persist the instance list first, but publish setupComplete only after the
-        // profile assignment succeeds. A failure or crash therefore reopens setup.
-        const provisional = await bridge.saveSettings({
-          ...settings,
-          setupComplete: false,
-          gameInstances: instances,
-        });
-        const savedProfile = await bridge.saveProfile({ ...active, gameInstanceId });
-        const normalized = await bridge.saveSettings({ ...provisional, setupComplete: true });
+        const normalized = await bridge.saveSettings({ ...settings, setupComplete: true });
         setSettings(normalized);
-        patchProfile(savedProfile);
       });
     } catch (error) {
       if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      throw error;
     }
   };
 
@@ -1115,8 +1185,8 @@ export function App() {
     settingsOpen ||
     pickerTarget !== null ||
     shareOpen ||
-    maintenanceOpen ||
     firstRun ||
+    setupOpen ||
     updateReviewOpen ||
     launchWarn !== null;
 
@@ -1132,9 +1202,6 @@ export function App() {
         onJoinLobby={openLobby}
         onOpenSettings={() => {
           if (!busy) setSettingsOpen(true);
-        }}
-        onOpenMaintenance={() => {
-          if (!busy) setMaintenanceOpen(true);
         }}
       />
 
@@ -1285,16 +1352,21 @@ export function App() {
         settings={settings}
         profileId={active.id}
         profileGameInstanceId={active.gameInstanceId}
+        profileUsesTou={active.mods.some(
+          (mod) =>
+            mod.enabled &&
+            (mod.packageId.toLowerCase() === "au-avengers/tou-mira" ||
+              mod.repo?.toLowerCase() === "au-avengers/tou-mira"),
+        )}
         onClose={() => {
           if (!operationRef.current) setSettingsOpen(false);
         }}
         onSave={saveSettings}
+        onRunSetup={() => {
+          setSettingsOpen(false);
+          setSetupOpen(true);
+        }}
         trustOf={trustOf}
-      />
-      <MaintenancePanel
-        open={maintenanceOpen}
-        profileId={active.id}
-        onClose={() => setMaintenanceOpen(false)}
       />
       <BatchUpdateReview
         open={updateReviewOpen}
@@ -1325,10 +1397,12 @@ export function App() {
         }}
       />
       <SetupModal
-        open={firstRun}
+        open={firstRun || setupOpen}
         detected={games}
         profileId={active.id}
         onFinish={completeSetup}
+        onDismiss={dismissSetup}
+        onInstallLoader={installSetupLoader}
       />
       <LaunchWarning
         open={launchWarn !== null}

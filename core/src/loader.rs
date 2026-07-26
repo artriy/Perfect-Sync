@@ -27,6 +27,11 @@ pub const IL2CPP_PRELOADER: &str = "BepInEx.Unity.IL2CPP.dll";
 pub const STEAM_APP_ID: &str = "945360";
 
 const LOADER_MARKER: &str = ".perfectsync_loader";
+pub const DOORSTOP_PATCH_MARKER: &str = ".perfectsync_doorstop";
+pub const DOORSTOP_PATCH_TRANSACTION: &str = ".doorstop-fix.perfectsync-txn";
+pub const MANAGED_TOU_PACKAGE_MARKER: &str = ".perfectsync-tou-package.json";
+const DOORSTOP_GC_VARIABLE: &str = "GC_DISABLE_INCREMENTAL";
+const MAX_DOORSTOP_CONFIG_BYTES: u64 = 1024 * 1024;
 const MANAGED_PLUGINS_MARKER: &str = ".perfectsync-managed.json";
 const PLUGIN_SYNC_TRANSACTION: &str = ".plugins.perfectsync-sync";
 const PLUGIN_SYNC_STAGE: &str = "sync-stage";
@@ -58,6 +63,50 @@ static SYNC_LOCK: Mutex<()> = Mutex::new(());
 /// reads false, so the app reinstalls the current build (auto-heals stale loaders).
 pub fn has_loader(game_dir: &Path) -> bool {
     is_installed(game_dir) && game_dir.join("BepInEx").join(LOADER_MARKER).is_file()
+}
+
+fn doorstop_patch_record(version: &str, arch: &str) -> io::Result<String> {
+    cache_component(version)?;
+    if !matches!(arch, "x86" | "x64") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported Doorstop architecture",
+        ));
+    }
+    Ok(format!("{version}:win:{arch}"))
+}
+
+/// True when the pinned Windows Doorstop patch was applied for this game architecture.
+///
+/// Among Us remains a Windows executable on every supported host. Linux uses
+/// Proton and macOS uses Wine, so both must load the Windows proxy selected
+/// from the actual PE bitness rather than a host-native Doorstop library.
+pub fn has_doorstop_patch(game_dir: &Path, version: &str, arch: &str) -> bool {
+    let Ok(expected) = doorstop_patch_record(version, arch) else {
+        return false;
+    };
+    fs::read_to_string(game_dir.join("BepInEx").join(DOORSTOP_PATCH_MARKER))
+        .ok()
+        .is_some_and(|record| record.trim() == expected)
+}
+
+/// Remove only Perfect-Sync's patch marker after an unchecked full reinstall.
+pub fn clear_doorstop_patch_marker(game_dir: &Path) -> io::Result<()> {
+    let bepinex = game_dir.join("BepInEx");
+    let marker = bepinex.join(DOORSTOP_PATCH_MARKER);
+    crate::profile::reject_reparse(game_dir)?;
+    crate::profile::reject_reparse(&bepinex)?;
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(marker)
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Doorstop patch marker is not a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// True if the recorded loader build is older than `latest` (so it should be
@@ -167,7 +216,7 @@ fn cache_component(value: &str) -> io::Result<()> {
         || windows_device_name(value)
         || !value
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
         || !single
     {
         return Err(io::Error::new(
@@ -871,6 +920,160 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+fn configured_doorstop_ini(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    let source = std::str::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Doorstop configuration is not UTF-8",
+        )
+    })?;
+    let (bom, body) = source
+        .strip_prefix('\u{feff}')
+        .map_or(("", source), |body| ("\u{feff}", body));
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("target_assembly") || !lower.contains("bepinex") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Doorstop configuration does not target BepInEx",
+        ));
+    }
+
+    let newline = if body.contains("\r\n") { "\r\n" } else { "\n" };
+    let had_trailing_newline = body.ends_with('\n') || body.ends_with('\r');
+    let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
+    let mut environment_header = None;
+    let mut in_environment = false;
+    let mut variable_lines = Vec::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(section) = trimmed
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        {
+            in_environment = section.trim().eq_ignore_ascii_case("Environment");
+            if in_environment && environment_header.is_none() {
+                environment_header = Some(index);
+            }
+            continue;
+        }
+        if in_environment
+            && !trimmed.starts_with('#')
+            && !trimmed.starts_with(';')
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case(DOORSTOP_GC_VARIABLE))
+        {
+            variable_lines.push(index);
+        }
+    }
+
+    if let Some(first) = variable_lines.first().copied() {
+        lines[first] = format!("{DOORSTOP_GC_VARIABLE}=1");
+        for duplicate in variable_lines.into_iter().skip(1).rev() {
+            lines.remove(duplicate);
+        }
+    } else if let Some(header) = environment_header {
+        lines.insert(header + 1, format!("{DOORSTOP_GC_VARIABLE}=1"));
+    } else {
+        if lines.last().is_some_and(|line| !line.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push("[Environment]".to_string());
+        lines.push(format!("{DOORSTOP_GC_VARIABLE}=1"));
+    }
+
+    let mut configured = String::with_capacity(source.len() + 64);
+    configured.push_str(bom);
+    configured.push_str(&lines.join(newline));
+    if had_trailing_newline {
+        configured.push_str(newline);
+    }
+    Ok(configured.into_bytes())
+}
+
+fn copy_new_synced(source: &Path, destination: &Path) -> io::Result<()> {
+    if !regular_nonempty(source) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Doorstop patch file is missing or empty: {}",
+                source.display()
+            ),
+        ));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut input = File::open(source)?;
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()
+}
+
+fn write_new_synced(destination: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)?;
+    output.write_all(bytes)?;
+    output.sync_all()
+}
+
+fn validate_windows_proxy_arch(path: &Path, arch: &str) -> io::Result<()> {
+    let bytes = fs::read(path)?;
+    let pe_offset = bytes
+        .get(0x3c..0x40)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_le_bytes)
+        .map(|value| value as usize)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Doorstop proxy is not a PE file",
+            )
+        })?;
+    if bytes.get(pe_offset..pe_offset + 4) != Some(b"PE\0\0") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Doorstop proxy is not a PE file",
+        ));
+    }
+    let machine = bytes
+        .get(pe_offset + 4..pe_offset + 6)
+        .and_then(|value| value.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Doorstop proxy has no COFF header",
+            )
+        })?;
+    let expected = match arch {
+        "x86" => 0x014c,
+        "x64" => 0x8664,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported Doorstop architecture",
+            ));
+        }
+    };
+    if machine != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Doorstop proxy architecture does not match {arch} Among Us"),
+        ));
+    }
+    Ok(())
+}
+
 /// Force the BepInEx console window off (keep the on-disk log).
 pub fn write_console_off(game_dir: &Path) -> io::Result<()> {
     let cfg_dir = game_dir.join("BepInEx").join("config");
@@ -1080,6 +1283,360 @@ pub fn extract_all(bytes: &[u8], dest: &Path) -> io::Result<()> {
     let _ = fs::remove_dir_all(&stage);
     if result.is_ok() || !backup.exists() {
         let _ = fs::remove_dir_all(&backup);
+    }
+    result
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedTouPackage {
+    key: String,
+    files: Vec<String>,
+}
+
+fn valid_tou_package_relative(relative: &Path) -> bool {
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return false;
+    }
+    let names: Vec<_> = components
+        .iter()
+        .map(|component| component.as_os_str().to_str())
+        .collect();
+    if names.iter().any(|name| {
+        name.is_none_or(|name| {
+            name.is_empty() || !name.is_ascii() || name.to_ascii_lowercase().contains("perfectsync")
+        })
+    }) {
+        return false;
+    }
+    let first = names[0].unwrap_or_default();
+    if first.eq_ignore_ascii_case("BepInEx") || first.eq_ignore_ascii_case("dotnet") {
+        return components.len() >= 2;
+    }
+    components.len() == 1
+        && (BOOTSTRAP_FILES
+            .iter()
+            .any(|allowed| first.eq_ignore_ascii_case(allowed))
+            || first.eq_ignore_ascii_case("changelog.txt")
+            || first.eq_ignore_ascii_case("steam_appid.txt"))
+}
+
+fn read_managed_tou_package(game_dir: &Path) -> io::Result<Option<ManagedTouPackage>> {
+    let marker = game_dir.join("BepInEx").join(MANAGED_TOU_PACKAGE_MARKER);
+    crate::profile::reject_reparse(&marker)?;
+    let metadata = match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed Town of Us package marker is not a regular file",
+            ));
+        }
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.len() == 0 || metadata.len() > MAX_MANAGED_MARKER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed Town of Us package marker has an invalid size",
+        ));
+    }
+    let managed: ManagedTouPackage = serde_json::from_slice(&fs::read(marker)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if managed.key.is_empty()
+        || managed.key.len() > 128
+        || !managed.key.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || managed.files.is_empty()
+        || managed.files.len() > MAX_ZIP_ENTRIES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed Town of Us package marker is invalid",
+        ));
+    }
+    let mut seen = HashSet::with_capacity(managed.files.len());
+    for name in &managed.files {
+        let relative = PathBuf::from(name);
+        if !valid_tou_package_relative(&relative)
+            || !seen.insert(name.replace('\\', "/").to_ascii_lowercase())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed Town of Us package marker contains an invalid path",
+            ));
+        }
+    }
+    Ok(Some(managed))
+}
+
+/// Whether the complete release-matched Town of Us package is already present.
+pub fn tou_package_is_current(game_dir: &Path, key: &str) -> io::Result<bool> {
+    let Some(managed) = read_managed_tou_package(game_dir)? else {
+        return Ok(false);
+    };
+    if managed.key != key {
+        return Ok(false);
+    }
+    for name in &managed.files {
+        let target = game_dir.join(name);
+        crate::profile::reject_reparse(&target)?;
+        if !fs::metadata(target).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Remove every game-root file owned by the previously applied Town of Us ZIP.
+/// The caller wraps this in the broader game artifact transaction.
+pub fn remove_tou_package(game_dir: &Path) -> io::Result<()> {
+    let Some(mut managed) = read_managed_tou_package(game_dir)? else {
+        return Ok(());
+    };
+    managed
+        .files
+        .sort_by_key(|name| std::cmp::Reverse(name.matches('/').count()));
+    for name in managed.files {
+        let target = game_dir.join(name);
+        crate::profile::reject_reparse(&target)?;
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed Town of Us package target changed type",
+                ));
+            }
+            Ok(_) => fs::remove_file(target)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let marker = game_dir.join("BepInEx").join(MANAGED_TOU_PACKAGE_MARKER);
+    match fs::remove_file(marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    clear_doorstop_patch_marker(game_dir)
+}
+
+/// Apply every safe game-root file from the exact Town of Us release ZIP.
+/// The bundled BepInEx pack is installed first, then the full archive is
+/// overlaid. The caller provides rollback through the game artifact transaction.
+pub fn install_tou_package(
+    bytes: &[u8],
+    game_dir: &Path,
+    key: &str,
+    loader_version: &str,
+) -> io::Result<()> {
+    if key.is_empty() || key.len() > 128 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Town of Us package key",
+        ));
+    }
+    crate::profile::reject_reparse(game_dir)?;
+    let extraction = crate::profile::unique_sibling(game_dir, "tou-package")?;
+    let result = (|| {
+        extract_zip_to_empty(bytes, &extraction)?;
+        let package_root = locate_pack_root(&extraction).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Town of Us ZIP has no unique complete BepInEx package root",
+            )
+        })?;
+        validate_pack_root(&package_root)?;
+        for required in crate::profile::TOU_REQUIRED_FILES {
+            if !regular_nonempty(&package_root.join("BepInEx").join(required)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Town of Us ZIP is missing required file {required}"),
+                ));
+            }
+        }
+
+        let mut files = Vec::new();
+        collect_regular_files(&package_root, &package_root, &mut files)?;
+        if files.is_empty() || files.len() > MAX_ZIP_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Town of Us ZIP has an invalid file count",
+            ));
+        }
+        let mut names = Vec::with_capacity(files.len());
+        let mut seen = HashSet::with_capacity(files.len());
+        for relative in &files {
+            if !valid_tou_package_relative(relative) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Town of Us ZIP contains an unsupported game-root path {}",
+                        relative.display()
+                    ),
+                ));
+            }
+            let name = relative.to_string_lossy().replace('\\', "/");
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Town of Us ZIP contains case-colliding game-root paths",
+                ));
+            }
+            names.push(name);
+        }
+
+        remove_tou_package(game_dir)?;
+        install_pack(&package_root, game_dir, loader_version)?;
+        overlay_dir(&package_root, game_dir)?;
+        clear_doorstop_patch_marker(game_dir)?;
+        names.sort_by_key(|name| name.to_ascii_lowercase());
+        let marker_bytes = serde_json::to_vec(&ManagedTouPackage {
+            key: key.to_string(),
+            files: names,
+        })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if marker_bytes.len() as u64 > MAX_MANAGED_MARKER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed Town of Us package marker would be too large",
+            ));
+        }
+        atomic_write(
+            &game_dir.join("BepInEx").join(MANAGED_TOU_PACKAGE_MARKER),
+            &marker_bytes,
+        )
+    })();
+    let _ = fs::remove_dir_all(&extraction);
+    result
+}
+
+/// Apply the patched Windows UnityDoorstop proxy without replacing BepInEx's
+/// target assembly configuration. The patch is transactionally installed after
+/// BepInEx, and its marker is committed last.
+pub fn install_windows_doorstop_patch(
+    bytes: &[u8],
+    game_dir: &Path,
+    version: &str,
+    arch: &str,
+) -> io::Result<()> {
+    let marker_record = doorstop_patch_record(version, arch)?;
+    crate::profile::reject_reparse(game_dir)?;
+    crate::profile::reject_reparse(&game_dir.join("BepInEx"))?;
+    if !has_loader(game_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "BepInEx must be installed by Perfect-Sync before applying the Doorstop patch",
+        ));
+    }
+
+    let _guard = LOADER_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("loader install lock is poisoned"))?;
+    let transaction = game_dir.join(DOORSTOP_PATCH_TRANSACTION);
+    crate::profile::reject_reparse(&transaction)?;
+    remove_any(&transaction)?;
+    let archive = transaction.join("archive");
+    let stage = transaction.join("new");
+    let backup = transaction.join("old");
+    fs::create_dir_all(&stage)?;
+    fs::create_dir_all(&backup)?;
+
+    let result = (|| {
+        extract_zip_to_empty(bytes, &archive)?;
+        let payload = archive.join(arch);
+        crate::profile::reject_reparse(&payload)?;
+        if !payload.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Doorstop archive does not contain its {arch} payload"),
+            ));
+        }
+
+        let proxy = payload.join("winhttp.dll");
+        let released_version = payload.join(".doorstop_version");
+        let released_config = payload.join("doorstop_config.ini");
+        for required in [&proxy, &released_version, &released_config] {
+            if !regular_nonempty(required) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Doorstop archive is missing mandatory file {}",
+                        required
+                            .strip_prefix(&archive)
+                            .unwrap_or(required)
+                            .display()
+                    ),
+                ));
+            }
+        }
+        validate_windows_proxy_arch(&proxy, arch)?;
+        if fs::read_to_string(&released_version)
+            .ok()
+            .is_none_or(|value| value.trim() != version)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Doorstop archive version does not match the pinned release",
+            ));
+        }
+        let released_config_bytes = fs::read(&released_config)?;
+        if !std::str::from_utf8(&released_config_bytes)
+            .ok()
+            .is_some_and(|value| value.to_ascii_lowercase().contains("[environment]"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Doorstop archive does not support process environment configuration",
+            ));
+        }
+
+        let installed_config = game_dir.join("doorstop_config.ini");
+        let config_metadata = fs::metadata(&installed_config)?;
+        if !config_metadata.is_file()
+            || config_metadata.len() == 0
+            || config_metadata.len() > MAX_DOORSTOP_CONFIG_BYTES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installed BepInEx Doorstop configuration is invalid",
+            ));
+        }
+        let configured = configured_doorstop_ini(&fs::read(&installed_config)?)?;
+
+        copy_new_synced(&proxy, &stage.join("winhttp.dll"))?;
+        copy_new_synced(&released_version, &stage.join(".doorstop_version"))?;
+        write_new_synced(&stage.join("doorstop_config.ini"), &configured)?;
+        let marker_relative = PathBuf::from("BepInEx").join(DOORSTOP_PATCH_MARKER);
+        write_new_synced(&stage.join(&marker_relative), marker_record.as_bytes())?;
+
+        let targets = [
+            PathBuf::from("winhttp.dll"),
+            PathBuf::from(".doorstop_version"),
+            PathBuf::from("doorstop_config.ini"),
+            marker_relative.clone(),
+        ];
+        let required_dirs = [PathBuf::new(), PathBuf::from("BepInEx")];
+        commit_staged_files_with_sentinel(
+            &stage,
+            game_dir,
+            &backup,
+            &targets,
+            &required_dirs,
+            Some(&marker_relative),
+            |source, destination| fs::rename(source, destination),
+        )
+    })();
+    remove_any(&archive).ok();
+    let backup_empty = fs::read_dir(&backup)
+        .ok()
+        .is_some_and(|mut entries| entries.next().is_none());
+    if result.is_ok() || !backup.exists() || backup_empty {
+        remove_any(&transaction).ok();
     }
     result
 }
@@ -1628,6 +2185,17 @@ pub fn sync_profile_plugins(
     profile_id: &str,
     game_dir: &Path,
 ) -> io::Result<()> {
+    sync_profile_plugins_shadowing(profiles_root, profile_id, game_dir, &[])
+}
+
+/// Synchronize profile DLLs while leaving package-owned versions of the named
+/// plugins untouched. Shadowed profile files remain available for later use.
+pub fn sync_profile_plugins_shadowing(
+    profiles_root: &Path,
+    profile_id: &str,
+    game_dir: &Path,
+    shadowed_names: &[String],
+) -> io::Result<()> {
     let _guard = SYNC_LOCK
         .lock()
         .map_err(|_| io::Error::other("plugin sync lock is poisoned"))?;
@@ -1648,6 +2216,24 @@ pub fn sync_profile_plugins(
     recover_interrupted_plugin_sync(&destination)?;
     let marker = destination.join(MANAGED_PLUGINS_MARKER);
     let mut previously_owned = read_managed_plugins(&marker)?;
+    if shadowed_names.len() > MAX_MANAGED_PLUGINS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many shadowed plugin names",
+        ));
+    }
+    let mut shadowed = HashSet::with_capacity(shadowed_names.len());
+    for name in shadowed_names {
+        crate::profile::validate_dll_name(name)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        if !shadowed.insert(name.to_ascii_lowercase()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shadowed plugin names collide case-insensitively",
+            ));
+        }
+    }
+    previously_owned.retain(|name| !shadowed.contains(name));
 
     let mut selected = HashMap::<String, (String, PathBuf, u64)>::new();
     let mut total_source_bytes = 0_u64;
@@ -1672,6 +2258,9 @@ pub fn sync_profile_plugins(
         crate::profile::validate_dll_name(&name)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let key = name.to_ascii_lowercase();
+        if shadowed.contains(&key) {
+            continue;
+        }
         if selected.contains_key(&key) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2196,6 +2785,21 @@ mod tests {
         )
         .unwrap();
     }
+
+    #[test]
+    fn loader_cache_accepts_semver_build_metadata_safely() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            loader_cache_dir(temp.path(), "be.753+0d275a4", "x86").unwrap(),
+            temp.path()
+                .join("bepinex")
+                .join("be.753+0d275a4")
+                .join("x86")
+        );
+        for unsafe_key in ["../be.753", "be.753/x86", "CON", "be.753:bad"] {
+            assert!(loader_cache_dir(temp.path(), unsafe_key, "x86").is_err());
+        }
+    }
     fn make_pack_zip(body: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
         {
@@ -2213,6 +2817,212 @@ mod tests {
             writer.finish().unwrap();
         }
         bytes
+    }
+
+    fn make_tou_package_zip(identity: u8, include_legacy: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            for path in [
+                "Tou/.doorstop_version",
+                "Tou/winhttp.dll",
+                "Tou/doorstop_config.ini",
+                "Tou/steam_appid.txt",
+                "Tou/changelog.txt",
+                "Tou/dotnet/coreclr.dll",
+                "Tou/BepInEx/core/BepInEx.Unity.IL2CPP.dll",
+                "Tou/BepInEx/unity-libs/System.dll",
+            ] {
+                writer.start_file(path, options).unwrap();
+                writer.write_all(&[identity]).unwrap();
+            }
+            for required in crate::profile::TOU_REQUIRED_FILES {
+                writer
+                    .start_file(format!("Tou/BepInEx/{required}"), options)
+                    .unwrap();
+                writer.write_all(&[identity]).unwrap();
+            }
+            if include_legacy {
+                writer
+                    .start_file("Tou/BepInEx/plugins/Legacy.dll", options)
+                    .unwrap();
+                writer.write_all(&[identity]).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn installs_updates_and_removes_complete_tou_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir(&game).unwrap();
+        fs::write(game.join("Among Us.exe"), b"game").unwrap();
+        fs::create_dir_all(game.join("BepInEx/plugins")).unwrap();
+        fs::write(game.join("BepInEx/plugins/ExistingMod.dll"), b"existing").unwrap();
+        let first_key = "a".repeat(64);
+        let second_key = "b".repeat(64);
+
+        install_tou_package(
+            &make_tou_package_zip(b'1', true),
+            &game,
+            &first_key,
+            "be.753+0d275a4",
+        )
+        .unwrap();
+        assert!(tou_package_is_current(&game, &first_key).unwrap());
+        assert!(game.join("BepInEx/plugins/TownOfUsMira.dll").is_file());
+        assert!(game
+            .join("BepInEx/config/at.duikbo.regioninstall.cfg")
+            .is_file());
+        assert!(game.join("BepInEx/unity-libs/System.dll").is_file());
+        assert!(game.join("steam_appid.txt").is_file());
+        assert!(game.join("BepInEx/plugins/Legacy.dll").is_file());
+        assert_eq!(
+            fs::read(game.join("BepInEx/plugins/ExistingMod.dll")).unwrap(),
+            b"existing"
+        );
+
+        install_tou_package(
+            &make_tou_package_zip(b'2', false),
+            &game,
+            &second_key,
+            "be.753+0d275a4",
+        )
+        .unwrap();
+        assert!(!tou_package_is_current(&game, &first_key).unwrap());
+        assert!(tou_package_is_current(&game, &second_key).unwrap());
+        assert_eq!(
+            fs::read(game.join("BepInEx/plugins/TownOfUsMira.dll")).unwrap(),
+            b"2"
+        );
+        assert!(!game.join("BepInEx/plugins/Legacy.dll").exists());
+
+        remove_tou_package(&game).unwrap();
+        assert!(!tou_package_is_current(&game, &second_key).unwrap());
+        assert!(!game.join("BepInEx/plugins/TownOfUsMira.dll").exists());
+        assert!(!game.join("steam_appid.txt").exists());
+        assert_eq!(
+            fs::read(game.join("BepInEx/plugins/ExistingMod.dll")).unwrap(),
+            b"existing"
+        );
+        assert!(!game
+            .join("BepInEx")
+            .join(MANAGED_TOU_PACKAGE_MARKER)
+            .exists());
+    }
+
+    fn pe_proxy(machine: u16, identity: u8) -> Vec<u8> {
+        let mut bytes = vec![identity; 72];
+        bytes[0..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&(64_u32).to_le_bytes());
+        bytes[64..68].copy_from_slice(b"PE\0\0");
+        bytes[68..70].copy_from_slice(&machine.to_le_bytes());
+        bytes
+    }
+
+    fn make_doorstop_zip(config: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            for (path, body) in [
+                ("x86/winhttp.dll", pe_proxy(0x014c, b'3')),
+                ("x64/winhttp.dll", pe_proxy(0x8664, b'6')),
+                ("x86/doorstop_config.ini", config.to_vec()),
+                ("x64/doorstop_config.ini", config.to_vec()),
+                ("x86/.doorstop_version", b"4.5.1".to_vec()),
+                ("x64/.doorstop_version", b"4.5.1".to_vec()),
+            ] {
+                writer.start_file(path, options).unwrap();
+                writer.write_all(&body).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn configures_patch_without_replacing_bepinex_target() {
+        let configured = configured_doorstop_ini(
+            b"[General]\r\nenabled=true\r\ntarget_assembly=BepInEx\\core\\BepInEx.Unity.IL2CPP.dll\r\n\r\n[Environment]\r\nOTHER=value\r\n",
+        )
+        .unwrap();
+        let configured = String::from_utf8(configured).unwrap();
+
+        assert!(configured.contains("target_assembly=BepInEx\\core\\BepInEx.Unity.IL2CPP.dll\r\n"));
+        assert!(configured.contains("OTHER=value\r\n"));
+        assert!(configured.contains("GC_DISABLE_INCREMENTAL=1\r\n"));
+        assert_eq!(configured.matches("GC_DISABLE_INCREMENTAL").count(), 1);
+    }
+
+    #[test]
+    fn rejects_config_that_does_not_target_bepinex() {
+        let error = configured_doorstop_ini(
+            b"[General]\nenabled=true\ntarget_assembly=Another.Loader.dll\n",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn installs_matching_patch_proxy_for_each_game_architecture() {
+        let archive = make_doorstop_zip(
+            b"[General]\nenabled=true\ntarget_assembly=BepInEx\\core\\BepInEx.Unity.IL2CPP.dll\n\n[Environment]\n",
+        );
+        for (arch, machine, identity) in [("x86", 0x014c_u16, b'3'), ("x64", 0x8664, b'6')] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pack = tmp.path().join("pack");
+            let game = tmp.path().join("game");
+            make_pack(&pack);
+            fs::create_dir_all(&game).unwrap();
+            install_pack(&pack, &game, "be.999").unwrap();
+            fs::write(
+                game.join("doorstop_config.ini"),
+                b"[General]\nenabled=true\ntarget_assembly=BepInEx\\core\\BepInEx.Unity.IL2CPP.dll\n",
+            )
+            .unwrap();
+
+            install_windows_doorstop_patch(&archive, &game, "4.5.1", arch).unwrap();
+
+            let proxy = fs::read(game.join("winhttp.dll")).unwrap();
+            assert_eq!(u16::from_le_bytes([proxy[68], proxy[69]]), machine);
+            assert_eq!(proxy[2], identity);
+            assert!(has_doorstop_patch(&game, "4.5.1", arch));
+            assert!(fs::read_to_string(game.join("doorstop_config.ini"))
+                .unwrap()
+                .contains("GC_DISABLE_INCREMENTAL=1"));
+            assert!(!game.join(DOORSTOP_PATCH_TRANSACTION).exists());
+        }
+    }
+
+    #[test]
+    fn failed_patch_validation_preserves_loader_and_cleans_transaction() {
+        let archive = make_doorstop_zip(
+            b"[General]\nenabled=true\ntarget_assembly=BepInEx\\core\\BepInEx.Unity.IL2CPP.dll\n",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let pack = tmp.path().join("pack");
+        let game = tmp.path().join("game");
+        make_pack(&pack);
+        fs::create_dir_all(&game).unwrap();
+        install_pack(&pack, &game, "be.999").unwrap();
+        let proxy_before = fs::read(game.join("winhttp.dll")).unwrap();
+        let config_before = fs::read(game.join("doorstop_config.ini")).unwrap();
+
+        let error = install_windows_doorstop_patch(&archive, &game, "4.5.1", "x64").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(game.join("winhttp.dll")).unwrap(), proxy_before);
+        assert_eq!(
+            fs::read(game.join("doorstop_config.ini")).unwrap(),
+            config_before
+        );
+        assert!(!game.join(DOORSTOP_PATCH_TRANSACTION).exists());
+        assert!(!game.join("BepInEx").join(DOORSTOP_PATCH_MARKER).exists());
     }
 
     #[test]
@@ -2793,6 +3603,48 @@ mod tests {
         assert_eq!(
             fs::read(game_plugins.join("Reactor.dll")).unwrap(),
             b"same reactor"
+        );
+    }
+
+    #[test]
+    fn package_shadowed_dependencies_resume_after_package_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profiles = tmp.path().join("profiles");
+        let game = tmp.path().join("game");
+        let game_plugins = game.join("BepInEx/plugins");
+        let profile_plugins = profiles.join("p1/BepInEx/plugins");
+        fs::create_dir_all(&game_plugins).unwrap();
+        fs::create_dir_all(&profile_plugins).unwrap();
+        fs::write(game_plugins.join("MiraAPI.dll"), b"town of us mira").unwrap();
+        fs::write(profile_plugins.join("MiraAPI.dll"), b"standalone mira").unwrap();
+        fs::write(profile_plugins.join("Other.dll"), b"other").unwrap();
+        fs::write(
+            game_plugins.join(MANAGED_PLUGINS_MARKER),
+            serde_json::to_vec(&ManagedPlugins {
+                names: vec!["MiraAPI.dll".into()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        sync_profile_plugins_shadowing(&profiles, "p1", &game, &["MiraAPI.dll".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            fs::read(game_plugins.join("MiraAPI.dll")).unwrap(),
+            b"town of us mira"
+        );
+        assert_eq!(fs::read(game_plugins.join("Other.dll")).unwrap(), b"other");
+        assert_eq!(
+            read_managed_plugins(&game_plugins.join(MANAGED_PLUGINS_MARKER)).unwrap(),
+            HashSet::from(["other.dll".to_string()])
+        );
+
+        fs::remove_file(game_plugins.join("MiraAPI.dll")).unwrap();
+        sync_profile_plugins(&profiles, "p1", &game).unwrap();
+        assert_eq!(
+            fs::read(game_plugins.join("MiraAPI.dll")).unwrap(),
+            b"standalone mira"
         );
     }
 

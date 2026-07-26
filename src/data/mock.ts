@@ -134,16 +134,43 @@ export const PROFILES: Profile[] = [
 
 export const GAME: GameStatus = { store: "steam", arch: "x86", running: false };
 
-export const CATALOG: CatalogItem[] = bundledCatalog.mods.map((item) => ({
-  id: item.id,
-  name: item.name,
-  repo: item.repo,
-  summary: item.summary,
-  tags: item.tags as CatalogItem["tags"],
-  latest: "latest",
-  dependencies: item.dependencies,
-  trust: item.trust as CatalogItem["trust"],
-}));
+const PRIORITY_CATALOG_IDS = [
+  "TheOtherRolesAU/TheOtherRoles",
+  "AU-Avengers/TOU-Mira",
+  "EnhancedNetwork/TownofHost-Enhanced",
+  "Mehzxzz/TownOfExtra",
+  "DigiWorm0/LevelImposter",
+];
+const BUNDLED_DEPENDENCY_IDS = [
+  "All-Of-Us-Mods/MiraAPI",
+  "NuclearPowered/Reactor",
+  "miniduikboot/Mini.RegionInstall",
+];
+
+function catalogRank(item: CatalogItem): number {
+  const priority = PRIORITY_CATALOG_IDS.indexOf(item.id);
+  if (priority >= 0) return priority;
+  return item.tags.includes("library") || BUNDLED_DEPENDENCY_IDS.includes(item.id)
+    ? Number.MAX_SAFE_INTEGER
+    : PRIORITY_CATALOG_IDS.length;
+}
+
+export const CATALOG: CatalogItem[] = bundledCatalog.mods
+  .map((item) => ({
+    id: item.id,
+    name: item.name,
+    repo: item.repo,
+    summary: item.summary,
+    tags: item.tags as CatalogItem["tags"],
+    latest: "latest",
+    dependencies: item.dependencies,
+    included:
+      item.id === "AU-Avengers/TOU-Mira"
+        ? ["MiraAPI", "Reactor", "Mini.RegionInstall with the Town of Us server config", "Town of Us cosmetics"]
+        : undefined,
+    trust: item.trust as CatalogItem["trust"],
+  }))
+  .sort((left, right) => catalogRank(left) - catalogRank(right));
 
 // A valid checksum-bearing lobby code used when a static fixture is needed.
 export const SAMPLE_CODE =

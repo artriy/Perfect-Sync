@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.1.3 (experimental)
+
+- Install Town of Us - Mira as one target-specific release package, including its
+  matching BepInEx, dependencies, configs, cosmetics, and fixed UnityDoorstop.
+- Keep pre-existing MiraAPI, Reactor, and Mini.RegionInstall profile copies dormant
+  while Town of Us is active, then restore them automatically if Town of Us is
+  disabled or removed.
+- Offer the separate UnityDoorstop 4.5.1 compatibility fix only for BepInEx-only
+  setup and repair flows, with the option disabled by default.
+- Let full Town of Us release downloads run beyond the metadata request deadline
+  while retaining bounded connection and inactivity timeouts.
+- Allow slow release downloads up to ten minutes of inactivity and sixty seconds
+  to connect before reporting a network timeout.
+- Reuse an already-installed, complete Town of Us package when adding one of its
+  extensions instead of resolving and downloading the same release again.
+- Put The Other Roles, Town of Us - Mira, Town of Host - Enhanced, Town Of Extra,
+  and LevelImposter first in the default catalog order, with dependency packages
+  at the bottom.
+- Remove the Health & maintenance control and panel from the app.
+- Show the same live, stage-aware download progress during first-time BepInEx
+  and Town of Us setup that later mod installs use.
+- Keep setup's local settings and profile state synchronized after a partial
+  install failure, and make **Skip setup** dismiss without resubmitting stale
+  game-instance data.
+- Accept pinned BepInEx build identifiers containing SemVer `+` metadata in the
+  validated loader cache path.
+
 ## v0.1.2 (experimental)
 
 This release includes the complete v0.1.1 and v0.1.0 change sets documented

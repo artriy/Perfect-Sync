@@ -82,6 +82,7 @@ pub fn run() {
             commands::encode_lobby_code,
             commands::list_releases,
             commands::list_install_options,
+            commands::list_tou_setup_options,
             commands::install_assets,
             commands::install_local_mod,
             commands::search_levelimposter_maps,

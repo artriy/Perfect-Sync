@@ -7,6 +7,12 @@ import type { GameInstance, GameStatus, Profile, Trust } from "../lib/types";
 import { useModalFocus } from "../lib/useModalFocus";
 import { displayPath } from "../lib/displayPath";
 
+const TOWN_OF_US_BUNDLED_IDS: Record<string, true> = {
+  "all-of-us-mods/miraapi": true,
+  "nuclearpowered/reactor": true,
+  "miniduikboot/mini.regioninstall": true,
+};
+
 interface MainPanelProps {
   profile: Profile;
   game: GameStatus;
@@ -31,7 +37,21 @@ interface MainPanelProps {
 export function MainPanel(props: MainPanelProps) {
   const { profile, game, busy } = props;
   const reduce = useReducedMotion();
-  const userMods = profile.mods.filter((m) => !m.managed);
+  const hasTownOfUs = profile.mods.some(
+    (mod) =>
+      mod.enabled &&
+      (mod.packageId.toLowerCase() === "au-avengers/tou-mira" ||
+        mod.repo?.toLowerCase() === "au-avengers/tou-mira"),
+  );
+  const userMods = profile.mods.filter(
+    (mod) =>
+      !mod.managed &&
+      !(
+        hasTownOfUs &&
+        (TOWN_OF_US_BUNDLED_IDS[mod.packageId.toLowerCase()] === true ||
+          (mod.repo ? TOWN_OF_US_BUNDLED_IDS[mod.repo.toLowerCase()] === true : false))
+      ),
+  );
   const updates = userMods.filter((m) => m.update).length;
   const selectedGame =
     props.gameInstances.find((instance) => instance.id === profile.gameInstanceId) ??
@@ -76,6 +96,13 @@ export function MainPanel(props: MainPanelProps) {
   }, []);
 
   useModalFocus(deleteOpen, deleteDialogRef, closeDelete);
+
+  const beginRename = () => {
+    if (busy) return;
+    setMenuOpen(false);
+    setDraft(profile.name.slice(0, 80));
+    setRenaming(true);
+  };
 
   const commitRename = () => {
     const name = draft.trim().slice(0, 80);
@@ -160,9 +187,21 @@ export function MainPanel(props: MainPanelProps) {
               className="glass w-full max-w-[36rem] rounded-lg px-2 py-1 text-[24px] font-semibold text-ink focus:outline-none disabled:opacity-60"
             />
           ) : (
-            <h1 className="truncate text-[26px] leading-tight font-semibold text-ink" title={profile.name}>
-              {profile.name}
-            </h1>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={beginRename}
+              aria-label={`Rename profile ${profile.name}`}
+              title="Click to rename profile"
+              className="ring-focus group flex max-w-full items-center gap-2 rounded-lg text-left text-[26px] leading-tight font-semibold text-ink hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <span className="truncate">{profile.name}</span>
+              <PencilSimple
+                size={17}
+                aria-hidden="true"
+                className="shrink-0 text-ink-faint opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+              />
+            </button>
           )}
           <div className="mt-1 flex items-center gap-2 text-[13px] text-ink-dim">
             <span>
@@ -216,11 +255,7 @@ export function MainPanel(props: MainPanelProps) {
                 <button
                   type="button"
                   disabled={busy}
-                  onClick={() => {
-                    setMenuOpen(false);
-                    setDraft(profile.name.slice(0, 80));
-                    setRenaming(true);
-                  }}
+                  onClick={beginRename}
                   className="ring-focus flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink-dim hover:bg-white/10 hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <PencilSimple size={15} /> Rename profile
@@ -252,7 +287,7 @@ export function MainPanel(props: MainPanelProps) {
         {userMods.length === 0 ? (
           <EmptyState onAddMod={props.onAddMod} busy={busy} />
         ) : (
-          profile.mods.map((mod) => (
+          userMods.map((mod) => (
             <ModRow
               key={mod.packageId}
               mod={mod}

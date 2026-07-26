@@ -61,6 +61,8 @@ export interface CatalogItem {
   latest: string;
   /** catalog package ids installed automatically unless excluded during review */
   dependencies?: string[];
+  /** package components supplied by the selected release bundle, not separate downloads */
+  included?: string[];
   /** vetting tier: trusted (curated) | community (listed) | flagged (unknown) */
   trust?: Trust;
 }

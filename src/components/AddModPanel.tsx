@@ -227,6 +227,11 @@ export function AddModPanel({
                       {item.latest && <span className="max-w-24 shrink-0 truncate font-mono text-[12px] text-ink-faint" title={item.latest} aria-label={`Latest version ${item.latest}`}>{item.latest}</span>}
                     </div>
                     <p className="mt-1.5 line-clamp-3 text-[12.5px] leading-snug break-words text-ink-dim" title={item.summary || item.repo}>{item.summary || item.repo}</p>
+                    {!!item.included?.length && (
+                      <p className="mt-2 text-[11.5px] leading-snug text-[#cbbcff]">
+                        Complete ZIP includes {item.included.join(", ")}. These components install and update together.
+                      </p>
+                    )}
                     <div className="mt-3 flex min-w-0 items-center justify-between gap-2">
                       <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink-faint" title={item.repo} aria-label={`Repository ${item.repo}`}>{item.repo}</span>
                       {manage ? (

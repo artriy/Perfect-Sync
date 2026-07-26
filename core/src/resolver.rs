@@ -232,15 +232,17 @@ pub trait Http {
 /// Real HTTPS client (blocking) used at runtime.
 pub struct UreqHttp {
     agent: ureq::Agent,
+    download_agent: ureq::Agent,
     authorization: Option<String>,
 }
 
 const MAX_DOWNLOAD: u64 = 300 * 1024 * 1024;
 const MAX_TEXT_RESPONSE: u64 = 8 * 1024 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
-
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const METADATA_OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWNLOAD_IO_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 fn parsed_https_url(value: &str) -> Result<url::Url, ResolveError> {
     let parsed =
         url::Url::parse(value).map_err(|_| ResolveError::InsecureUrl(value.to_string()))?;
@@ -267,33 +269,50 @@ fn is_github_host(url: &str) -> bool {
             .ends_with(".githubusercontent.com")
 }
 
+fn build_agent(io_timeout: Duration, overall_timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .https_only(true)
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(io_timeout)
+        .timeout_write(io_timeout)
+        .timeout(overall_timeout)
+        .build()
+}
+fn build_download_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(DOWNLOAD_CONNECT_TIMEOUT)
+        .timeout_read(DOWNLOAD_IO_TIMEOUT)
+        .timeout_write(DOWNLOAD_IO_TIMEOUT)
+        .build()
+}
+
 impl UreqHttp {
     pub fn new(token: Option<String>) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .https_only(true)
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(IO_TIMEOUT)
-            .timeout_write(IO_TIMEOUT)
-            .timeout(OVERALL_TIMEOUT)
-            .build();
         Self {
-            agent,
+            agent: build_agent(METADATA_IO_TIMEOUT, METADATA_OVERALL_TIMEOUT),
+            download_agent: build_download_agent(),
             authorization: token.map(|token| format!("Bearer {token}")),
         }
     }
 
-    fn request(&self, method: &str, url: &str) -> Result<ureq::Request, ResolveError> {
+    fn request_with_agent(
+        &self,
+        agent: &ureq::Agent,
+        method: &str,
+        url: &str,
+    ) -> Result<ureq::Request, ResolveError> {
         parsed_https_url(url)?;
-        let mut request = self
-            .agent
-            .request(method, url)
-            .set("User-Agent", "perfect-sync");
+        let mut request = agent.request(method, url).set("User-Agent", "perfect-sync");
         if is_github_host(url) {
             if let Some(authorization) = &self.authorization {
                 request = request.set("Authorization", authorization);
             }
         }
         Ok(request)
+    }
+
+    fn request(&self, method: &str, url: &str) -> Result<ureq::Request, ResolveError> {
+        self.request_with_agent(&self.agent, method, url)
     }
 
     #[cfg(test)]
@@ -312,6 +331,15 @@ impl UreqHttp {
 
     fn call(&self, url: &str) -> Result<ureq::Response, ResolveError> {
         self.call_method("GET", url)
+    }
+
+    fn call_download(&self, url: &str) -> Result<ureq::Response, ResolveError> {
+        self.request_with_agent(&self.download_agent, "GET", url)?
+            .call()
+            .map_err(|error| match error {
+                ureq::Error::Status(status, _) => ResolveError::HttpStatus(status),
+                ureq::Error::Transport(error) => ResolveError::Http(error.to_string()),
+            })
     }
 }
 
@@ -358,7 +386,7 @@ impl Http for UreqHttp {
         url: &str,
         on_progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<Vec<u8>, ResolveError> {
-        let response = self.call(url)?;
+        let response = self.call_download(url)?;
         let total = response
             .header("Content-Length")
             .and_then(|value| value.parse::<u64>().ok());

@@ -29,11 +29,18 @@
     {
       "id": "AU-Avengers/TOU-Mira",
       "name": "Town of Us - Mira",
-      "summary": "The Mira-API rebuild of Town of Us. Dozens of custom roles.",
+      "summary": "The complete release-matched Town of Us package. Includes MiraAPI, Reactor, Mini.RegionInstall, custom configs, and cosmetics.",
       "repo": "AU-Avengers/TOU-Mira",
       "tags": ["role", "all-client"],
-      "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor", "miniduikboot/Mini.RegionInstall"],
-      "assetRules": { "perArch": {}, "dllName": "TownOfUsMira.dll" },
+      "dependencies": [],
+      "assetRules": {
+        "perArch": {
+          "x86": { "match": "(?i)TouMira.*x86-steam-itch\\.zip$", "prefer": "zip" },
+          "x64": { "match": "(?i)TouMira.*x64-epic-msstore\\.zip$", "prefer": "zip" }
+        },
+        "dllName": "TownOfUsMira.dll",
+        "bundlesLoader": true
+      },
       "trust": "trusted"
     },
     {

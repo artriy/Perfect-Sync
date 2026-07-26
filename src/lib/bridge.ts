@@ -21,7 +21,15 @@ import type {
   Settings,
   Trust,
 } from "./types";
+
 import { CATALOG, PROFILES } from "../data/mock";
+
+const TOWN_OF_US_ID = "au-avengers/tou-mira";
+const TOWN_OF_US_BUNDLED_IDS: Record<string, true> = {
+  "all-of-us-mods/miraapi": true,
+  "nuclearpowered/reactor": true,
+  "miniduikboot/mini.regioninstall": true,
+};
 
 /** True when running inside the Tauri shell (vs a plain browser via `pnpm dev`). */
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -203,11 +211,40 @@ export async function listReleases(repo: string): Promise<GhRelease[]> {
 /** List installable release assets, with the catalog default first. */
 export async function listInstallOptions(repo: string, profileId: string): Promise<ModInstallOption[]> {
   if (inTauri) return invoke<ModInstallOption[]>("list_install_options", { repo, profileId });
+  if (repo.toLowerCase() === TOWN_OF_US_ID) {
+    const profile = browserProfiles.find((candidate) => candidate.id === profileId);
+    const instance =
+      browserSettings.gameInstances.find((candidate) => candidate.id === profile?.gameInstanceId) ??
+      browserSettings.gameInstances[0];
+    return listTouSetupOptions(
+      instance?.arch ?? "x86",
+      instance?.store ?? "manual",
+      instance?.runtime ?? "native",
+    );
+  }
   return (await listReleases(repo)).flatMap((release) =>
-    release.assets
-      .filter((asset) => /\.(?:dll|zip)$/i.test(asset.name))
-      .map((asset) => ({ tag: release.tag_name, assetName: asset.name, size: asset.size })),
+    release.assets.map((asset) => ({ tag: release.tag_name, assetName: asset.name, size: asset.size })),
   );
+}
+export async function listTouSetupOptions(
+  arch: Arch,
+  store: Store,
+  runtime: Runtime,
+): Promise<ModInstallOption[]> {
+  if (inTauri) {
+    return invoke<ModInstallOption[]>("list_tou_setup_options", { arch, store, runtime });
+  }
+  const assetName =
+    arch === "x64"
+      ? "TouMirav1.6.3b2-x64-epic-msstore.zip"
+      : runtime !== "native"
+        ? "TouMirav1.6.3b2-x86-macOS-linux.zip"
+        : "TouMirav1.6.3b2-x86-steam-itch.zip";
+  return fixtureVersions("AU-Avengers/TOU-Mira").map((tag) => ({
+    tag,
+    assetName,
+    size: 52 * 1024 * 1024,
+  }));
 }
 
 function replaceBrowserProfile(profile: Profile): Profile {
@@ -681,7 +718,7 @@ export async function collectDiagnostics(profileId?: string): Promise<Diagnostic
   ) ?? browserSettings.gameInstances[0];
   return {
     generatedAt: Date.now(),
-    appVersion: "0.1.2",
+    appVersion: "0.1.3",
     profileName: profile?.name,
     game: instance
       ? {
@@ -1046,11 +1083,28 @@ export async function encodeLobbyCode(profile: Profile): Promise<string> {
     mod.enabled && (mod.packageId.toLowerCase() === "digiworm0/levelimposter"
       || mod.repo?.toLowerCase() === "digiworm0/levelimposter"),
   );
+  const townOfUsEnabled = profile.mods.some(
+    (mod) =>
+      mod.enabled &&
+      (mod.packageId.toLowerCase() === TOWN_OF_US_ID ||
+        mod.repo?.toLowerCase() === TOWN_OF_US_ID),
+  );
   const manifest: BrowserManifest = {
     v: 1,
     name: profile.name,
     mods: profile.mods
-      .filter((mod) => mod.enabled && mod.source !== "file")
+      .filter(
+        (mod) =>
+          mod.enabled &&
+          mod.source !== "file" &&
+          !(
+            townOfUsEnabled &&
+            (TOWN_OF_US_BUNDLED_IDS[mod.packageId.toLowerCase()] === true ||
+              (mod.repo
+                ? TOWN_OF_US_BUNDLED_IDS[mod.repo.toLowerCase()] === true
+                : false))
+          ),
+      )
       .map((mod) => ({ id: mod.repo ?? mod.packageId, v: mod.version, ...(mod.asset ? { a: mod.asset } : {}) })),
     ...(levelImposterEnabled && profile.levelImposterMaps?.length ? { maps: profile.levelImposterMaps } : {}),
   };
@@ -1199,6 +1253,7 @@ export interface LoaderStatus {
   preloader: boolean;
   current: boolean;
   installedVersion?: string | null;
+  doorstopFix: boolean;
   dotnet: boolean;
   steamAppid: boolean;
   profilePlugins: number;
@@ -1216,6 +1271,7 @@ export async function loaderStatus(gamePath: string, profileId: string): Promise
     preloader: true,
     current: true,
     installedVersion: "6.0.0-be.735",
+    doorstopFix: true,
     dotnet: true,
     steamAppid: true,
     profilePlugins: browserProfiles.find((profile) => profile.id === profileId)?.mods.length ?? 0,
@@ -1225,9 +1281,24 @@ export async function loaderStatus(gamePath: string, profileId: string): Promise
   };
 }
 
-export async function ensureLoader(gamePath: string, profileId: string, arch: string): Promise<string | null> {
-  if (inTauri) return invoke<string | null>("ensure_loader", { gamePath, profileId, arch });
+export async function ensureLoader(
+  gamePath: string,
+  profileId: string,
+  arch: string,
+  applyDoorstopFix = false,
+  onProgress?: ProgressHandler,
+): Promise<string | null> {
+  if (inTauri) {
+    return invoke<string | null>("ensure_loader", {
+      gamePath,
+      profileId,
+      arch,
+      applyDoorstopFix,
+      onProgress: progressChannel(onProgress),
+    });
+  }
   if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  await simulateBrowserTransfers(["BepInEx loader"], onProgress);
   return null;
 }
 
@@ -1236,8 +1307,16 @@ export async function reinstallLoader(
   gamePath: string,
   profileId: string,
   arch: string,
+  applyDoorstopFix = false,
+  useLatestLoader = false,
 ): Promise<string | null> {
-  if (inTauri) return invoke<string | null>("reinstall_loader", { gamePath, profileId, arch });
+  if (inTauri) return invoke<string | null>("reinstall_loader", {
+    gamePath,
+    profileId,
+    arch,
+    applyDoorstopFix,
+    useLatestLoader,
+  });
   if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
   return null;
 }
