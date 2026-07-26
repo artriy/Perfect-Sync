@@ -20,6 +20,7 @@ import type {
   Store,
   Settings,
   Trust,
+  UnmanagedPlugin,
 } from "./types";
 
 import { CATALOG, PROFILES } from "../data/mock";
@@ -1246,7 +1247,61 @@ export async function applyLobbyCode(
   return replaceBrowserProfile(profile);
 }
 
+// -------------------------------------------------------- plugin ownership
+export async function listUnmanagedPlugins(
+  gamePath: string,
+  profileId: string,
+): Promise<UnmanagedPlugin[]> {
+  if (inTauri) {
+    return invoke<UnmanagedPlugin[]>("list_unmanaged_plugins", { gamePath, profileId });
+  }
+  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  return [];
+}
+
+export async function quarantineUnmanagedPlugins(
+  gamePath: string,
+  profileId: string,
+  paths: string[],
+): Promise<UnmanagedPlugin[]> {
+  if (inTauri) {
+    return invoke<UnmanagedPlugin[]>("quarantine_unmanaged_plugins", { gamePath, profileId, paths });
+  }
+  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  if (paths.length === 0) throw new Error("Select at least one plugin.");
+  return [];
+}
+
+export async function deleteUnmanagedPlugins(
+  gamePath: string,
+  profileId: string,
+  paths: string[],
+): Promise<UnmanagedPlugin[]> {
+  if (inTauri) {
+    return invoke<UnmanagedPlugin[]>("delete_unmanaged_plugins", { gamePath, profileId, paths });
+  }
+  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  if (paths.length === 0) throw new Error("Select at least one plugin.");
+  return [];
+}
+
+export async function importUnmanagedPlugins(
+  gamePath: string,
+  profileId: string,
+  paths: string[],
+): Promise<Profile> {
+  if (inTauri) {
+    return invoke<Profile>("import_unmanaged_plugins", { gamePath, profileId, paths });
+  }
+  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  if (paths.length === 0) throw new Error("Select at least one plugin.");
+  const profile = browserProfiles.find((candidate) => candidate.id === profileId);
+  if (!profile) throw new Error("Profile not found.");
+  return structuredClone(profile);
+}
+
 // ------------------------------------------------------------ loader + launch
+
 export interface LoaderStatus {
   gameFound: boolean;
   winhttp: boolean;

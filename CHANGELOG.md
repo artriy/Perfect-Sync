@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.4 (experimental)
+
+- Make the selected profile authoritative by detecting every unmanaged DLL that BepInEx
+  would load and blocking setup or launch until each extra is resolved.
+- Let users select unmanaged plugins individually, keep safe root-level DLLs in the
+  profile, quarantine selected files with checksummed recovery manifests, or permanently
+  delete selected files after an explicit confirmation.
+- Recover a registered game instance after its folder is renamed by matching the stable
+  Among Us executable identity instead of leaving profiles bound to the deleted path.
+- Keep the download bar, byte counts, percentage label, and accessibility values in
+  exact agreement, and show 100% only after every reported byte has arrived.
+
 ## v0.1.3 (experimental)
 
 - Install Town of Us - Mira as one target-specific release package, including its

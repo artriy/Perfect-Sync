@@ -51,9 +51,13 @@ export function OperationProgressModal({ activity }: OperationProgressModalProps
   }, [activity?.id]);
 
   const phaseIndex = activity ? PHASES.indexOf(activity.phase) : 0;
-  const hasByteTotal = !!activity?.bytesTotal && activity.bytesTotal > 0;
-  const percentage = hasByteTotal && activity
-    ? Math.min(100, Math.round(((activity.bytesReceived ?? 0) / activity.bytesTotal!) * 100))
+  const bytesReceived = activity?.bytesReceived ?? 0;
+  const bytesTotal = activity?.bytesTotal ?? 0;
+  const hasByteTotal = bytesTotal > 0;
+  const percentage = hasByteTotal
+    ? bytesReceived >= bytesTotal
+      ? 100
+      : Math.max(0, Math.floor((bytesReceived / bytesTotal) * 100))
     : null;
 
   return (
@@ -136,12 +140,10 @@ export function OperationProgressModal({ activity }: OperationProgressModalProps
                     transition={reduce ? { duration: 0.01 } : { duration: 1.35, repeat: Infinity, ease: [0.65, 0, 0.35, 1] }}
                   />
                 ) : (
-                  <motion.div
+                  <div
                     aria-hidden="true"
                     className="accent-grad h-full rounded-full shadow-[0_3px_16px_rgba(91,192,255,0.38)]"
-                    initial={false}
-                    animate={{ width: `${percentage}%` }}
-                    transition={{ duration: reduce ? 0.01 : 0.18, ease: "linear" }}
+                    style={{ width: `${percentage}%` }}
                   />
                 )}
               </div>

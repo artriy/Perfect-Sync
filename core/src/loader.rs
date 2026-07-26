@@ -15,7 +15,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Game-dir files from the pack root (the rest of the pack is dirs).
 pub const BOOTSTRAP_FILES: &[&str] = &["winhttp.dll", "doorstop_config.ini", ".doorstop_version"];
@@ -40,6 +44,9 @@ const PLUGIN_SYNC_JOURNAL: &str = "journal.json";
 const PLUGIN_SYNC_JOURNAL_PENDING: &str = "journal.pending";
 const PLUGIN_SYNC_COMMITTED: &str = "committed";
 const PLUGIN_SYNC_COMMITTED_PENDING: &str = "committed.pending";
+pub const UNMANAGED_QUARANTINE_DIR: &str = ".perfectsync-quarantine";
+const QUARANTINE_MANIFEST_PENDING: &str = "manifest.pending.json";
+const QUARANTINE_MANIFEST: &str = "manifest.json";
 const MAX_PLUGIN_SYNC_JOURNAL_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ZIP_ENTRIES: usize = 8_192;
 const MAX_ZIP_PATH_BYTES: usize = 1_024;
@@ -54,6 +61,7 @@ const MANAGED_LEVELIMPOSTER_MAPS_MARKER: &str = ".perfectsync-maps.json";
 const MAX_MANAGED_LEVELIMPOSTER_MAPS: usize = 4_096;
 const MAX_MANAGED_LEVELIMPOSTER_MAP_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANAGED_LEVELIMPOSTER_MAP_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+static QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PACK_CACHE_LOCK: Mutex<()> = Mutex::new(());
 static LOADER_LOCK: Mutex<()> = Mutex::new(());
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
@@ -1756,6 +1764,30 @@ struct ManagedPlugins {
     names: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnmanagedPlugin {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub importable: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QuarantinedPlugin {
+    original_path: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginQuarantineManifest {
+    created_at: u128,
+    files: Vec<QuarantinedPlugin>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PluginSyncJournal {
@@ -2144,6 +2176,426 @@ fn read_managed_plugins(marker: &Path) -> io::Result<HashSet<String>> {
     }
     Ok(names)
 }
+fn plugin_path_key(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn managed_tou_plugin_paths(game_dir: &Path) -> io::Result<HashSet<String>> {
+    let Some(managed) = read_managed_tou_package(game_dir)? else {
+        return Ok(HashSet::new());
+    };
+    let mut paths = HashSet::new();
+    for file in managed.files {
+        let normalized = plugin_path_key(&file);
+        if let Some(relative) = normalized.strip_prefix("bepinex/plugins/") {
+            paths.insert(relative.to_string());
+        }
+    }
+    Ok(paths)
+}
+
+fn selected_profile_plugins(source: &Path) -> io::Result<HashMap<String, PathBuf>> {
+    let mut selected = HashMap::new();
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "profile plugins contain a symlink",
+            ));
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name().into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-Unicode profile plugin filename",
+            )
+        })?;
+        if !name.to_ascii_lowercase().ends_with(".dll") {
+            continue;
+        }
+        crate::profile::validate_dll_name(&name)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        if selected
+            .insert(name.to_ascii_lowercase(), entry.path())
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "profile has case-colliding DLLs",
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+fn collect_plugin_dlls(
+    root: &Path,
+    directory: &Path,
+    output: &mut Vec<UnmanagedPlugin>,
+) -> io::Result<()> {
+    crate::profile::reject_reparse(directory)?;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "game plugins contain a link or reparse point: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if metadata.is_dir() {
+            collect_plugin_dlls(root, &path, output)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("game plugins contain a special file: {}", path.display()),
+            ));
+        }
+        if !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+        {
+            continue;
+        }
+        if metadata.len() == 0 || metadata.len() > MAX_MANAGED_PLUGIN_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("plugin DLL has an invalid size: {}", path.display()),
+            ));
+        }
+        if output.len() >= MAX_MANAGED_PLUGINS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "game folder has too many plugin DLLs",
+            ));
+        }
+        let relative = path.strip_prefix(root).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "plugin path escaped its root")
+        })?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "game plugin has an unsafe relative path",
+            ));
+        }
+        let portable = relative
+            .to_str()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "non-Unicode game plugin path")
+            })?
+            .replace('\\', "/");
+        if portable.len() > MAX_ZIP_PATH_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "game plugin path is too long",
+            ));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "non-Unicode game plugin filename",
+                )
+            })?
+            .to_string();
+        let importable =
+            relative.components().count() == 1 && crate::profile::validate_dll_name(&name).is_ok();
+        output.push(UnmanagedPlugin {
+            path: portable,
+            name,
+            size: metadata.len(),
+            importable,
+        });
+    }
+    Ok(())
+}
+
+fn unmanaged_plugins_unlocked(
+    profiles_root: &Path,
+    profile_id: &str,
+    game_dir: &Path,
+) -> io::Result<Vec<UnmanagedPlugin>> {
+    let source = checked_profile_bepinex_dir(profiles_root, profile_id)?.join("plugins");
+    crate::profile::reject_reparse(&source)?;
+    if !fs::metadata(&source).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "profile plugins directory not found",
+        ));
+    }
+    let destination = game_dir.join("BepInEx").join("plugins");
+    crate::profile::reject_reparse(game_dir)?;
+    crate::profile::reject_reparse(&game_dir.join("BepInEx"))?;
+    crate::profile::reject_reparse(&destination)?;
+    if !destination.is_dir() {
+        return Ok(Vec::new());
+    }
+    recover_interrupted_plugin_sync(&destination)?;
+    let previously_owned = read_managed_plugins(&destination.join(MANAGED_PLUGINS_MARKER))?;
+    let package_owned = managed_tou_plugin_paths(game_dir)?;
+    let selected = selected_profile_plugins(&source)?;
+    let mut candidates = Vec::new();
+    collect_plugin_dlls(&destination, &destination, &mut candidates)?;
+
+    let mut unmanaged = Vec::new();
+    for plugin in candidates {
+        let key = plugin_path_key(&plugin.path);
+        let root_name = (!plugin.path.contains('/')).then(|| plugin.name.to_ascii_lowercase());
+        if root_name
+            .as_ref()
+            .is_some_and(|name| previously_owned.contains(name))
+            || package_owned.contains(&key)
+        {
+            continue;
+        }
+        if let Some(source) = root_name.as_ref().and_then(|name| selected.get(name)) {
+            let destination_file = destination.join(&plugin.path);
+            if regular_file_digest(&destination_file)? == regular_file_digest(source)? {
+                continue;
+            }
+        }
+        unmanaged.push(plugin);
+    }
+    unmanaged.sort_by(|left, right| {
+        left.path
+            .to_ascii_lowercase()
+            .cmp(&right.path.to_ascii_lowercase())
+    });
+    Ok(unmanaged)
+}
+
+/// List every loadable DLL that is not owned by Perfect-Sync or identical to
+/// the selected profile's copy.
+pub fn unmanaged_plugins(
+    profiles_root: &Path,
+    profile_id: &str,
+    game_dir: &Path,
+) -> io::Result<Vec<UnmanagedPlugin>> {
+    let _guard = SYNC_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("plugin sync lock is poisoned"))?;
+    unmanaged_plugins_unlocked(profiles_root, profile_id, game_dir)
+}
+
+fn resolve_unmanaged_selection(
+    plugins: Vec<UnmanagedPlugin>,
+    selected_paths: &[String],
+) -> io::Result<Vec<UnmanagedPlugin>> {
+    if selected_paths.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "select at least one unmanaged plugin",
+        ));
+    }
+    if selected_paths.len() > MAX_MANAGED_PLUGINS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many unmanaged plugins selected",
+        ));
+    }
+    let mut requested = HashSet::with_capacity(selected_paths.len());
+    for path in selected_paths {
+        if path.is_empty() || path.len() > MAX_ZIP_PATH_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid unmanaged plugin selection",
+            ));
+        }
+        if !requested.insert(plugin_path_key(path)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unmanaged plugin selection contains duplicates",
+            ));
+        }
+    }
+    let selected = plugins
+        .into_iter()
+        .filter(|plugin| requested.remove(&plugin_path_key(&plugin.path)))
+        .collect::<Vec<_>>();
+    if !requested.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unmanaged plugin selection is stale; review the folder again",
+        ));
+    }
+    Ok(selected)
+}
+
+/// Re-read the game folder and return exactly the selected unmanaged DLLs.
+pub fn selected_unmanaged_plugins(
+    profiles_root: &Path,
+    profile_id: &str,
+    game_dir: &Path,
+    selected_paths: &[String],
+) -> io::Result<Vec<UnmanagedPlugin>> {
+    let _guard = SYNC_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("plugin sync lock is poisoned"))?;
+    resolve_unmanaged_selection(
+        unmanaged_plugins_unlocked(profiles_root, profile_id, game_dir)?,
+        selected_paths,
+    )
+}
+
+fn digest_hex(digest: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+/// Move unmanaged DLLs outside BepInEx's plugin scan without deleting them.
+/// The caller supplies the broader game transaction used for rollback.
+pub fn quarantine_unmanaged_plugins(
+    profiles_root: &Path,
+    profile_id: &str,
+    game_dir: &Path,
+    selected_paths: &[String],
+) -> io::Result<Vec<UnmanagedPlugin>> {
+    let _guard = SYNC_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("plugin sync lock is poisoned"))?;
+    let plugins = resolve_unmanaged_selection(
+        unmanaged_plugins_unlocked(profiles_root, profile_id, game_dir)?,
+        selected_paths,
+    )?;
+
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| io::Error::other("system clock is before the Unix epoch"))?
+        .as_millis();
+    let batch_name = format!(
+        "{created_at}-{}-{}",
+        std::process::id(),
+        QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let destination_root = game_dir
+        .join("BepInEx")
+        .join(UNMANAGED_QUARANTINE_DIR)
+        .join(batch_name);
+    fs::create_dir_all(destination_root.join("plugins"))?;
+    crate::profile::reject_reparse(&destination_root)?;
+
+    let source_root = game_dir.join("BepInEx").join("plugins");
+    let mut manifest_files = Vec::with_capacity(plugins.len());
+    for plugin in &plugins {
+        let source = source_root.join(&plugin.path);
+        let metadata = fs::symlink_metadata(&source)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != plugin.size
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("plugin changed before quarantine: {}", plugin.path),
+            ));
+        }
+        let digest = regular_file_digest(&source)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "plugin disappeared"))?;
+        manifest_files.push(QuarantinedPlugin {
+            original_path: plugin.path.clone(),
+            size: plugin.size,
+            sha256: digest_hex(digest),
+        });
+    }
+    let manifest = PluginQuarantineManifest {
+        created_at,
+        files: manifest_files,
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if manifest_bytes.len() as u64 > MAX_MANAGED_MARKER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "plugin quarantine manifest is too large",
+        ));
+    }
+    let pending = destination_root.join(QUARANTINE_MANIFEST_PENDING);
+    let mut manifest_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&pending)?;
+    manifest_file.write_all(&manifest_bytes)?;
+    manifest_file.sync_all()?;
+    drop(manifest_file);
+
+    let mut moved = Vec::with_capacity(plugins.len());
+    let result = (|| {
+        for plugin in &plugins {
+            let source = source_root.join(&plugin.path);
+            let destination = destination_root.join("plugins").join(&plugin.path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+                crate::profile::reject_reparse(parent)?;
+            }
+            crate::profile::reject_reparse(&destination)?;
+            fs::rename(&source, &destination)?;
+            moved.push((source, destination));
+        }
+        fs::rename(&pending, destination_root.join(QUARANTINE_MANIFEST))
+    })();
+    if let Err(error) = result {
+        for (source, destination) in moved.into_iter().rev() {
+            if let Some(parent) = source.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::rename(destination, source);
+        }
+        let _ = fs::remove_dir_all(&destination_root);
+        return Err(error);
+    }
+    Ok(plugins)
+}
+
+/// Permanently remove selected unmanaged DLLs. The caller must provide rollback.
+pub fn delete_unmanaged_plugins(
+    profiles_root: &Path,
+    profile_id: &str,
+    game_dir: &Path,
+    selected_paths: &[String],
+) -> io::Result<Vec<UnmanagedPlugin>> {
+    let _guard = SYNC_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("plugin sync lock is poisoned"))?;
+    let plugins = resolve_unmanaged_selection(
+        unmanaged_plugins_unlocked(profiles_root, profile_id, game_dir)?,
+        selected_paths,
+    )?;
+    let source_root = game_dir.join("BepInEx").join("plugins");
+    for plugin in &plugins {
+        let source = source_root.join(&plugin.path);
+        let metadata = fs::symlink_metadata(&source)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != plugin.size
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("plugin changed before deletion: {}", plugin.path),
+            ));
+        }
+    }
+    for plugin in &plugins {
+        fs::remove_file(source_root.join(&plugin.path))?;
+    }
+    Ok(plugins)
+}
+
 fn copy_bounded_profile_dll(
     source: &Path,
     destination: &Path,
@@ -3241,6 +3693,115 @@ mod tests {
         sync_profile_plugins(&profiles, "p1", &game).unwrap();
         assert_eq!(fs::read(game_plugins.join("AppMod.DLL")).unwrap(), b"app");
         assert_eq!(fs::read(game_plugins.join("UserMod.dll")).unwrap(), b"user");
+    }
+
+    #[test]
+    fn inventories_nested_unmanaged_plugins_without_flagging_owned_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("game");
+        let profiles = tmp.path().join("profiles");
+        let game_plugins = game.join("BepInEx/plugins");
+        let profile_plugins = profile_plugins_dir(&profiles, "p1");
+        fs::create_dir_all(game_plugins.join("Nested")).unwrap();
+        fs::create_dir_all(&profile_plugins).unwrap();
+        fs::write(game_plugins.join("Managed.dll"), b"managed").unwrap();
+        fs::write(game_plugins.join("Same.dll"), b"same").unwrap();
+        fs::write(game_plugins.join("User.dll"), b"user").unwrap();
+        fs::write(game_plugins.join("Nested/Deep.dll"), b"deep").unwrap();
+        fs::write(profile_plugins.join("Same.dll"), b"same").unwrap();
+        fs::write(
+            game_plugins.join(MANAGED_PLUGINS_MARKER),
+            br#"{"names":["Managed.dll"]}"#,
+        )
+        .unwrap();
+
+        let plugins = unmanaged_plugins(&profiles, "p1", &game).unwrap();
+
+        assert_eq!(
+            plugins
+                .iter()
+                .map(|plugin| (plugin.path.as_str(), plugin.importable))
+                .collect::<Vec<_>>(),
+            vec![("Nested/Deep.dll", false), ("User.dll", true)]
+        );
+        let selected =
+            selected_unmanaged_plugins(&profiles, "p1", &game, &["User.dll".into()]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].path, "User.dll");
+        assert!(selected[0].importable);
+        assert!(
+            selected_unmanaged_plugins(&profiles, "p1", &game, &["Missing.dll".into()],).is_err()
+        );
+    }
+
+    #[test]
+    fn quarantines_only_selected_plugins_with_a_recovery_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("game");
+        let profiles = tmp.path().join("profiles");
+        let game_plugins = game.join("BepInEx/plugins");
+        fs::create_dir_all(game_plugins.join("Nested")).unwrap();
+        fs::create_dir_all(profile_plugins_dir(&profiles, "p1")).unwrap();
+        fs::write(game_plugins.join("User.dll"), b"user").unwrap();
+        fs::write(game_plugins.join("Nested/Deep.dll"), b"deep").unwrap();
+
+        let moved =
+            quarantine_unmanaged_plugins(&profiles, "p1", &game, &["Nested/Deep.dll".into()])
+                .unwrap();
+
+        assert_eq!(moved.len(), 1);
+        assert_eq!(fs::read(game_plugins.join("User.dll")).unwrap(), b"user");
+        assert!(!game_plugins.join("Nested/Deep.dll").exists());
+        assert_eq!(
+            unmanaged_plugins(&profiles, "p1", &game)
+                .unwrap()
+                .iter()
+                .map(|plugin| plugin.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["User.dll"]
+        );
+        let quarantine = game.join("BepInEx").join(UNMANAGED_QUARANTINE_DIR);
+        let batches = fs::read_dir(&quarantine)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(
+            fs::read(batch.join("plugins/Nested/Deep.dll")).unwrap(),
+            b"deep"
+        );
+        assert!(!batch.join("plugins/User.dll").exists());
+        let manifest: PluginQuarantineManifest =
+            serde_json::from_slice(&fs::read(batch.join(QUARANTINE_MANIFEST)).unwrap()).unwrap();
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].original_path, "Nested/Deep.dll");
+        assert_eq!(manifest.files[0].sha256.len(), 64);
+    }
+
+    #[test]
+    fn deletes_only_selected_unmanaged_plugins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("game");
+        let profiles = tmp.path().join("profiles");
+        let game_plugins = game.join("BepInEx/plugins");
+        fs::create_dir_all(&game_plugins).unwrap();
+        fs::create_dir_all(profile_plugins_dir(&profiles, "p1")).unwrap();
+        fs::write(game_plugins.join("Delete.dll"), b"delete").unwrap();
+        fs::write(game_plugins.join("Keep.dll"), b"keep").unwrap();
+
+        let deleted =
+            delete_unmanaged_plugins(&profiles, "p1", &game, &["Delete.dll".into()]).unwrap();
+
+        assert_eq!(
+            deleted
+                .iter()
+                .map(|plugin| plugin.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Delete.dll"]
+        );
+        assert!(!game_plugins.join("Delete.dll").exists());
+        assert_eq!(fs::read(game_plugins.join("Keep.dll")).unwrap(), b"keep");
     }
 
     #[test]

@@ -138,7 +138,18 @@ export interface GameInstall {
 export interface GameInstance extends GameInstall {
   id: string;
   name: string;
+  /** stable executable identity used to recover a renamed game folder */
+  executableIdentity?: string;
   runtime: Runtime;
+}
+
+export interface UnmanagedPlugin {
+  /** path relative to BepInEx/plugins, always using forward slashes */
+  path: string;
+  name: string;
+  size: number;
+  /** whether the bare DLL can be copied into this profile as a local mod */
+  importable: boolean;
 }
 
 export interface PersonalLocalMod {

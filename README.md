@@ -68,13 +68,14 @@ personal GitHub or local-DLL defaults merged into every applied lobby profile. L
 remain device-only and are never serialized into lobby codes.
 
 > [!TIP]
-> **The app-data profile is the source of truth for Perfect-Sync-managed plugin DLLs.**
-> At setup or launch, Perfect-Sync publishes that profile into the writable game copy.
-> It deliberately replaces or removes DLLs recorded as Perfect-Sync-owned when the
-> profile changes. DLLs it does not own are preserved, and a managed DLL is not allowed
-> to overwrite an unmanaged file with the same name. Microsoft Store / Game Pass installs
-> in the protected `WindowsApps` tree use Settings' managed-copy flow to create a normal,
-> writable x64 game copy before setup or launch.
+> **The app-data profile is the source of truth for the complete modded runtime.**
+> Before setup or launch, Perfect-Sync recursively checks `BepInEx/plugins` for DLLs
+> outside the selected profile. It shows every extra DLL and blocks publication until
+> each one is resolved. You can select any subset, import safe root-level DLLs into the
+> profile, move files to the instance's checksummed `.perfectsync-quarantine`, or
+> explicitly delete them after confirmation. Perfect-Sync otherwise replaces or removes
+> only files it owns. Microsoft Store / Game Pass installs in the protected `WindowsApps`
+> tree use Settings' managed-copy flow to create a normal, writable x64 game copy.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
@@ -190,9 +191,11 @@ GitHub HTTPS hosts, and never returned to the frontend. A legacy token found in
 `settings.json` is migrated to the OS keyring and scrubbed from the settings file.
 
 During synchronization, an ownership marker limits replacement/removal to
-Perfect-Sync-managed plugin DLLs. Unmanaged files in `BepInEx/plugins` are preserved;
-name collisions fail instead of overwriting them. Replacement of previously owned DLLs
-is deliberate when changing profiles or versions.
+Perfect-Sync-managed plugin DLLs. Unmanaged DLLs are detected recursively before
+publication and must be imported into the selected profile, moved transactionally to
+`BepInEx/.perfectsync-quarantine`, or explicitly deleted after confirmation. They are
+never removed silently. Name collisions fail instead of overwriting user files.
+Replacement of previously owned DLLs is deliberate when changing profiles or versions.
 
 ## Credits
 

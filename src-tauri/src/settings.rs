@@ -50,6 +50,8 @@ pub struct GameInstance {
     pub id: String,
     pub name: String,
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub executable_identity: Option<String>,
     pub arch: Arch,
     pub store: Store,
     pub runtime: Runtime,
@@ -208,6 +210,7 @@ fn migrate_legacy_game(text: &str) -> Option<GameInstance> {
         id: "game-1".to_string(),
         name: name.to_string(),
         path,
+        executable_identity: None,
         arch,
         store,
         runtime,

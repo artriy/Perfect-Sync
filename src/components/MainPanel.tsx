@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { ArrowsClockwise, CaretDown, DotsThree, GameController, PencilSimple, PlusCircle, ShareNetwork, Stack, TrashSimple } from "@phosphor-icons/react";
+import { ArrowsClockwise, CaretDown, DotsThree, GameController, PencilSimple, PlusCircle, ShareNetwork, Stack, TrashSimple, Warning } from "@phosphor-icons/react";
 import { ModRow } from "./ModRow";
 import { LaunchBar } from "./LaunchBar";
-import type { GameInstance, GameStatus, Profile, Trust } from "../lib/types";
+import type { GameInstance, GameStatus, Profile, Trust, UnmanagedPlugin } from "../lib/types";
 import { useModalFocus } from "../lib/useModalFocus";
 import { displayPath } from "../lib/displayPath";
 
@@ -18,6 +18,9 @@ interface MainPanelProps {
   game: GameStatus;
   gameInstances: GameInstance[];
   busy: boolean;
+  unmanagedPlugins: readonly UnmanagedPlugin[];
+  unmanagedLoading: boolean;
+  unmanagedError: string | null;
   onToggle: (modId: string) => void;
   onRemove: (modId: string) => Promise<void>;
   onPickRelease: (modId: string) => void;
@@ -31,6 +34,7 @@ interface MainPanelProps {
   onSelectGameInstance: (id: string) => void;
   onBrowseMaps: () => void;
   onManageGameInstances: () => void;
+  onReviewUnmanaged: () => void;
   trustOf: (id: string) => Trust;
 }
 
@@ -169,6 +173,37 @@ export function MainPanel(props: MainPanelProps) {
           </button>
         )}
       </div>
+      {(props.unmanagedPlugins.length > 0 || props.unmanagedError) && (
+        <button
+          type="button"
+          disabled={busy || props.unmanagedLoading}
+          onClick={props.onReviewUnmanaged}
+          className="ring-focus mx-3 mt-3 flex min-w-0 items-center gap-3 rounded-2xl border border-[rgba(255,193,92,0.24)] bg-[rgba(255,193,92,0.075)] px-3.5 py-3 text-left transition-colors hover:bg-[rgba(255,193,92,0.11)] disabled:cursor-not-allowed disabled:opacity-60 sm:mx-6"
+        >
+          <Warning size={19} weight="fill" className="shrink-0 text-[#ffd9a8]" aria-hidden="true" />
+          <span className="min-w-0 flex-1">
+            <span className="block text-[13.5px] font-semibold text-[#ffe2b7]">
+              {props.unmanagedError
+                ? "Could not verify the game’s plugin folder"
+                : `${props.unmanagedPlugins.length} extra plugin${props.unmanagedPlugins.length === 1 ? "" : "s"} will load`}
+            </span>
+            <span
+              className="mt-0.5 block truncate text-[12px] text-[#d8c4aa]"
+              title={props.unmanagedError ?? props.unmanagedPlugins.map((plugin) => plugin.path).join(", ")}
+            >
+              {props.unmanagedError ?? (
+                <>
+                  {props.unmanagedPlugins.slice(0, 3).map((plugin) => plugin.name).join(", ")}
+                  {props.unmanagedPlugins.length > 3 ? ` and ${props.unmanagedPlugins.length - 3} more` : ""}
+                </>
+              )}
+            </span>
+          </span>
+          <span className="shrink-0 text-[12.5px] font-semibold text-[#ffe2b7]">
+            {props.unmanagedError ? "Retry" : "Review"}
+          </span>
+        </button>
+      )}
       <div className="flex min-w-0 items-end gap-3 px-6 pt-5 pb-3 max-[720px]:flex-wrap max-[720px]:px-3 max-[720px]:pt-4">
         <div className="min-w-0 flex-1">
           {renaming ? (

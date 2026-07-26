@@ -13,6 +13,7 @@ import { ShareModal } from "./components/ShareModal";
 import { SetupModal, type SetupSelection } from "./components/SetupModal";
 import { LaunchWarning } from "./components/LaunchWarning";
 import { MainModWarning } from "./components/MainModWarning";
+import { UnmanagedPluginsModal } from "./components/UnmanagedPluginsModal";
 import { Toast, type ToastState } from "./components/Toast";
 import {
   OperationProgressModal,
@@ -36,10 +37,12 @@ import type {
   Settings,
   Store,
   Trust,
+  UnmanagedPlugin,
 } from "./lib/types";
 
 const CREW_CYCLE = Object.values(CREW);
 const OPERATION_BUSY = new Error("Another operation is already in progress.");
+const UNMANAGED_REVIEW_CANCELLED = new Error("Unmanaged plugin review was canceled.");
 
 const INSTANCE_NAMES: Record<Store, string> = {
   steam: "Steam",
@@ -69,6 +72,15 @@ interface TrackedOperation {
   message: string;
 }
 
+interface UnmanagedPluginPrompt {
+  profileId: string;
+  profileName: string;
+  instanceName: string;
+  gamePath: string;
+  plugins: UnmanagedPlugin[];
+  continuation: boolean;
+}
+
 function messageFrom(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (/^HTTP status 403$/i.test(message.trim())) {
@@ -91,6 +103,7 @@ export function App() {
   const startupPromiseRef = useRef<Promise<StartupResult> | null>(null);
   const operationActivityId = useRef(0);
   const mainModWarningResolver = useRef<((confirmed: boolean) => void) | null>(null);
+  const unmanagedPluginResolver = useRef<((resolved: boolean) => void) | null>(null);
 
   const [games, setGames] = useState<GameInstall[]>([]);
   const [settings, setSettings] = useState<Settings>(EMPTY_SETTINGS);
@@ -115,6 +128,10 @@ export function App() {
     mods: MainMod[];
     actionLabel: string;
   } | null>(null);
+  const [unmanagedPlugins, setUnmanagedPlugins] = useState<UnmanagedPlugin[]>([]);
+  const [unmanagedLoading, setUnmanagedLoading] = useState(false);
+  const [unmanagedScanError, setUnmanagedScanError] = useState<string | null>(null);
+  const [unmanagedPrompt, setUnmanagedPrompt] = useState<UnmanagedPluginPrompt | null>(null);
   const [pickerTarget, setPickerTarget] = useState<{
     repo: string;
     name: string;
@@ -228,9 +245,12 @@ export function App() {
   }, []);
 
   useEffect(() => () => {
-    const resolve = mainModWarningResolver.current;
+    const mainModResolve = mainModWarningResolver.current;
     mainModWarningResolver.current = null;
-    resolve?.(false);
+    mainModResolve?.(false);
+    const unmanagedResolve = unmanagedPluginResolver.current;
+    unmanagedPluginResolver.current = null;
+    unmanagedResolve?.(false);
   }, []);
 
   // StrictMode replays effects. The startup promise is created synchronously
@@ -417,6 +437,38 @@ export function App() {
   const busy = operationBusy || running;
   const firstRun = loaded && !settings.setupComplete;
 
+  useEffect(() => {
+    if (!loaded || !active || !activeGame) {
+      setUnmanagedPlugins([]);
+      setUnmanagedScanError(null);
+      setUnmanagedLoading(false);
+      return;
+    }
+    let current = true;
+    setUnmanagedLoading(true);
+    setUnmanagedScanError(null);
+    void bridge
+      .listUnmanagedPlugins(activeGame.path, active.id)
+      .then((plugins) => {
+        if (current) {
+          setUnmanagedPlugins(plugins);
+          setUnmanagedScanError(null);
+        }
+      })
+      .catch((error) => {
+        if (current) {
+          setUnmanagedPlugins([]);
+          setUnmanagedScanError(messageFrom(error));
+        }
+      })
+      .finally(() => {
+        if (current) setUnmanagedLoading(false);
+      });
+    return () => {
+      current = false;
+    };
+  }, [loaded, active?.id, active?.gameInstanceId, activeGame?.path]);
+
   if (!loaded) {
     return (
       <div className="grid h-[100dvh] place-items-center">
@@ -451,6 +503,120 @@ export function App() {
         ? current.map((profile) => (profile.id === updated.id ? updated : profile))
         : current,
     );
+  };
+
+  const requestUnmanagedPluginResolution = async (
+    profile: Profile,
+    continuation: boolean,
+    targetInstance?: GameInstance,
+  ): Promise<boolean> => {
+    const instance = targetInstance ?? gameForProfile(profile);
+    if (!instance) throw new Error("No Among Us instance is assigned to this profile.");
+    const plugins = await bridge.listUnmanagedPlugins(instance.path, profile.id);
+    if (profile.id === active.id) {
+      setUnmanagedPlugins(plugins);
+      setUnmanagedScanError(null);
+    }
+    if (plugins.length === 0) return true;
+    if (unmanagedPluginResolver.current) return false;
+
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    unmanagedPluginResolver.current = resolve;
+    setUnmanagedPrompt({
+      profileId: profile.id,
+      profileName: profile.name,
+      instanceName: instance.name,
+      gamePath: instance.path,
+      plugins,
+      continuation,
+    });
+    return promise;
+  };
+
+  const closeUnmanagedPluginPrompt = (resolved: boolean) => {
+    const resolve = unmanagedPluginResolver.current;
+    unmanagedPluginResolver.current = null;
+    setUnmanagedPrompt(null);
+    resolve?.(resolved);
+  };
+
+  const resolveUnmanagedPlugins = async (
+    action: "quarantine" | "delete" | "import",
+    paths: readonly string[],
+  ): Promise<boolean> => {
+    const prompt = unmanagedPrompt;
+    if (!prompt) return true;
+    const selectedPaths = [...paths];
+    let updated: Profile | null = null;
+    if (action === "quarantine") {
+      await bridge.quarantineUnmanagedPlugins(prompt.gamePath, prompt.profileId, selectedPaths);
+    } else if (action === "delete") {
+      await bridge.deleteUnmanagedPlugins(prompt.gamePath, prompt.profileId, selectedPaths);
+    } else {
+      updated = await bridge.importUnmanagedPlugins(
+        prompt.gamePath,
+        prompt.profileId,
+        selectedPaths,
+      );
+      patchProfile(updated);
+    }
+    const remaining = await bridge.listUnmanagedPlugins(prompt.gamePath, prompt.profileId);
+    if (prompt.profileId === active.id) setUnmanagedPlugins(remaining);
+    setUnmanagedScanError(null);
+    const count = selectedPaths.length;
+    const resultMessage = action === "quarantine"
+      ? `Moved ${count} plugin${count === 1 ? "" : "s"} to the instance quarantine.`
+      : action === "delete"
+        ? `Permanently deleted ${count} plugin${count === 1 ? "" : "s"} from the instance.`
+        : `Added ${count} local plugin${count === 1 ? "" : "s"} to ${updated?.name ?? prompt.profileName}.`;
+    if (remaining.length > 0) {
+      setUnmanagedPrompt({ ...prompt, plugins: remaining });
+      notify(`${resultMessage} ${remaining.length} still need${remaining.length === 1 ? "s" : ""} review.`);
+      return false;
+    }
+    closeUnmanagedPluginPrompt(true);
+    notify(resultMessage);
+    return true;
+  };
+
+  const reviewUnmanagedPlugins = async (): Promise<void> => {
+    if (!activeGame || unmanagedPluginResolver.current) return;
+    setUnmanagedLoading(true);
+    try {
+      const plugins = await bridge.listUnmanagedPlugins(activeGame.path, active.id);
+      setUnmanagedPlugins(plugins);
+      setUnmanagedScanError(null);
+      if (plugins.length === 0) {
+        notify("No extra plugins were found in this game instance.");
+        return;
+      }
+      setUnmanagedPrompt({
+        profileId: active.id,
+        profileName: active.name,
+        instanceName: activeGame.name,
+        gamePath: activeGame.path,
+        plugins,
+        continuation: false,
+      });
+    } catch (error) {
+      const message = messageFrom(error);
+      setUnmanagedScanError(message);
+      notify(`Could not inspect the game’s plugin folder: ${message}`, "error");
+    } finally {
+      setUnmanagedLoading(false);
+    }
+  };
+
+  const syncAuthoritativeProfile = async (
+    profile: Profile,
+    targetInstance?: GameInstance,
+  ): Promise<string | null> => {
+    if (!await requestUnmanagedPluginResolution(profile, true, targetInstance)) {
+      throw UNMANAGED_REVIEW_CANCELLED;
+    }
+    const instance = targetInstance ?? gameForProfile(profile);
+    if (!instance) throw new Error("No Among Us instance is assigned to this profile.");
+    return bridge.syncProfile(instance.path, profile.id);
   };
 
   const trustOf = (id: string): Trust => {
@@ -642,6 +808,12 @@ export function App() {
 
   const installSelectedMaps = async (maps: LevelImposterMap[]): Promise<void> => {
     try {
+      const preflightProfile = profiles.find((candidate) => candidate.id === active.id);
+      const preflightInstance = gameForProfile(preflightProfile);
+      if (!preflightProfile || !preflightInstance) {
+        throw new Error("Assign an Among Us instance before installing maps.");
+      }
+      if (!await requestUnmanagedPluginResolution(preflightProfile, true, preflightInstance)) return;
       await trackedExclusive(
         {
           scope: "maps",
@@ -670,7 +842,7 @@ export function App() {
           let syncError: string | null = null;
           let warning: string | null = null;
           try {
-            warning = await bridge.syncProfile(instance.path, installed.id);
+            warning = await syncAuthoritativeProfile(installed, instance);
           } catch (error) {
             syncError = messageFrom(error);
           }
@@ -704,6 +876,12 @@ export function App() {
 
   const removeInstalledMaps = async (mapIds: string[]): Promise<void> => {
     try {
+      const preflightProfile = profiles.find((candidate) => candidate.id === active.id);
+      const preflightInstance = gameForProfile(preflightProfile);
+      if (!preflightProfile || !preflightInstance) {
+        throw new Error("Assign an Among Us instance before removing maps.");
+      }
+      if (!await requestUnmanagedPluginResolution(preflightProfile, true, preflightInstance)) return;
       await exclusive(async () => {
         const profile = profiles.find((candidate) => candidate.id === active.id);
         const instance = gameForProfile(profile);
@@ -713,7 +891,7 @@ export function App() {
         let syncError: string | null = null;
         let warning: string | null = null;
         try {
-          warning = await bridge.syncProfile(instance.path, removed.id);
+          warning = await syncAuthoritativeProfile(removed, instance);
         } catch (error) {
           syncError = messageFrom(error);
         }
@@ -918,6 +1096,9 @@ export function App() {
   const launchInternal = async (profile: Profile, vanilla: boolean) => {
     const instance = gameForProfile(profile);
     if (!instance) throw new Error("No Among Us instance is assigned to this profile.");
+    if (!vanilla && !await requestUnmanagedPluginResolution(profile, true, instance)) {
+      throw UNMANAGED_REVIEW_CANCELLED;
+    }
     setRunning(true);
     try {
       if (vanilla) await bridge.launchVanilla(instance.path);
@@ -950,7 +1131,7 @@ export function App() {
         await launchInternal(current, false);
       });
     } catch (error) {
-      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      if (error !== OPERATION_BUSY && error !== UNMANAGED_REVIEW_CANCELLED) notify(messageFrom(error), "error");
     }
   };
 
@@ -965,7 +1146,7 @@ export function App() {
         await launchInternal(profile, false);
       });
     } catch (error) {
-      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      if (error !== OPERATION_BUSY && error !== UNMANAGED_REVIEW_CANCELLED) notify(messageFrom(error), "error");
     }
   };
 
@@ -1003,6 +1184,8 @@ export function App() {
     );
     if (!confirmed) return;
     try {
+      if (!activeGame) throw new Error("Choose a concrete Among Us instance before applying a lobby.");
+      if (!await requestUnmanagedPluginResolution(active, true, activeGame)) return;
       await trackedExclusive(
         {
           scope: "lobby",
@@ -1035,7 +1218,7 @@ export function App() {
             if (warnings.length > 0) notify(`Lobby launched. ${warnings.join(" ")}`, "error");
           } else {
             report({ phase: "finalizing", message: "Synchronizing the profile with Among Us" });
-            const warning = (await bridge.syncProfile(instance.path, built.id)) ?? loaderWarning;
+            const warning = (await syncAuthoritativeProfile(built, instance)) ?? loaderWarning;
             setLobbyOpen(false);
             const details = [warning, ...warnings].filter(Boolean).join(" ");
             notify(details ? `Lobby profile ready: ${built.name}. ${details}` : `Lobby profile ready: ${built.name}`, details ? "error" : "success");
@@ -1043,7 +1226,7 @@ export function App() {
         },
       );
     } catch (error) {
-      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      if (error !== OPERATION_BUSY && error !== UNMANAGED_REVIEW_CANCELLED) notify(messageFrom(error), "error");
     }
   };
 
@@ -1184,7 +1367,7 @@ export function App() {
             );
             patchProfile(savedProfile);
             report({ phase: "finalizing", message: "Synchronizing the complete Town of Us package" });
-            await bridge.syncProfile(selectedInstance.path, savedProfile.id);
+            await syncAuthoritativeProfile(savedProfile, selectedInstance);
           }
           report({ phase: "finalizing", message: "Marking first-time setup complete" });
           const normalized = await bridge.saveSettings({ ...provisional, setupComplete: true });
@@ -1195,6 +1378,7 @@ export function App() {
       );
       return true;
     } catch (error) {
+      if (error === UNMANAGED_REVIEW_CANCELLED) return false;
       if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
       throw error;
     }
@@ -1223,7 +1407,7 @@ export function App() {
         const instance = gameForProfile(current);
         if (!current || !instance) throw new Error("No Among Us instance is assigned. Add one in Settings.");
         notify("Setting up mods…");
-        const warning = await bridge.syncProfile(instance.path, current.id);
+        const warning = await syncAuthoritativeProfile(current, instance);
         notify(
           warning
             ? `Mods are synchronized in the Among Us folder. ${warning}`
@@ -1231,7 +1415,7 @@ export function App() {
         );
       });
     } catch (error) {
-      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+      if (error !== OPERATION_BUSY && error !== UNMANAGED_REVIEW_CANCELLED) notify(messageFrom(error), "error");
     }
   };
 
@@ -1256,7 +1440,8 @@ export function App() {
     setupOpen ||
     updateReviewOpen ||
     launchWarn !== null ||
-    mainModWarning !== null;
+    mainModWarning !== null ||
+    unmanagedPrompt !== null;
 
   return (
     <div className="flex h-[100dvh] flex-col max-[720px]:h-auto max-[720px]:min-h-[100dvh]">
@@ -1308,6 +1493,9 @@ export function App() {
             game={gameStatus}
             gameInstances={gameInstances}
             busy={busy}
+            unmanagedPlugins={unmanagedPlugins}
+            unmanagedLoading={unmanagedLoading}
+            unmanagedError={unmanagedScanError}
             trustOf={trustOf}
             onToggle={(id) => void toggleMod(id)}
             onRemove={removeMod}
@@ -1331,6 +1519,7 @@ export function App() {
             onManageGameInstances={() => {
               if (!busy) setSettingsOpen(true);
             }}
+            onReviewUnmanaged={() => void reviewUnmanagedPlugins()}
           />
         </div>
       </div>
@@ -1480,6 +1669,17 @@ export function App() {
         onCancel={() => {
           if (!operationRef.current) setLaunchWarn(null);
         }}
+      />
+      <UnmanagedPluginsModal
+        open={unmanagedPrompt !== null}
+        profileName={unmanagedPrompt?.profileName ?? active.name}
+        instanceName={unmanagedPrompt?.instanceName ?? activeGame?.name ?? "Selected instance"}
+        plugins={unmanagedPrompt?.plugins ?? []}
+        continuation={unmanagedPrompt?.continuation ?? false}
+        onCancel={() => closeUnmanagedPluginPrompt(false)}
+        onQuarantine={(paths) => resolveUnmanagedPlugins("quarantine", paths)}
+        onDelete={(paths) => resolveUnmanagedPlugins("delete", paths)}
+        onImport={(paths) => resolveUnmanagedPlugins("import", paths)}
       />
       {mainModWarning && (
         <MainModWarning

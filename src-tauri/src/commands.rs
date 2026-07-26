@@ -383,6 +383,7 @@ fn game_artifact_transaction<T>(
         PathBuf::from("BepInEx/interop"),
         PathBuf::from("BepInEx/unity-libs"),
         PathBuf::from("BepInEx/cache"),
+        PathBuf::from("BepInEx").join(loader::UNMANAGED_QUARANTINE_DIR),
         PathBuf::from("BepInEx/plugins"),
     ];
     let backup = unique_sibling(game_dir, "prepare-backup")?;
@@ -1561,6 +1562,128 @@ fn canonical_game_path(game_dir: &Path) -> Result<PathBuf, String> {
     game::exe_arch(&executable).ok_or("Among Us executable architecture is unsupported")?;
     Ok(canonical)
 }
+#[cfg(windows)]
+fn game_executable_identity(game_dir: &Path) -> Option<String> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let executable = File::open(game_dir.join(process::GAME_EXE)).ok()?;
+    let mut information: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+    let succeeded =
+        unsafe { GetFileInformationByHandle(executable.as_raw_handle(), &mut information) };
+    if succeeded == 0 {
+        return None;
+    }
+    let file_index =
+        ((information.file_index_high as u64) << 32) | information.file_index_low as u64;
+    Some(format!(
+        "{:08x}:{file_index:016x}",
+        information.volume_serial_number
+    ))
+}
+
+#[cfg(unix)]
+fn game_executable_identity(game_dir: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(game_dir.join(process::GAME_EXE)).ok()?;
+    Some(format!("{:016x}:{:016x}", metadata.dev(), metadata.ino()))
+}
+
+fn repair_moved_game_instances(saved: &mut Settings) -> Result<(bool, Vec<String>), String> {
+    let mut changed = false;
+    let mut repaired = Vec::new();
+    for instance in &mut saved.game_instances {
+        if let Ok(canonical) = canonical_game_path(Path::new(&instance.path)) {
+            let identity = game_executable_identity(&canonical);
+            let normalized = canonical.to_string_lossy().into_owned();
+            if instance.path != normalized || instance.executable_identity != identity {
+                instance.path = normalized;
+                instance.executable_identity = identity;
+                changed = true;
+            }
+            continue;
+        }
+
+        let original = PathBuf::from(&instance.path);
+        if original.is_dir() {
+            continue;
+        }
+        let Some(parent) = original.parent().filter(|parent| parent.is_dir()) else {
+            continue;
+        };
+        let expected_identity = instance.executable_identity.as_deref();
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(parent)
+            .map_err(|error| format!("Could not inspect the old game folder's parent: {error}"))?
+            .take(MAX_PROFILE_RECOVERY_PARENT_ENTRIES + 1)
+        {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+            if is_reparse(&metadata) || !metadata.is_dir() {
+                continue;
+            }
+            let Ok(candidate) = canonical_game_path(&entry.path()) else {
+                continue;
+            };
+            if game::exe_arch(&candidate.join(process::GAME_EXE)) != Some(instance.arch) {
+                continue;
+            }
+            if instance
+                .build
+                .as_deref()
+                .is_some_and(|expected| game::detect_build(&candidate).as_deref() != Some(expected))
+            {
+                continue;
+            }
+            let candidate_identity = game_executable_identity(&candidate);
+            if expected_identity.is_some() && candidate_identity.as_deref() != expected_identity {
+                continue;
+            }
+            candidates.push((candidate, candidate_identity));
+        }
+        if candidates.len() != 1 {
+            continue;
+        }
+        let (candidate, identity) = candidates.pop().unwrap();
+        instance.path = candidate.to_string_lossy().into_owned();
+        instance.executable_identity = identity;
+        instance.runtime = compat::resolve_with_hint(&candidate, Some(instance.runtime)).runtime;
+        instance.build = game::detect_build(&candidate);
+        instance.writable = game::is_writable_game_dir(&candidate);
+        repaired.push(instance.name.clone());
+        changed = true;
+    }
+    Ok((changed, repaired))
+}
 
 fn validate_game_target(game_path: &str, profile_id: Option<&str>) -> Result<PathBuf, String> {
     let canonical = canonical_game_path(Path::new(game_path))?;
@@ -1954,7 +2077,22 @@ pub async fn inspect_game(game_path: String) -> Result<game::GameInstall, String
 
 #[tauri::command]
 pub async fn get_settings() -> Result<SettingsView, String> {
-    blocking(|| settings::view().map_err(|error| error.to_string())).await
+    blocking(|| {
+        let _guard = lock_mutations()?;
+        let mut view = settings::view().map_err(|error| error.to_string())?;
+        let (changed, repaired) = repair_moved_game_instances(&mut view.settings)?;
+        if changed {
+            settings::save(&view.settings).map_err(|error| error.to_string())?;
+        }
+        if !repaired.is_empty() {
+            log::info!(
+                "recovered renamed Among Us folders for {}",
+                repaired.join(", ")
+            );
+        }
+        Ok(view)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1989,6 +2127,7 @@ pub async fn save_settings(
                 return Err("Every Among Us instance needs a unique folder.".to_string());
             }
             instance.path = canonical.to_string_lossy().into_owned();
+            instance.executable_identity = game_executable_identity(&canonical);
             instance.arch = game::exe_arch(&canonical.join(process::GAME_EXE))
                 .ok_or("Among Us executable architecture is unsupported")?;
             instance.runtime =
@@ -5245,6 +5384,124 @@ fn apply_lobby_code_impl(
 // ---------- loader + launch ----------
 
 #[tauri::command]
+pub async fn list_unmanaged_plugins(
+    game_path: String,
+    profile_id: String,
+) -> Result<Vec<loader::UnmanagedPlugin>, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        validate_profile_id(&profile_id)?;
+        let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
+        with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
+            loader::unmanaged_plugins(&settings::profiles_root(), &profile_id, &game_dir)
+                .map_err(|error| error.to_string())
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn quarantine_unmanaged_plugins(
+    game_path: String,
+    profile_id: String,
+    paths: Vec<String>,
+) -> Result<Vec<loader::UnmanagedPlugin>, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        game_is_stopped()?;
+        validate_profile_id(&profile_id)?;
+        let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
+        with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
+            game_artifact_transaction(&game_dir, || {
+                loader::quarantine_unmanaged_plugins(
+                    &settings::profiles_root(),
+                    &profile_id,
+                    &game_dir,
+                    &paths,
+                )
+                .map_err(|error| error.to_string())
+            })
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_unmanaged_plugins(
+    game_path: String,
+    profile_id: String,
+    paths: Vec<String>,
+) -> Result<Vec<loader::UnmanagedPlugin>, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        game_is_stopped()?;
+        validate_profile_id(&profile_id)?;
+        let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
+        with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
+            game_artifact_transaction(&game_dir, || {
+                loader::delete_unmanaged_plugins(
+                    &settings::profiles_root(),
+                    &profile_id,
+                    &game_dir,
+                    &paths,
+                )
+                .map_err(|error| error.to_string())
+            })
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn import_unmanaged_plugins(
+    game_path: String,
+    profile_id: String,
+    paths: Vec<String>,
+) -> Result<ProfileRecord, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        game_is_stopped()?;
+        validate_profile_id(&profile_id)?;
+        let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
+        let profiles_root = settings::profiles_root();
+        let plugins =
+            loader::selected_unmanaged_plugins(&profiles_root, &profile_id, &game_dir, &paths)
+                .map_err(|error| error.to_string())?;
+        if plugins.iter().any(|plugin| !plugin.importable) {
+            return Err(
+                "Plugins inside subfolders cannot be imported safely. Quarantine them, then add their supported releases to the profile."
+                    .into(),
+            );
+        }
+        profile_transaction(&profiles_root, &profile_id, |stage_root, stage_store| {
+            let mut record = stage_store
+                .load(&profile_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("profile not found")?;
+            for plugin in &plugins {
+                let source = game_dir
+                    .join("BepInEx")
+                    .join("plugins")
+                    .join(&plugin.path);
+                install_local_mod_into_record(
+                    stage_root,
+                    &profile_id,
+                    &mut record,
+                    &source,
+                )?;
+            }
+            stage_store
+                .save(&record)
+                .map_err(|error| error.to_string())?;
+            Ok(record)
+        })
+    })
+    .await
+}
+
+// ---------- loader + launch ----------
+
+#[tauri::command]
 pub async fn ensure_loader(
     game_path: String,
     profile_id: String,
@@ -5449,6 +5706,36 @@ fn load_tou_package_bytes(
     Ok(bytes)
 }
 
+fn require_authoritative_plugin_set(
+    profiles_root: &Path,
+    profile_id: &str,
+    game_dir: &Path,
+) -> Result<(), String> {
+    let unmanaged = loader::unmanaged_plugins(profiles_root, profile_id, game_dir)
+        .map_err(|error| error.to_string())?;
+    if unmanaged.is_empty() {
+        return Ok(());
+    }
+    let names = unmanaged
+        .iter()
+        .take(3)
+        .map(|plugin| plugin.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = unmanaged.len().saturating_sub(3);
+    Err(format!(
+        "{} unmanaged plugin{} will also load: {}{}. Review or quarantine them before synchronizing this profile.",
+        unmanaged.len(),
+        if unmanaged.len() == 1 { "" } else { "s" },
+        names,
+        if remaining == 0 {
+            String::new()
+        } else {
+            format!(" and {remaining} more")
+        }
+    ))
+}
+
 fn prepare_profile(game_path: &str, profile_id: &str) -> Result<Option<String>, String> {
     game_is_stopped()?;
     let game_dir = validate_game_target(game_path, Some(profile_id))?;
@@ -5461,6 +5748,7 @@ fn prepare_profile(game_path: &str, profile_id: &str) -> Result<Option<String>, 
         .load(profile_id)
         .map_err(|error| error.to_string())?
         .ok_or("profile not found")?;
+    require_authoritative_plugin_set(&profiles_root, profile_id, &game_dir)?;
     let active_tou = profile
         .mods
         .iter()
@@ -7597,6 +7885,79 @@ mod tests {
         );
         assert_eq!(reconciled.hidden_hosted_ids, vec!["Owner/Hidden"]);
         assert_eq!(reconciled.hosted_ids, vec!["Owner/Hidden"]);
+    }
+
+    #[test]
+    fn publication_requires_unmanaged_plugins_to_be_resolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles = temp.path().join("profiles");
+        let game = temp.path().join("game");
+        let game_plugins = game.join("BepInEx/plugins");
+        fs::create_dir_all(&game_plugins).unwrap();
+        profile::install_plugin_bytes(&profiles, "authoritative", "Managed.dll", b"managed")
+            .unwrap();
+        fs::write(game_plugins.join("User.dll"), b"user").unwrap();
+
+        let error =
+            require_authoritative_plugin_set(&profiles, "authoritative", &game).unwrap_err();
+
+        assert!(error.contains("1 unmanaged plugin"));
+        assert!(error.contains("User.dll"));
+        loader::quarantine_unmanaged_plugins(
+            &profiles,
+            "authoritative",
+            &game,
+            &["User.dll".into()],
+        )
+        .unwrap();
+        require_authoritative_plugin_set(&profiles, "authoritative", &game).unwrap();
+        loader::sync_profile_plugins(&profiles, "authoritative", &game).unwrap();
+        assert_eq!(
+            fs::read(game_plugins.join("Managed.dll")).unwrap(),
+            b"managed"
+        );
+        assert!(!game_plugins.join("User.dll").exists());
+    }
+
+    #[test]
+    fn recovers_a_registered_game_instance_after_its_folder_is_renamed() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("Among Us copy");
+        let renamed = temp.path().join("Among Us copy renamed");
+        fs::create_dir_all(&original).unwrap();
+        let mut executable = vec![0_u8; 72];
+        executable[0..2].copy_from_slice(b"MZ");
+        executable[0x3c..0x40].copy_from_slice(&(64_u32).to_le_bytes());
+        executable[64..68].copy_from_slice(b"PE\0\0");
+        executable[68..70].copy_from_slice(&(0x014c_u16).to_le_bytes());
+        fs::write(original.join(process::GAME_EXE), executable).unwrap();
+        let identity = game_executable_identity(&original).unwrap();
+        let mut saved = Settings::default();
+        saved.game_instances.push(settings::GameInstance {
+            id: "renamed".into(),
+            name: "Renamed instance".into(),
+            path: original.to_string_lossy().into_owned(),
+            executable_identity: Some(identity.clone()),
+            arch: Arch::X86,
+            store: Store::Manual,
+            runtime: Runtime::Native,
+            build: None,
+            writable: true,
+        });
+        fs::rename(&original, &renamed).unwrap();
+
+        let (changed, repaired) = repair_moved_game_instances(&mut saved).unwrap();
+
+        assert!(changed);
+        assert_eq!(repaired, vec!["Renamed instance"]);
+        assert_eq!(
+            PathBuf::from(&saved.game_instances[0].path),
+            fs::canonicalize(&renamed).unwrap()
+        );
+        assert_eq!(
+            saved.game_instances[0].executable_identity.as_deref(),
+            Some(identity.as_str())
+        );
     }
 
     #[test]
