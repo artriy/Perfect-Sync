@@ -146,7 +146,7 @@ export function ShareModal({ open, profile, onClose }: ShareModalProps) {
 
             <h2 className="pr-10 text-[20px] font-semibold text-ink">Share this lobby</h2>
             <p className="mt-0.5 text-[13px] text-ink-dim">
-              Everyone who opens this gets the exact mods and versions from <strong className="inline-block max-w-full truncate align-bottom" title={profile.name}>{profile.name}</strong>, then just clicks Launch.
+              Everyone who opens this gets the exact enabled mods, versions, release assets, and LevelImposter maps from <strong className="inline-block max-w-full truncate align-bottom" title={profile.name}>{profile.name}</strong>.
             </p>
 
             <div className="scroll-region mt-4 flex min-h-0 flex-col gap-3 overflow-y-auto pr-1">

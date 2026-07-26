@@ -1,10 +1,13 @@
 use crate::catalog::Catalog;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Resolved {
     /// Install order: each dependency appears before the mod that needs it.
     pub ordered: Vec<String>,
+    /// Semver constraints declared by every selected dependent, keyed by the
+    /// dependency's canonical catalog id.
+    pub requirements: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -25,6 +28,7 @@ pub fn resolve(cat: &Catalog, selected: &[String]) -> Result<Resolved, Dependenc
     let mut ordered = Vec::new();
     let mut done = HashSet::new();
     let mut active = HashSet::new();
+    let mut requirements: HashMap<String, Vec<String>> = HashMap::new();
 
     for requested in selected {
         let Some(root) = cat.get(requested) else {
@@ -68,6 +72,12 @@ pub fn resolve(cat: &Catalog, selected: &[String]) -> Result<Resolved, Dependenc
                         dependency: dependency.clone(),
                     });
                 };
+                if let Some(requirement) = entry.dependency_versions.get(&target.id) {
+                    let constraints = requirements.entry(target.id.clone()).or_default();
+                    if !constraints.contains(requirement) {
+                        constraints.push(requirement.clone());
+                    }
+                }
                 let target_folded = target.id.to_ascii_lowercase();
                 if active.contains(&target_folded) {
                     return Err(DependencyError::Cycle(target.id.clone()));
@@ -79,7 +89,10 @@ pub fn resolve(cat: &Catalog, selected: &[String]) -> Result<Resolved, Dependenc
         }
     }
 
-    Ok(Resolved { ordered })
+    Ok(Resolved {
+        ordered,
+        requirements,
+    })
 }
 
 #[cfg(test)]
@@ -121,6 +134,20 @@ mod tests {
             .ordered
             .iter()
             .any(|id| id == "EnhancedNetwork/TownofHost-Enhanced"));
+    }
+
+    #[test]
+    fn aggregates_version_requirements_for_shared_dependencies() {
+        let catalog = parse(r#"{"schema":1,"mods":[
+            {"id":"A/One","name":"One","summary":"s","repo":null,"tags":[],"dependencies":["D/Shared"],"dependencyVersions":{"D/Shared":">=2.0.0"},"assetRules":{}},
+            {"id":"B/Two","name":"Two","summary":"s","repo":null,"tags":[],"dependencies":["D/Shared"],"dependencyVersions":{"D/Shared":"<3.0.0"},"assetRules":{}},
+            {"id":"D/Shared","name":"Shared","summary":"s","repo":null,"tags":[],"dependencies":[],"assetRules":{}}
+        ]}"#).unwrap();
+        let resolved = resolve(&catalog, &["A/One".into(), "B/Two".into()]).unwrap();
+        assert_eq!(
+            resolved.requirements.get("D/Shared").unwrap(),
+            &[">=2.0.0", "<3.0.0"]
+        );
     }
 
     #[test]

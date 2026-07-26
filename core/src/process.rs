@@ -47,13 +47,42 @@ pub fn interactive_command<S: AsRef<OsStr>>(program: S) -> Command {
     }
 }
 
+#[cfg(windows)]
+fn win32_current_directory(path: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let verbatim = [
+        u16::from(b'\\'),
+        u16::from(b'\\'),
+        u16::from(b'?'),
+        u16::from(b'\\'),
+    ];
+    if wide.starts_with(&verbatim) {
+        let unc = wide.len() >= 8
+            && matches!(wide[4], value if value == u16::from(b'U') || value == u16::from(b'u'))
+            && matches!(wide[5], value if value == u16::from(b'N') || value == u16::from(b'n'))
+            && matches!(wide[6], value if value == u16::from(b'C') || value == u16::from(b'c'))
+            && wide[7] == u16::from(b'\\');
+        if unc {
+            let mut conventional = vec![u16::from(b'\\'), u16::from(b'\\')];
+            conventional.extend_from_slice(&wide[8..]);
+            wide = conventional;
+        } else {
+            wide.drain(..verbatim.len());
+        }
+    }
+    wide.push(0);
+    wide
+}
+
 /// Launch a console helper with usable standard handles. Windows must bypass
 /// `std::process::Command`: inheriting a GUI parent's empty standard handles
 /// produces a visible but blank console that cannot accept input.
 pub fn launch_console_interactive(
     program: &std::path::Path,
     cwd: &std::path::Path,
-) -> io::Result<()> {
+) -> io::Result<u32> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -119,7 +148,11 @@ pub fn launch_console_interactive(
         );
         command_line.push(u16::from(b'"'));
         command_line.push(0);
-        let current_directory: Vec<u16> = cwd.as_os_str().encode_wide().chain(Some(0)).collect();
+        // .NET and Unity preserve a verbatim current-directory prefix in their
+        // runtime paths. Addressables then loads Town of Us's catalog but fails
+        // to resolve its `touhats` key. Keep verbatim syntax for file access,
+        // but give launched processes the equivalent conventional Win32 path.
+        let current_directory = win32_current_directory(cwd);
         let mut startup_info: StartupInfoW = unsafe { std::mem::zeroed() };
         startup_info.cb = std::mem::size_of::<StartupInfoW>() as u32;
         let mut process_information: ProcessInformation = unsafe { std::mem::zeroed() };
@@ -145,19 +178,20 @@ pub fn launch_console_interactive(
             return Err(io::Error::last_os_error());
         }
         // SAFETY: CreateProcessW initialized both handles on success. The
-        // process and its console remain alive after these owner handles close.
+        // caller only needs the process ID; the process and console remain
+        // alive after these owner handles close.
         unsafe {
             CloseHandle(process_information.hThread);
             CloseHandle(process_information.hProcess);
         }
-        Ok(())
+        Ok(process_information.dwProcessId)
     }
     #[cfg(not(windows))]
     {
         interactive_command(program)
             .current_dir(cwd)
             .spawn()
-            .map(|_| ())
+            .map(|child| child.id())
     }
 }
 
@@ -277,6 +311,29 @@ mod tests {
     #[link(name = "Kernel32")]
     extern "system" {
         fn GetConsoleWindow() -> isize;
+    }
+
+    #[test]
+    fn process_current_directory_removes_verbatim_syntax() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let decoded = |path| {
+            let mut wide = win32_current_directory(std::path::Path::new(path));
+            assert_eq!(wide.pop(), Some(0));
+            OsString::from_wide(&wide)
+        };
+        assert_eq!(
+            decoded(r"\\?\D:\Epic Games Games\AmongUs - TOU"),
+            OsString::from(r"D:\Epic Games Games\AmongUs - TOU")
+        );
+        assert_eq!(
+            decoded(r"\\?\UNC\server\share\Among Us"),
+            OsString::from(r"\\server\share\Among Us")
+        );
+        assert_eq!(
+            decoded(r"D:\SteamLibrary\Among Us"),
+            OsString::from(r"D:\SteamLibrary\Among Us")
+        );
     }
 
     #[test]

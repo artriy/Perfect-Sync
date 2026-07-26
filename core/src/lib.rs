@@ -9,5 +9,6 @@ pub mod preview;
 pub mod process;
 pub mod profile;
 pub mod resolver;
+pub mod tou_cosmetics;
 pub mod types;
 pub mod version;

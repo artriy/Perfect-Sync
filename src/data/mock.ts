@@ -1,3 +1,4 @@
+import bundledCatalog from "../../catalog/catalog.json";
 import { CREW } from "../lib/palette";
 import type { CatalogItem, GameStatus, Profile } from "../lib/types";
 
@@ -133,17 +134,16 @@ export const PROFILES: Profile[] = [
 
 export const GAME: GameStatus = { store: "steam", arch: "x86", running: false };
 
-export const CATALOG: CatalogItem[] = [
-  { id: "AU-Avengers/TOU-Mira", name: "Town of Us - Mira", repo: "AU-Avengers/TOU-Mira", summary: "The Mira-API rebuild of Town of Us. Dozens of custom roles.", tags: ["role", "all-client"], latest: "1.6.3", dependencies: ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor", "miniduikboot/Mini.RegionInstall"], trust: "trusted" },
-  { id: "TheOtherRolesAU/TheOtherRoles", name: "The Other Roles", repo: "TheOtherRolesAU/TheOtherRoles", summary: "Classic all-client role mod with a deep options menu.", tags: ["role", "all-client"], latest: "4.8.0", dependencies: ["NuclearPowered/Reactor"], trust: "trusted" },
-  { id: "EnhancedNetwork/TownofHost-Enhanced", name: "Town of Host - Enhanced", repo: "EnhancedNetwork/TownofHost-Enhanced", summary: "Host-only chaos modes. Guests can stay vanilla.", tags: ["role", "host-only"], latest: "2.4.1", dependencies: [], trust: "trusted" },
-  { id: "SubmergedAmongUs/Submerged", name: "Submerged", repo: "SubmergedAmongUs/Submerged", summary: "The underwater map, with elevators and verticality.", tags: ["map"], latest: "2025.11.20", dependencies: ["NuclearPowered/Reactor"], trust: "trusted" },
-  { id: "All-Of-Us-Mods/LaunchpadReloaded", name: "Launchpad Reloaded", repo: "All-Of-Us-Mods/LaunchpadReloaded", summary: "A fresh roster of roles built on Mira API.", tags: ["role", "all-client"], latest: "0.3.8", dependencies: ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor"], trust: "trusted" },
-  { id: "DigiWorm0/LevelImposter", name: "LevelImposter", repo: "DigiWorm0/LevelImposter", summary: "Trusted custom-map loader with searchable community map downloads.", tags: ["map", "cosmetic"], latest: "v0.21.2-beta", dependencies: ["NuclearPowered/Reactor"], trust: "trusted" },
-  { id: "NuclearPowered/Reactor", name: "Reactor", repo: "NuclearPowered/Reactor", summary: "Shared runtime library for Reactor-based Among Us mods.", tags: ["library"], latest: "2.5.0", dependencies: [], trust: "trusted" },
-  { id: "All-Of-Us-Mods/MiraAPI", name: "MiraAPI", repo: "All-Of-Us-Mods/MiraAPI", summary: "Shared API and runtime library for Mira-based mods.", tags: ["library"], latest: "0.3.9", dependencies: ["NuclearPowered/Reactor"], trust: "trusted" },
-  { id: "miniduikboot/Mini.RegionInstall", name: "Region Install", repo: "miniduikboot/Mini.RegionInstall", summary: "One-click installer for custom server regions.", tags: ["all-client"], latest: "1.0.0", dependencies: [], trust: "trusted" },
-];
+export const CATALOG: CatalogItem[] = bundledCatalog.mods.map((item) => ({
+  id: item.id,
+  name: item.name,
+  repo: item.repo,
+  summary: item.summary,
+  tags: item.tags as CatalogItem["tags"],
+  latest: "latest",
+  dependencies: item.dependencies,
+  trust: item.trust as CatalogItem["trust"],
+}));
 
 // A valid checksum-bearing lobby code used when a static fixture is needed.
 export const SAMPLE_CODE =

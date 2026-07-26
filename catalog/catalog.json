@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-06-20",
+  "updated": "2026-07-26",
   "loader": {
     "buildsUrl": "https://builds.bepinex.dev/projects/bepinex_be",
     "thunderstoreApi": "https://thunderstore.io/api/experimental/package/BepInEx/BepInExPack_AmongUs/"
@@ -43,6 +43,7 @@
       "repo": "TheOtherRolesAU/TheOtherRoles",
       "tags": ["role", "all-client"],
       "dependencies": ["NuclearPowered/Reactor"],
+      "dependencyVersions": { "NuclearPowered/Reactor": "<=2.4.0" },
       "assetRules": {
         "perArch": {
           "x86": { "match": "(?i)theotherroles\\.zip", "prefer": "zip" },
@@ -76,6 +77,7 @@
       "repo": "SubmergedAmongUs/Submerged",
       "tags": ["map"],
       "dependencies": ["NuclearPowered/Reactor"],
+      "dependencyVersions": { "NuclearPowered/Reactor": ">=2.5.0" },
       "assetRules": {
         "perArch": {
           "x86": { "match": "(?i)steam\\.itch", "prefer": "zip" },
@@ -92,6 +94,7 @@
       "repo": "All-Of-Us-Mods/LaunchpadReloaded",
       "tags": ["role", "all-client"],
       "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor"],
+      "dependencyVersions": { "NuclearPowered/Reactor": ">=2.5.0" },
       "assetRules": { "perArch": {}, "dllName": "LaunchpadReloaded.dll" },
       "trust": "trusted"
     },
@@ -163,6 +166,190 @@
       "tags": ["role", "all-client"],
       "dependencies": ["AU-Avengers/TOU-Mira"],
       "assetRules": {},
+      "trust": "community"
+    },
+    {
+      "id": "tukasa0001/TownOfHost",
+      "name": "Town of Host",
+      "summary": "The original host-only role mod. Guests can join from unmodded clients.",
+      "repo": "tukasa0001/TownOfHost",
+      "tags": ["role", "host-only"],
+      "dependencies": [],
+      "assetRules": {
+        "perArch": {
+          "x86": { "match": "(?i)_Steam\\.zip$", "prefer": "zip" },
+          "x64": { "match": "(?i)_Epic\\.zip$", "prefer": "zip" }
+        },
+        "dllName": "TownOfHost.dll",
+        "bundlesLoader": true
+      },
+      "trust": "trusted"
+    },
+    {
+      "id": "Gurge44/EndlessHostRoles",
+      "name": "Endless Host Roles",
+      "summary": "Large host-only role collection with hundreds of roles, add-ons, and game modes.",
+      "repo": "Gurge44/EndlessHostRoles",
+      "tags": ["role", "host-only"],
+      "dependencies": [],
+      "assetRules": {
+        "perArch": {
+          "x86": { "match": "(?i)_Steam\\.zip$", "prefer": "zip" },
+          "x64": { "match": "(?i)Epic-Games_Microsoft-Store\\.zip$", "prefer": "zip" }
+        },
+        "dllName": "EHR.dll",
+        "bundlesLoader": true
+      },
+      "trust": "trusted"
+    },
+    {
+      "id": "Rabek009/MoreGamemodes",
+      "name": "More Gamemodes",
+      "summary": "Host-only roles, add-ons, and alternate game modes for vanilla-compatible lobbies.",
+      "repo": "Rabek009/MoreGamemodes",
+      "tags": ["role", "host-only"],
+      "dependencies": [],
+      "assetRules": {
+        "perArch": {
+          "x86": { "match": "(?i)SteamItchio", "prefer": "zip" },
+          "x64": { "match": "(?i)EpicMsstore", "prefer": "zip" }
+        },
+        "dllName": "MoreGamemodes.dll",
+        "bundlesLoader": true
+      },
+      "trust": "community"
+    },
+    {
+      "id": "D1GQ/BetterAmongUs",
+      "name": "Better Among Us",
+      "summary": "Client-side quality-of-life, host controls, and anti-cheat tools for vanilla-compatible lobbies.",
+      "repo": "D1GQ/BetterAmongUs",
+      "tags": ["host-only"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "BetterAmongUs.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "Mr-Fluuff/StellarRolesAU",
+      "name": "Stellar Roles",
+      "summary": "All-client role mod with custom roles, modifiers, cosmetics, and lobby settings.",
+      "repo": "Mr-Fluuff/StellarRolesAU",
+      "tags": ["role", "all-client"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "dependencyVersions": { "NuclearPowered/Reactor": ">=2.5.0" },
+      "assetRules": { "perArch": {}, "dllName": "StellarRoles.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "ApeMV/AmongUsRevamped",
+      "name": "Among Us Revamped",
+      "summary": "Host-only public-lobby roles, moderation, automation, and alternate game modes.",
+      "repo": "ApeMV/AmongUsRevamped",
+      "tags": ["role", "host-only"],
+      "dependencies": [],
+      "assetRules": {},
+      "trust": "community"
+    },
+    {
+      "id": "Slok7565/FinalSuspect",
+      "name": "Final Suspect",
+      "summary": "Host-only enhancements and roles designed for a richer vanilla lobby experience.",
+      "repo": "Slok7565/FinalSuspect",
+      "tags": ["role", "host-only"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "FinalSuspect.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "yukieiji/ExtremeRoles",
+      "name": "Extreme Roles",
+      "summary": "Large all-client role mod with extensive role, option, and add-on support.",
+      "repo": "yukieiji/ExtremeRoles",
+      "tags": ["role", "all-client"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "ExtremeRoles.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "SuperNewRoles/SuperNewRoles",
+      "name": "Super New Roles",
+      "summary": "Long-running role collection with both fully modded and host-oriented game modes.",
+      "repo": "SuperNewRoles/SuperNewRoles",
+      "tags": ["role", "host-only"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "SuperNewRoles.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "Brybry16/BetterPolus",
+      "name": "Better Polus",
+      "summary": "Rebalances Polus by moving information tools, tasks, and vent connections.",
+      "repo": "Brybry16/BetterPolus",
+      "tags": ["map", "all-client"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "BetterPolus.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "CallOfCreator/NewMod",
+      "name": "NewMod",
+      "summary": "All-client roles, abilities, and game modes with Mira API interoperability.",
+      "repo": "CallOfCreator/NewMod",
+      "tags": ["role", "all-client"],
+      "dependencies": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor"],
+      "dependencyVersions": { "NuclearPowered/Reactor": ">=2.3.1" },
+      "assetRules": { "perArch": {}, "dllName": "NewMod.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "ugackMiner53/PropHunt",
+      "name": "Prop Hunt",
+      "summary": "All-client hide-and-seek mode where crewmates disguise themselves as map props.",
+      "repo": "ugackMiner53/PropHunt",
+      "tags": ["role", "all-client"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "assetRules": { "perArch": {}, "dllName": "PropHunt.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "xChipseq/VanillaEnhancements",
+      "name": "Vanilla Enhancements",
+      "summary": "Client quality-of-life tools including dark mode, muting, commands, and task tracking.",
+      "repo": "xChipseq/VanillaEnhancements",
+      "tags": ["host-only"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "assetRules": { "perArch": {}, "dllName": "VanillaEnhancements.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "xChipseq/ModExplorer",
+      "name": "Mod Explorer",
+      "summary": "In-game installed-mod browser with plugin details and live configuration controls.",
+      "repo": "xChipseq/ModExplorer",
+      "tags": ["cosmetic"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "ModExplorer.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "RaresHonour/HostGuard",
+      "name": "HostGuard",
+      "summary": "Host-only moderation, bot protection, anti-cheat, filters, and lobby presets.",
+      "repo": "RaresHonour/HostGuard",
+      "tags": ["host-only"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "dependencyVersions": { "NuclearPowered/Reactor": ">=2.5.0" },
+      "assetRules": { "perArch": {}, "dllName": "HostGuard.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "AtomicTyler1/MinimumLevel",
+      "name": "Minimum Level",
+      "summary": "Host-only automatic level-range enforcement with kick or ban controls.",
+      "repo": "AtomicTyler1/MinimumLevel",
+      "tags": ["host-only"],
+      "dependencies": [],
+      "assetRules": { "perArch": {}, "dllName": "MinimumLevel.dll" },
       "trust": "community"
     }
   ]

@@ -29,6 +29,8 @@ pub struct CatalogEntry {
     pub repo: Option<String>,
     pub tags: Vec<ModTag>,
     pub dependencies: Vec<String>,
+    #[serde(rename = "dependencyVersions", default)]
+    pub dependency_versions: HashMap<String, String>,
     #[serde(rename = "assetRules")]
     pub asset_rules: AssetRules,
     #[serde(default)]
@@ -78,6 +80,12 @@ pub enum CatalogError {
     AssetRule { id: String, reason: String },
     #[error("catalog dependency {dependency:?} required by {id:?} is missing")]
     MissingDependency { id: String, dependency: String },
+    #[error("invalid dependency version requirement for {id} -> {dependency}: {reason}")]
+    DependencyVersion {
+        id: String,
+        dependency: String,
+        reason: String,
+    },
     #[error("catalog dependency cycle includes {0:?}")]
     DependencyCycle(String),
     #[error("loader URL must be an absolute HTTPS URL: {0}")]
@@ -194,6 +202,52 @@ fn validate(mut catalog: Catalog) -> Result<Catalog, CatalogError> {
             let canonical = catalog.mods[target].id.clone();
             catalog.mods[entry_index].dependencies[dependency_index] = canonical;
         }
+    }
+
+    for entry_index in 0..catalog.mods.len() {
+        let owner = catalog.mods[entry_index].id.clone();
+        let mut requirements = HashMap::new();
+        for (requested, requirement) in catalog.mods[entry_index].dependency_versions.clone() {
+            if !valid_repo_slug(&requested) {
+                return Err(CatalogError::Identity(requested));
+            }
+            let Some(&target) = ids.get(&requested.to_ascii_lowercase()) else {
+                return Err(CatalogError::MissingDependency {
+                    id: owner.clone(),
+                    dependency: requested,
+                });
+            };
+            let canonical = catalog.mods[target].id.clone();
+            if !catalog.mods[entry_index]
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.eq_ignore_ascii_case(&canonical))
+            {
+                return Err(CatalogError::DependencyVersion {
+                    id: owner.clone(),
+                    dependency: canonical,
+                    reason: "requirement target is not a direct dependency".into(),
+                });
+            }
+            semver::VersionReq::parse(requirement.trim()).map_err(|error| {
+                CatalogError::DependencyVersion {
+                    id: owner.clone(),
+                    dependency: canonical.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+            if requirements
+                .insert(canonical.clone(), requirement)
+                .is_some()
+            {
+                return Err(CatalogError::DependencyVersion {
+                    id: owner.clone(),
+                    dependency: canonical,
+                    reason: "duplicate requirement target".into(),
+                });
+            }
+        }
+        catalog.mods[entry_index].dependency_versions = requirements;
     }
 
     // Iterative DFS avoids recursion on an untrusted catalog.
@@ -427,5 +481,26 @@ mod tests {
             bundles_loader: false,
         };
         assert!(select_asset(&rules, "x86", &["a.zip".into(), "b.zip".into()]).is_none());
+    }
+    #[test]
+    fn validates_and_canonicalizes_versioned_dependencies() {
+        let document = r#"{"schema":1,"mods":[
+            {"id":"A/Root","name":"Root","summary":"s","repo":null,"tags":[],"dependencies":["b/library"],"dependencyVersions":{"B/LIBRARY":">=2.0.0, <3.0.0"},"assetRules":{}},
+            {"id":"B/Library","name":"Library","summary":"s","repo":null,"tags":[],"dependencies":[],"assetRules":{}}
+        ]}"#;
+        let catalog = parse(document).unwrap();
+        let root = catalog.get("A/Root").unwrap();
+        assert_eq!(
+            root.dependency_versions
+                .get("B/Library")
+                .map(String::as_str),
+            Some(">=2.0.0, <3.0.0")
+        );
+
+        let invalid = document.replace(">=2.0.0, <3.0.0", "not-a-requirement");
+        assert!(matches!(
+            parse(&invalid),
+            Err(CatalogError::DependencyVersion { .. })
+        ));
     }
 }

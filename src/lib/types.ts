@@ -104,7 +104,7 @@ export interface DiffItem {
   action: "install" | "change" | "ok";
   from?: string;
   to?: string;
-  /** exact release asset requested by the lobby manifest */
+  /** Exact release asset requested by the lobby manifest. */
   asset?: string;
   detail: string;
   trust?: Trust;
@@ -123,12 +123,22 @@ export interface GameInstall {
   arch: Arch;
   /** how the game runs: native (Windows) or via Proton/Wine/CrossOver */
   runtime?: Runtime;
+  /** detected Among Us build/version when readable */
+  build?: string;
+  /** whether Perfect-Sync can safely modify this folder */
+  writable?: boolean;
 }
 
 export interface GameInstance extends GameInstall {
   id: string;
   name: string;
   runtime: Runtime;
+}
+
+export interface PersonalLocalMod {
+  path: string;
+  name: string;
+  enabled?: boolean;
 }
 
 export interface PersonalMod {
@@ -143,6 +153,8 @@ export interface PersonalMod {
 export interface Settings {
   gameInstances: GameInstance[];
   personalMods: PersonalMod[];
+  /** local DLLs that should be installed into every profile */
+  personalLocalMods?: PersonalLocalMod[];
   setupComplete: boolean;
   /** don't warn on launch when BepInEx isn't fully installed */
   skipLaunchWarning?: boolean;

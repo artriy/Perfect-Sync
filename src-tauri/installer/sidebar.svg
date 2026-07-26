@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="164" height="314" viewBox="0 0 164 314" fill="none">
+  <defs>
+    <linearGradient id="sideBg" x1="15" y1="0" x2="155" y2="314" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#090713"/><stop offset="0.48" stop-color="#160C2F"/><stop offset="1" stop-color="#061B2A"/>
+    </linearGradient>
+    <radialGradient id="violetGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(18 92) rotate(48) scale(142 104)">
+      <stop stop-color="#8A4EFF" stop-opacity="0.42"/><stop offset="1" stop-color="#8A4EFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="cyanGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(154 284) rotate(-130) scale(168 120)">
+      <stop stop-color="#36C8F4" stop-opacity="0.40"/><stop offset="1" stop-color="#36C8F4" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="markLeft" x1="20" y1="34" x2="67" y2="111" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#62DFFF"/><stop offset="1" stop-color="#718FFF"/>
+    </linearGradient>
+    <linearGradient id="markRight" x1="78" y1="34" x2="126" y2="111" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8B78FF"/><stop offset="1" stop-color="#C153FF"/>
+    </linearGradient>
+  </defs>
+  <rect width="164" height="314" fill="url(#sideBg)"/>
+  <rect width="164" height="314" fill="url(#violetGlow)"/>
+  <rect width="164" height="314" fill="url(#cyanGlow)"/>
+  <path d="M0 1H164" stroke="#FFFFFF" stroke-opacity="0.14"/>
+
+  <rect x="25" y="24" width="114" height="114" rx="24" fill="#050609"/>
+  <rect x="26" y="25" width="112" height="112" rx="23" stroke="#34384A" stroke-width="2"/>
+  <g transform="translate(25 24) scale(.791667)">
+    <rect x="17" y="29" width="49" height="86" rx="24.5" fill="url(#markLeft)"/>
+    <rect x="78" y="29" width="49" height="86" rx="24.5" fill="url(#markRight)"/>
+    <rect x="43" y="45" width="30" height="18" rx="9" fill="#050609"/>
+    <rect x="71" y="45" width="30" height="18" rx="9" fill="#050609"/>
+    <path d="M52 84H92" stroke="#D1D3DB" stroke-width="8" stroke-linecap="round"/>
+    <path d="M85 74L98 84L85 94V74Z" fill="#D1D3DB"/>
+    <path d="M59 94L46 84L59 74V94Z" fill="#D1D3DB"/>
+    <circle cx="72" cy="84" r="5" fill="#050609"/>
+  </g>
+
+  <text x="20" y="175" fill="#F6F2FF" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="750">Perfect-Sync</text>
+  <text x="21" y="195" fill="#BEB6D8" font-family="Segoe UI, Arial, sans-serif" font-size="8" font-weight="600" letter-spacing="1.15">MOD MANAGER</text>
+
+  <text x="21" y="228" fill="#FFFFFF" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">One code.</text>
+  <text x="21" y="246" fill="#FFFFFF" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">Same mods.</text>
+  <text x="21" y="264" fill="#FFFFFF" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">Every crewmate.</text>
+
+  <circle cx="23" cy="290" r="3" fill="#5EDAF8"/>
+  <path d="M31 290H72" stroke="#746E91" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="80" cy="290" r="3" fill="#8B7AFF"/>
+  <path d="M88 290H129" stroke="#746E91" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="137" cy="290" r="3" fill="#BD56FF"/>
+  <text x="21" y="306" fill="#928AAE" font-family="Segoe UI, Arial, sans-serif" font-size="6" font-weight="600" letter-spacing=".7">PROFILE  •  SYNC  •  LAUNCH</text>
+</svg>

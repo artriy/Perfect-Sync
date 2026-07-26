@@ -159,7 +159,7 @@ export function LobbyCodeModal({ open, initialCode, installed, trustOf, personal
     <AnimatePresence>
       {open && (
         <motion.div
-          className="fixed inset-0 z-50 grid place-items-center p-4 sm:p-6"
+          className="fixed inset-0 z-50 grid place-items-center p-4 sm:p-6 max-[600px]:p-0"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
@@ -183,14 +183,13 @@ export function LobbyCodeModal({ open, initialCode, installed, trustOf, personal
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.97, y: 8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className={`glass-strong relative flex max-h-[92vh] max-w-full flex-col rounded-3xl p-5 sm:p-6 ${mode === "input" ? "w-[560px]" : "w-[820px]"}`}
+            className={`glass-strong relative flex max-h-[92vh] max-w-full flex-col rounded-3xl p-5 sm:p-6 max-[600px]:h-[100dvh] max-[600px]:max-h-none max-[600px]:w-full max-[600px]:rounded-none ${mode === "input" ? "w-[560px]" : "w-[820px]"}`}
           >
             <button
-              data-autofocus
               type="button"
               onClick={closeModal}
               aria-label="Close lobby code dialog"
-              className="ring-focus absolute top-4 right-4 grid h-8 w-8 place-items-center rounded-lg text-ink-faint hover:bg-white/10 hover:text-ink"
+              className="ring-focus absolute top-4 right-4 grid h-9 w-9 place-items-center rounded-lg text-ink-faint hover:bg-white/10 hover:text-ink"
             >
               <X size={16} weight="bold" />
             </button>
@@ -199,7 +198,7 @@ export function LobbyCodeModal({ open, initialCode, installed, trustOf, personal
             <p className="mt-0.5 text-[13px] text-ink-dim">
               {mode === "input"
                 ? "Paste a friend's PERFECT- code and we'll show exactly what changes."
-                : "Decoded from a shared code. Here is precisely what will change."}
+                : "Decoded from a shared code. Review its exact mods, versions, assets, and maps."}
             </p>
 
             <div className="mt-4 flex min-h-0 flex-1 flex-col">
@@ -399,14 +398,12 @@ function ResultStep({
           </>
         )}
 
+
         {!error && mode !== "decoding" && (
-          <>
-            <div className="mt-4 flex items-start gap-2.5 rounded-xl px-3.5 py-2.5 text-[13px]" style={{ background: "rgba(91,227,176,0.12)", border: "1px solid rgba(91,227,176,0.3)", color: "#aef3d8" }}>
-              <ShieldCheck size={16} weight="fill" className="mt-0.5 shrink-0" />
-              <span>All all-client mods will match the lobby <strong>exactly</strong>, so the Reactor handshake passes.</span>
-            </div>
-            <p className="mt-2 px-1 text-[12.5px] text-ink-faint">Built for Among Us 17.0.1 (reference only; the app won't change your game version).</p>
-          </>
+          <div className="mt-4 flex items-start gap-2.5 rounded-xl px-3.5 py-2.5 text-[13px]" style={{ background: "rgba(91,227,176,0.12)", border: "1px solid rgba(91,227,176,0.3)", color: "#aef3d8" }}>
+            <ShieldCheck size={16} weight="fill" className="mt-0.5 shrink-0" />
+            <span>The applied profile will match every mod, release version, release asset, and LevelImposter map in this code.</span>
+          </div>
         )}
 
         {busyReason && (
@@ -420,7 +417,7 @@ function ResultStep({
         <button type="button" onClick={() => onApply(false)} disabled={!canApply || mode === "decoding" || !!error || !!busyReason} aria-describedby={busyReason ? "lobby-apply-busy-reason" : undefined} className="ring-focus glass rounded-xl px-4 py-2.5 text-[14px] text-ink disabled:opacity-50">
           Apply only
         </button>
-        <button type="button" onClick={() => onApply(true)} disabled={!canApply || mode === "decoding" || !!error || !!busyReason} aria-describedby={busyReason ? "lobby-apply-busy-reason" : undefined} className="ring-focus accent-grad flex items-center gap-2 rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820] disabled:opacity-50" style={{ boxShadow: "0 8px 24px rgba(123,150,255,0.5)" }}>
+        <button type="button" onClick={() => onApply(true)} disabled={!canApply || mode === "decoding" || !!error || !!busyReason} aria-describedby={busyReason ? "lobby-apply-busy-reason" : undefined} className="ring-focus accent-grad flex items-center gap-2 rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820] disabled:opacity-50" style={{ boxShadow: "0 8px 22px rgba(91,192,255,0.24)" }}>
           <Play size={15} weight="fill" /> Apply &amp; Launch
         </button>
       </div>
@@ -428,7 +425,19 @@ function ResultStep({
   );
 }
 
-function UnverifiedConfirmation({ open, flaggedCount, code, onCancel, onConfirm }: { open: boolean; flaggedCount: number; code: string; onCancel: () => void; onConfirm: () => void }) {
+function UnverifiedConfirmation({
+  open,
+  flaggedCount,
+  code,
+  onCancel,
+  onConfirm,
+}: {
+  open: boolean;
+  flaggedCount: number;
+  code: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   useModalFocus(open, ref, onCancel);
 

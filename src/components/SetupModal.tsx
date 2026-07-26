@@ -213,7 +213,7 @@ export function SetupModal({ open, detected, profileId, onFinish }: SetupModalPr
     <AnimatePresence>
       {open && (
         <motion.div
-          className="fixed inset-0 z-[55] grid place-items-center p-6"
+          className="fixed inset-0 z-[55] grid place-items-center p-6 max-[600px]:p-0"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
@@ -232,7 +232,7 @@ export function SetupModal({ open, detected, profileId, onFinish }: SetupModalPr
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.97, y: 8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="glass-strong relative flex max-h-[90vh] w-[560px] max-w-full flex-col rounded-3xl p-6"
+            className="glass-strong relative flex max-h-[90vh] w-[560px] max-w-full flex-col rounded-3xl p-6 max-[600px]:h-[100dvh] max-[600px]:max-h-none max-[600px]:w-full max-[600px]:rounded-none max-[600px]:p-4"
           >
             <h2 className="text-[20px] font-semibold text-ink">Welcome to Perfect-Sync</h2>
             <p className="mt-0.5 text-[13px] text-ink-dim">
@@ -382,7 +382,7 @@ export function SetupModal({ open, detected, profileId, onFinish }: SetupModalPr
               )}
             </div>
 
-            <div className="mt-4 flex items-center justify-between gap-2.5 border-t border-white/10 pt-4">
+            <div className="mt-4 flex items-center justify-between gap-2.5 border-t border-white/10 pt-4 max-[420px]:flex-wrap">
               <button
                 type="button"
                 onClick={() => finishRef.current(undefined)}

@@ -15,17 +15,17 @@ use perfect_sync_core::resolver::{download_resolved, Http, Release, ResolvedDown
 use perfect_sync_core::types::{
     valid_levelimposter_map_id, Arch, ModSource, ModTag, Runtime, Store, Trust,
 };
-use perfect_sync_core::{codec, compat, game, loader, process, profile, resolver};
+use perfect_sync_core::{codec, compat, game, loader, process, profile, resolver, tou_cosmetics};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
 
 const BUNDLED_CATALOG: &str = include_str!("../../catalog/catalog.json");
@@ -50,6 +50,8 @@ const MAX_PROFILE_STAGE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PROFILE_RECOVERY_JOURNALS: usize = 64;
 const MAX_PROFILE_RECOVERY_PARENT_ENTRIES: usize = 4_096;
 const MAX_PROFILE_RECOVERY_JOURNAL_BYTES: u64 = 1_024;
+const MAX_MANAGED_GAME_COPY_FILES: usize = 200_000;
+const MAX_MANAGED_GAME_COPY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LAUNCH_PENDING: AtomicBool = AtomicBool::new(false);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1106,6 +1108,7 @@ fn apply_bundled_install_policy(active: &mut Catalog) {
         if let Some(authoritative) = bundled.get(&entry.id) {
             entry.asset_rules = authoritative.asset_rules.clone();
             entry.dependencies = authoritative.dependencies.clone();
+            entry.dependency_versions = authoritative.dependency_versions.clone();
         }
     }
 }
@@ -1192,6 +1195,8 @@ fn inferred_store(game_dir: &Path) -> Store {
         Store::Steam
     } else if game_dir.join(".egstore").is_dir() || path.contains("/epic games/") {
         Store::Epic
+    } else if path.contains("/windowsapps/") || path.contains("/xboxgames/") {
+        Store::Msstore
     } else {
         Store::Manual
     }
@@ -1238,6 +1243,118 @@ fn validate_game_dir(game_dir: &Path) -> Result<(), String> {
             probe.display()
         )
     })
+}
+
+fn copy_game_tree(
+    source: &Path,
+    destination: &Path,
+    files: &mut usize,
+    bytes: &mut u64,
+) -> Result<(), String> {
+    let source_metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    if is_reparse(&source_metadata) || !source_metadata.is_dir() {
+        return Err(format!(
+            "Managed game copies cannot follow links or reparse points: {}",
+            source.display()
+        ));
+    }
+    fs::create_dir(destination).map_err(|error| error.to_string())?;
+    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".perfectsync-") {
+            continue;
+        }
+        let from = entry.path();
+        let to = destination.join(name);
+        let metadata = fs::symlink_metadata(&from).map_err(|error| error.to_string())?;
+        if is_reparse(&metadata) {
+            return Err(format!(
+                "Managed game copies cannot follow links or reparse points: {}",
+                from.display()
+            ));
+        }
+        if metadata.is_dir() {
+            copy_game_tree(&from, &to, files, bytes)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(format!("Unsupported game file type: {}", from.display()));
+        }
+        *files = files
+            .checked_add(1)
+            .ok_or("Managed game copy file count overflow")?;
+        *bytes = bytes
+            .checked_add(metadata.len())
+            .ok_or("Managed game copy size overflow")?;
+        if *files > MAX_MANAGED_GAME_COPY_FILES || *bytes > MAX_MANAGED_GAME_COPY_BYTES {
+            return Err("The selected game copy exceeds the managed-copy safety limit.".into());
+        }
+        let mut input = File::open(&from).map_err(|error| error.to_string())?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&to)
+            .map_err(|error| error.to_string())?;
+        io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
+        output.sync_all().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn create_managed_game_copy(
+    source_path: String,
+    destination_parent: String,
+) -> Result<game::GameInstall, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        game_is_stopped()?;
+        let source = canonical_game_path(Path::new(&source_path))?;
+        let parent = fs::canonicalize(Path::new(&destination_parent))
+            .map_err(|error| format!("Could not open the managed-copy destination: {error}"))?;
+        if !parent.is_dir() || !game::is_writable_game_dir(&parent) {
+            return Err("Choose a writable destination folder for the managed game copy.".into());
+        }
+        if parent.starts_with(&source) {
+            return Err(
+                "Choose a managed-copy destination outside the original game folder.".into(),
+            );
+        }
+        let destination = parent.join("Among Us - Perfect Sync");
+        if destination.exists() {
+            return Err(format!(
+                "{} already exists. Choose a different destination or remove that prior copy.",
+                destination.display()
+            ));
+        }
+        let stage = parent.join(format!(
+            ".perfectsync-game-copy-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let result = (|| {
+            let mut files = 0;
+            let mut bytes = 0;
+            copy_game_tree(&source, &stage, &mut files, &mut bytes)?;
+            validate_game_dir(&stage)?;
+            fs::rename(&stage, &destination).map_err(|error| error.to_string())?;
+            Ok(game::GameInstall {
+                path: destination.clone(),
+                store: Store::Msstore,
+                arch: game::exe_arch(&destination.join(process::GAME_EXE))
+                    .ok_or("Managed Among Us copy has unsupported architecture")?,
+                runtime: Runtime::Native,
+                build: game::detect_build(&destination),
+                writable: true,
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&stage);
+        }
+        result
+    })
+    .await
 }
 
 fn canonical_game_path(game_dir: &Path) -> Result<PathBuf, String> {
@@ -1344,20 +1461,30 @@ fn launch_err_msg(ctx: &compat::RuntimeContext, e: &std::io::Error) -> String {
     }
 }
 
-/// Download a resolved DLL asset and install it into the profile's plugins.
+/// Download a verified release asset and install its declared plugin DLL.
 fn install_resolved(
     profiles_root: &Path,
     profile_id: &str,
     http: &dyn Http,
     resolved: &ResolvedDownload,
+    expected_dll: Option<&str>,
 ) -> Result<String, String> {
-    if !resolved.asset_name.to_ascii_lowercase().ends_with(".dll") {
-        return Err("Only .dll mod files can be installed.".into());
-    }
+    let asset = resolved.asset_name.to_ascii_lowercase();
     let bytes = download_resolved(http, resolved).map_err(|error| error.to_string())?;
-    profile::install_plugin_bytes(profiles_root, profile_id, &resolved.asset_name, &bytes)
-        .map_err(|error| error.to_string())?;
-    Ok(resolved.asset_name.clone())
+    if asset.ends_with(".dll") {
+        profile::install_plugin_bytes(profiles_root, profile_id, &resolved.asset_name, &bytes)
+            .map_err(|error| error.to_string())?;
+        return Ok(resolved.asset_name.clone());
+    }
+    if asset.ends_with(".zip") {
+        let dll_name = expected_dll.ok_or(
+            "Catalog ZIP installs require an exact declared DLL name. Pick a DLL file manually.",
+        )?;
+        profile::install_plugin_zip_bytes(profiles_root, profile_id, dll_name, &bytes)
+            .map_err(|error| error.to_string())?;
+        return Ok(dll_name.to_string());
+    }
+    Err("Only .dll files and catalog-declared .zip packages can be installed.".into())
 }
 
 /// Resolve the newest BepInEx loader (id + download url) for `arch`.
@@ -1500,7 +1627,6 @@ pub async fn inspect_game(game_path: String) -> Result<game::GameInstall, String
     blocking(move || {
         let _guard = lock_mutations()?;
         let canonical = canonical_game_path(Path::new(&game_path))?;
-        validate_game_dir(&canonical)?;
         let store = inferred_store(&canonical);
         let arch = game::exe_arch(&canonical.join(process::GAME_EXE))
             .ok_or("Among Us executable architecture is unsupported")?;
@@ -1510,10 +1636,12 @@ pub async fn inspect_game(game_path: String) -> Result<game::GameInstall, String
             .map_err(|_| "inspected game lock is poisoned")?
             .insert(canonical.clone());
         Ok(game::GameInstall {
-            path: canonical,
+            path: canonical.clone(),
             store,
             arch,
             runtime,
+            build: game::detect_build(&canonical),
+            writable: game::is_writable_game_dir(&canonical),
         })
     })
     .await
@@ -1564,6 +1692,8 @@ pub async fn save_settings(
             if detected_store != Store::Manual {
                 instance.store = detected_store;
             }
+            instance.build = game::detect_build(&canonical);
+            instance.writable = game::is_writable_game_dir(&canonical);
             paths.push(canonical);
         }
         let mut personal_sources = HashSet::new();
@@ -1596,6 +1726,41 @@ pub async fn save_settings(
             if !personal_sources.insert(identity) {
                 return Err("Personal mods cannot contain duplicate release assets.".into());
             }
+        }
+        let mut local_sources = HashSet::new();
+        for local in &mut settings.personal_local_mods {
+            local.path = local.path.trim().to_string();
+            if !Path::new(&local.path).is_absolute() {
+                return Err("Every local lobby default needs an absolute DLL path.".into());
+            }
+            let source_metadata =
+                fs::symlink_metadata(&local.path).map_err(|error| error.to_string())?;
+            if is_reparse(&source_metadata) || !source_metadata.is_file() {
+                return Err("Every local lobby default must be a safe regular DLL file.".into());
+            }
+            let canonical = fs::canonicalize(&local.path)
+                .map_err(|error| format!("Local lobby default is unavailable: {error}"))?;
+            let metadata = fs::symlink_metadata(&canonical).map_err(|error| error.to_string())?;
+            if is_reparse(&metadata) {
+                return Err("Every local lobby default must be a safe regular DLL file.".into());
+            }
+            if !metadata.is_file() {
+                return Err("Every local lobby default must be a regular DLL file.".into());
+            }
+            let file_name = canonical
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("Local lobby default has no portable file name.")?;
+            profile::validate_dll_name(file_name).map_err(|error| error.to_string())?;
+            if !local_sources.insert(canonical.to_string_lossy().to_ascii_lowercase()) {
+                return Err("Local lobby defaults cannot contain duplicate DLL files.".into());
+            }
+            local.path = canonical.to_string_lossy().into_owned();
+            local.name = canonical
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or(file_name)
+                .to_string();
         }
         for profile in store()?.list().map_err(|error| error.to_string())? {
             let (replacement, previous) = match profile.game_instance_id.as_deref() {
@@ -2152,29 +2317,33 @@ pub async fn delete_profile(id: String) -> Result<(), String> {
 }
 
 // ---------- lobby codes ----------
-fn ensure_profile_shareable(profile: &ProfileRecord) -> Result<(), String> {
-    if profile
-        .mods
-        .iter()
-        .any(|installed| installed.enabled && installed.source == ModSource::File)
-    {
-        return Err(
-            "Local computer mods cannot be shared. Remove them or disable them before creating a lobby code."
-                .into(),
-        );
-    }
-    Ok(())
-}
 
 #[tauri::command]
 pub async fn encode_lobby_code(profile: ProfileRecord) -> Result<String, String> {
     blocking(move || {
-        let mut authoritative = store()?
+        let _guard = lock_mutations()?;
+        let profile_store = store()?;
+        let mut authoritative = profile_store
             .load(&profile.id)
             .map_err(|error| error.to_string())?
             .ok_or("profile not found")?;
-        ensure_profile_shareable(&authoritative)?;
+        let saved = settings::load().map_err(|error| error.to_string())?;
+        let instance = authoritative
+            .game_instance_id
+            .as_deref()
+            .and_then(|id| {
+                saved
+                    .game_instances
+                    .iter()
+                    .find(|instance| instance.id == id)
+            })
+            .or_else(|| saved.game_instances.first());
+        authoritative.game_build =
+            instance.and_then(|instance| game::detect_build(Path::new(&instance.path)));
         authoritative.levelimposter_maps = list_levelimposter_maps_impl(&authoritative.id)?;
+        profile_store
+            .save(&authoritative)
+            .map_err(|error| error.to_string())?;
         codec::encode(&profile::to_manifest(&authoritative)).map_err(|error| error.to_string())
     })
     .await
@@ -2216,7 +2385,11 @@ fn install_options(
         let mut assets: Vec<_> = release
             .assets
             .iter()
-            .filter(|asset| asset.name.to_ascii_lowercase().ends_with(".dll"))
+            .filter(|asset| {
+                let lower = asset.name.to_ascii_lowercase();
+                lower.ends_with(".dll")
+                    || (lower.ends_with(".zip") && preferred == Some(asset.name.as_str()))
+            })
             .collect();
         assets.sort_by_key(|asset| preferred != Some(asset.name.as_str()));
         options.extend(assets.into_iter().map(|asset| ModInstallOption {
@@ -2293,6 +2466,21 @@ impl ProgressHttp {
 impl Http for ProgressHttp {
     fn get_text(&self, url: &str) -> Result<String, perfect_sync_core::resolver::ResolveError> {
         self.inner.get_text(url)
+    }
+    fn get_text_with_url(
+        &self,
+        url: &str,
+    ) -> Result<perfect_sync_core::resolver::TextResponse, perfect_sync_core::resolver::ResolveError>
+    {
+        self.inner.get_text_with_url(url)
+    }
+
+    fn head(
+        &self,
+        url: &str,
+    ) -> Result<perfect_sync_core::resolver::HeadResponse, perfect_sync_core::resolver::ResolveError>
+    {
+        self.inner.head(url)
     }
 
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>, perfect_sync_core::resolver::ResolveError> {
@@ -2593,27 +2781,6 @@ fn explicit_catalog_roots(record: &ProfileRecord, catalog: &Catalog) -> Vec<Stri
         .collect()
 }
 
-fn required_by_other_explicit_root(
-    record: &ProfileRecord,
-    catalog: &Catalog,
-    package_id: &str,
-) -> Result<bool, String> {
-    for root in explicit_catalog_roots(record, catalog)
-        .into_iter()
-        .filter(|root| !root.eq_ignore_ascii_case(package_id))
-    {
-        if deps::resolve(catalog, std::slice::from_ref(&root))
-            .map_err(|error| error.to_string())?
-            .ordered
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(package_id))
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn normalize_dependency_ownership(
     stage_root: &Path,
     profile_id: &str,
@@ -2676,20 +2843,8 @@ fn mod_position(record: &ProfileRecord, package_id: &str) -> Result<usize, Strin
         .ok_or_else(|| "mod not found".to_string())
 }
 
-fn validate_mod_toggle(
-    record: &ProfileRecord,
-    catalog: &Catalog,
-    package_id: &str,
-    enabled: bool,
-) -> Result<usize, String> {
-    let position = mod_position(record, package_id)?;
-    if record.mods[position].managed {
-        return Err("managed dependencies cannot be toggled".into());
-    }
-    if !enabled && required_by_other_explicit_root(record, catalog, package_id)? {
-        return Err("This mod is required by another explicit root and cannot be disabled.".into());
-    }
-    Ok(position)
+fn validate_mod_toggle(record: &ProfileRecord, package_id: &str) -> Result<usize, String> {
+    mod_position(record, package_id)
 }
 
 fn remove_mod_from_record(
@@ -2700,22 +2855,9 @@ fn remove_mod_from_record(
     package_id: &str,
 ) -> Result<(), String> {
     let position = mod_position(record, package_id)?;
-    if record.mods[position].managed {
-        return Err("managed dependencies cannot be removed directly".into());
-    }
-    if required_by_other_explicit_root(record, catalog, package_id)? {
-        if let Some(file) = record.mods[position].file.as_deref() {
-            profile::set_plugin_enabled(stage_root, profile_id, file, true)
-                .map_err(|error| error.to_string())?;
-        }
-        record.mods[position].enabled = true;
-        record.mods[position].managed = true;
-    } else {
-        let removed = record.mods.remove(position);
-        if let Some(file) = removed.file {
-            profile::remove_plugin(stage_root, profile_id, &file)
-                .map_err(|error| error.to_string())?;
-        }
+    let removed = record.mods.remove(position);
+    if let Some(file) = removed.file {
+        profile::remove_plugin(stage_root, profile_id, &file).map_err(|error| error.to_string())?;
     }
     normalize_dependency_ownership(stage_root, profile_id, record, catalog)
 }
@@ -2725,9 +2867,12 @@ fn selected_release_asset(
     repo: &str,
     tag: &str,
     asset_name: &str,
+    rules: Option<&AssetRules>,
+    arch: &str,
 ) -> Result<ResolvedDownload, String> {
-    if !asset_name.to_ascii_lowercase().ends_with(".dll") {
-        return Err("Only .dll mod files can be installed.".into());
+    let lower = asset_name.to_ascii_lowercase();
+    if !lower.ends_with(".dll") && !lower.ends_with(".zip") {
+        return Err("Only .dll files and catalog-selected .zip packages can be installed.".into());
     }
     let release =
         resolver::fetch_release_by_tag(http, repo, tag).map_err(|error| error.to_string())?;
@@ -2736,26 +2881,18 @@ fn selected_release_asset(
         .iter()
         .find(|asset| asset.name == asset_name)
         .ok_or("selected file not found in that release")?;
-    Ok(ResolvedDownload {
-        url: asset.url.clone(),
-        asset_name: asset.name.clone(),
-        version: release.tag.clone(),
-
-        size: asset.size,
-    })
-}
-
-fn enforce_lobby_asset_choice(
-    requested: Option<&str>,
-    default: &ResolvedDownload,
-) -> Result<(), String> {
-    match requested {
-        Some(asset) if asset != default.asset_name => Err(format!(
-            "Lobby requests release asset {asset}, but the catalog selects {} for this game architecture. Refusing to install a different asset.",
-            default.asset_name
-        )),
-        _ => Ok(()),
+    if lower.ends_with(".zip") {
+        let selected = rules
+            .and_then(|rules| resolver::pick_asset(&release, rules, arch))
+            .is_some_and(|selected| selected.name == asset.name);
+        if !selected {
+            return Err(
+                "Only the catalog-selected ZIP package for this game architecture can be installed."
+                    .into(),
+            );
+        }
     }
+    resolver::resolved_asset(http, &release, asset).map_err(|error| error.to_string())
 }
 fn staged_plugin_names(stage_root: &Path, profile_id: &str) -> Result<HashSet<String>, String> {
     let directory = stage_root.join(profile_id).join("BepInEx").join("plugins");
@@ -2832,11 +2969,16 @@ fn install_record(
             .map_err(|error| error.to_string())?;
     }
     let preexisting = staged_plugin_names(context.stage_root, context.profile_id)?;
+    let expected_dll = context
+        .catalog
+        .get(&package_id)
+        .and_then(|entry| entry.asset_rules.dll_name.as_deref());
     let file = install_resolved(
         context.stage_root,
         context.profile_id,
         context.http,
         &resolved,
+        expected_dll,
     )?;
     let lower = file.to_ascii_lowercase();
     if preexisting.contains(&lower) || preexisting.contains(&format!("{lower}.disabled")) {
@@ -2892,25 +3034,63 @@ fn install_catalog_latest(
     record: &mut ProfileRecord,
     id: &str,
     managed: bool,
+    requirements: &[String],
 ) -> Result<(), String> {
     let entry = context
         .catalog
         .get(id)
         .ok_or("catalog dependency is missing")?;
-    if managed
-        && record.mods.iter().any(|installed| {
+    if managed {
+        if let Some(installed) = record.mods.iter().find(|installed| {
             installed.package_id.eq_ignore_ascii_case(&entry.id) && !installed.managed
-        })
-    {
-        return Ok(());
+        }) {
+            if requirements.is_empty()
+                || perfect_sync_core::version::satisfies_all(&installed.version, requirements)
+            {
+                return Ok(());
+            }
+            return Err(format!(
+                "{} {} does not satisfy required version {}.",
+                entry.name,
+                installed.version,
+                requirements.join(", ")
+            ));
+        }
     }
     let repo = entry
         .repo
         .clone()
         .or_else(|| resolver::parse_repo(&entry.id))
         .ok_or_else(|| format!("cannot resolve source for {}", entry.id))?;
-    let resolved = resolver::resolve_latest(context.http, &repo, &entry.asset_rules, context.arch)
-        .map_err(|error| error.to_string())?;
+    let resolved = if requirements.is_empty() {
+        resolver::resolve_latest(context.http, &repo, &entry.asset_rules, context.arch)
+            .map_err(|error| error.to_string())?
+    } else {
+        let releases =
+            resolver::fetch_releases(context.http, &repo, 20).map_err(|error| error.to_string())?;
+        let mut selected = None;
+        for release in releases {
+            if !perfect_sync_core::version::satisfies_all(&release.tag, requirements) {
+                continue;
+            }
+            let Some(asset) = resolver::pick_asset(&release, &entry.asset_rules, context.arch)
+            else {
+                continue;
+            };
+            selected = Some(
+                resolver::resolved_asset(context.http, &release, asset)
+                    .map_err(|error| error.to_string())?,
+            );
+            break;
+        }
+        selected.ok_or_else(|| {
+            format!(
+                "{} has no recent release satisfying {}.",
+                entry.name,
+                requirements.join(", ")
+            )
+        })?
+    };
     install_record(
         context,
         record,
@@ -2925,12 +3105,12 @@ fn install_catalog_latest(
     )
 }
 
-fn install_local_mod_impl(
+fn install_local_mod_into_record(
     profiles_root: &Path,
     profile_id: &str,
+    record: &mut ProfileRecord,
     source: &Path,
-) -> Result<ProfileRecord, String> {
-    validate_profile_id(profile_id)?;
+) -> Result<(), String> {
     if !source.is_absolute() {
         return Err("Choose an absolute path to a local .dll file.".into());
     }
@@ -2945,64 +3125,72 @@ fn install_local_mod_impl(
         .ok_or("Local mod path has no portable file name.")?
         .to_string();
     let package_id = format!("local/{}", file_name.to_ascii_lowercase());
+    if record.mods.iter().any(|installed| {
+        !installed.package_id.eq_ignore_ascii_case(&package_id)
+            && installed
+                .file
+                .as_deref()
+                .is_some_and(|owned| owned.eq_ignore_ascii_case(file_name))
+    }) {
+        return Err(format!(
+            "plugin file {file_name} is already owned by another installed package"
+        ));
+    }
 
+    let previous = record
+        .mods
+        .iter()
+        .position(|installed| installed.package_id.eq_ignore_ascii_case(&package_id));
+    if let Some(existing) = previous.and_then(|position| record.mods[position].file.as_deref()) {
+        profile::remove_plugin(profiles_root, profile_id, existing)
+            .map_err(|error| error.to_string())?;
+    }
+    let preexisting = staged_plugin_names(profiles_root, profile_id)?;
+    let folded_file = file_name.to_ascii_lowercase();
+    if preexisting.contains(&folded_file)
+        || preexisting.contains(&format!("{folded_file}.disabled"))
+    {
+        return Err(format!(
+            "plugin file {file_name} would overwrite a file not owned by this package"
+        ));
+    }
+
+    profile::install_plugin_dll(profiles_root, profile_id, source)
+        .map_err(|error| error.to_string())?;
+    let installed = InstalledMod {
+        package_id,
+        name: display_name,
+        repo: None,
+        version: "local".into(),
+        versions: vec!["local".into()],
+        enabled: true,
+        source: ModSource::File,
+        tags: Vec::new(),
+        managed: false,
+        update: None,
+        file: Some(file_name.to_string()),
+        asset: Some(file_name.to_string()),
+    };
+    if let Some(position) = previous {
+        record.mods[position] = installed;
+    } else {
+        record.mods.push(installed);
+    }
+    Ok(())
+}
+
+fn install_local_mod_impl(
+    profiles_root: &Path,
+    profile_id: &str,
+    source: &Path,
+) -> Result<ProfileRecord, String> {
+    validate_profile_id(profile_id)?;
     profile_transaction(profiles_root, profile_id, |stage_root, stage_store| {
         let mut record = stage_store
             .load(profile_id)
             .map_err(|error| error.to_string())?
             .ok_or("profile not found")?;
-        if record.mods.iter().any(|installed| {
-            !installed.package_id.eq_ignore_ascii_case(&package_id)
-                && installed
-                    .file
-                    .as_deref()
-                    .is_some_and(|owned| owned.eq_ignore_ascii_case(file_name))
-        }) {
-            return Err(format!(
-                "plugin file {file_name} is already owned by another installed package"
-            ));
-        }
-
-        let previous = record
-            .mods
-            .iter()
-            .position(|installed| installed.package_id.eq_ignore_ascii_case(&package_id));
-        if let Some(existing) = previous.and_then(|position| record.mods[position].file.as_deref())
-        {
-            profile::remove_plugin(stage_root, profile_id, existing)
-                .map_err(|error| error.to_string())?;
-        }
-        let preexisting = staged_plugin_names(stage_root, profile_id)?;
-        let folded_file = file_name.to_ascii_lowercase();
-        if preexisting.contains(&folded_file)
-            || preexisting.contains(&format!("{folded_file}.disabled"))
-        {
-            return Err(format!(
-                "plugin file {file_name} would overwrite a file not owned by this package"
-            ));
-        }
-
-        profile::install_plugin_dll(stage_root, profile_id, source)
-            .map_err(|error| error.to_string())?;
-        let installed = InstalledMod {
-            package_id,
-            name: display_name,
-            repo: None,
-            version: "local".into(),
-            versions: vec!["local".into()],
-            enabled: true,
-            source: ModSource::File,
-            tags: Vec::new(),
-            managed: false,
-            update: None,
-            file: Some(file_name.to_string()),
-            asset: Some(file_name.to_string()),
-        };
-        if let Some(position) = previous {
-            record.mods[position] = installed;
-        } else {
-            record.mods.push(installed);
-        }
+        install_local_mod_into_record(stage_root, profile_id, &mut record, source)?;
         stage_store
             .save(&record)
             .map_err(|error| error.to_string())?;
@@ -3025,13 +3213,13 @@ fn install_asset_impl(
     let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
     let catalog = catalog()?;
     let root_entry = catalog_entry_for(&catalog, &repo).cloned();
-    let ordered = match root_entry.as_ref() {
+    let (ordered, requirements) = match root_entry.as_ref() {
         Some(entry) => {
-            deps::resolve(&catalog, std::slice::from_ref(&entry.id))
-                .map_err(|error| error.to_string())?
-                .ordered
+            let plan = deps::resolve(&catalog, std::slice::from_ref(&entry.id))
+                .map_err(|error| error.to_string())?;
+            (plan.ordered, plan.requirements)
         }
-        None => Vec::new(),
+        None => (Vec::new(), HashMap::new()),
     };
     let root = settings::profiles_root();
     profile_transaction(&root, &profile_id, |stage_root, stage_store| {
@@ -3063,9 +3251,22 @@ fn install_asset_impl(
                 .as_ref()
                 .is_none_or(|root| is_managed_dependency(&root.id, id))
         }) {
-            install_catalog_latest(&install, &mut record, dependency, true)?;
+            install_catalog_latest(
+                &install,
+                &mut record,
+                dependency,
+                true,
+                requirements.get(dependency).map_or(&[][..], Vec::as_slice),
+            )?;
         }
-        let resolved = selected_release_asset(&http, &repo, &tag, &asset_name)?;
+        let resolved = selected_release_asset(
+            &http,
+            &repo,
+            &tag,
+            &asset_name,
+            root_entry.as_ref().map(|entry| &entry.asset_rules),
+            &arch,
+        )?;
         install_record(
             &install,
             &mut record,
@@ -3147,13 +3348,15 @@ fn install_assets_impl(
         prepared.push((selection, repo, catalog_entry));
     }
 
-    let ordered = if selected_catalog_roots.is_empty() {
-        Vec::new()
+    let plan = if selected_catalog_roots.is_empty() {
+        deps::Resolved {
+            ordered: Vec::new(),
+            requirements: HashMap::new(),
+        }
     } else {
-        deps::resolve(&catalog, &selected_catalog_roots)
-            .map_err(|error| error.to_string())?
-            .ordered
+        deps::resolve(&catalog, &selected_catalog_roots).map_err(|error| error.to_string())?
     };
+    let ordered = &plan.ordered;
     let selected_root_ids: HashSet<String> = selected_catalog_roots
         .iter()
         .map(|id| id.to_ascii_lowercase())
@@ -3173,6 +3376,22 @@ fn install_assets_impl(
                     entry.as_ref().unwrap().name
                 ));
             }
+        }
+    }
+    for (selection, _, entry) in &prepared {
+        let Some(entry) = entry else {
+            continue;
+        };
+        let Some(requirements) = plan.requirements.get(&entry.id) else {
+            continue;
+        };
+        if !perfect_sync_core::version::satisfies_all(&selection.tag, requirements) {
+            return Err(format!(
+                "{} {} does not satisfy required version {}.",
+                entry.name,
+                selection.tag,
+                requirements.join(", ")
+            ));
         }
     }
     let omitted_dependencies: Vec<String> = ordered
@@ -3238,8 +3457,14 @@ fn install_assets_impl(
             arch: &arch,
         };
         for (selection, repo, catalog_entry) in &prepared {
-            let resolved =
-                selected_release_asset(&http, repo, &selection.tag, &selection.asset_name)?;
+            let resolved = selected_release_asset(
+                &http,
+                repo,
+                &selection.tag,
+                &selection.asset_name,
+                catalog_entry.as_ref().map(|entry| &entry.asset_rules),
+                &arch,
+            )?;
             install_record(
                 &install,
                 &mut record,
@@ -3615,9 +3840,9 @@ fn install_levelimposter_maps_impl(
     {
         return Err("LevelImposter catalog metadata is not trusted.".into());
     }
-    let ordered = deps::resolve(&catalog, &[levelimposter.id.clone()])
-        .map_err(|error| error.to_string())?
-        .ordered;
+    let plan =
+        deps::resolve(&catalog, &[levelimposter.id.clone()]).map_err(|error| error.to_string())?;
+    let ordered = &plan.ordered;
     validate_authoritative_dependencies(&catalog, &[levelimposter.id.clone()])?;
 
     let root = settings::profiles_root();
@@ -3638,12 +3863,13 @@ fn install_levelimposter_maps_impl(
                 catalog: &catalog,
                 arch: &arch,
             };
-            for id in &ordered {
+            for id in ordered {
                 install_catalog_latest(
                     &install,
                     &mut record,
                     id,
                     !id.eq_ignore_ascii_case(LEVELIMPOSTER_ID),
+                    plan.requirements.get(id).map_or(&[][..], Vec::as_slice),
                 )?;
             }
             normalize_dependency_ownership(stage_root, &profile_id, &mut record, &catalog)?;
@@ -3716,13 +3942,13 @@ fn add_mod_impl(profile_id: String, repo: String, arch: String) -> Result<Profil
     let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
     let catalog = catalog()?;
     let root_entry = catalog_entry_for(&catalog, &repo).cloned();
-    let ordered = match root_entry.as_ref() {
+    let (ordered, requirements) = match root_entry.as_ref() {
         Some(entry) => {
-            deps::resolve(&catalog, std::slice::from_ref(&entry.id))
-                .map_err(|error| error.to_string())?
-                .ordered
+            let plan = deps::resolve(&catalog, std::slice::from_ref(&entry.id))
+                .map_err(|error| error.to_string())?;
+            (plan.ordered, plan.requirements)
         }
-        None => Vec::new(),
+        None => (Vec::new(), HashMap::new()),
     };
     let root = settings::profiles_root();
     profile_transaction(&root, &profile_id, |stage_root, stage_store| {
@@ -3752,7 +3978,13 @@ fn add_mod_impl(profile_id: String, repo: String, arch: String) -> Result<Profil
             let managed = root_entry
                 .as_ref()
                 .is_some_and(|root| is_managed_dependency(&root.id, id));
-            install_catalog_latest(&install, &mut record, id, managed)?;
+            install_catalog_latest(
+                &install,
+                &mut record,
+                id,
+                managed,
+                requirements.get(id).map_or(&[][..], Vec::as_slice),
+            )?;
         }
         if root_entry.is_none() {
             let rules = default_rules();
@@ -3794,10 +4026,7 @@ pub async fn set_mod_enabled(
                 .load(&profile_id)
                 .map_err(|error| error.to_string())?
                 .ok_or("profile not found")?;
-            let catalog = catalog()?;
-            let explicit_roots = explicit_catalog_roots(&record, &catalog);
-            validate_authoritative_dependencies(&catalog, &explicit_roots)?;
-            let position = validate_mod_toggle(&record, &catalog, &package_id, enabled)?;
+            let position = validate_mod_toggle(&record, &package_id)?;
             if let Some(file) = record.mods[position].file.as_deref() {
                 profile::set_plugin_enabled(stage_root, &profile_id, file, enabled)
                     .map_err(|error| error.to_string())?;
@@ -3904,8 +4133,6 @@ pub async fn remove_mod(profile_id: String, package_id: String) -> Result<Profil
                 .map_err(|error| error.to_string())?
                 .ok_or("profile not found")?;
             let catalog = catalog()?;
-            let explicit_roots = explicit_catalog_roots(&record, &catalog);
-            validate_authoritative_dependencies(&catalog, &explicit_roots)?;
             remove_mod_from_record(stage_root, &profile_id, &mut record, &catalog, &package_id)?;
             stage_store
                 .save(&record)
@@ -3938,7 +4165,6 @@ pub async fn check_mod_updates(profile_id: String, arch: String) -> Result<Profi
                     .and_then(resolver::parse_repo)
                     .or_else(|| resolver::parse_repo(&installed.package_id))
                 else {
-                    installed.update = None;
                     continue;
                 };
                 let rules = catalog_entry_for(&catalog, &installed.package_id)
@@ -3950,6 +4176,112 @@ pub async fn check_mod_updates(profile_id: String, arch: String) -> Result<Profi
                     perfect_sync_core::version::is_newer(&latest.version, &installed.version)
                         .then_some(latest.version);
             }
+            stage_store
+                .save(&record)
+                .map_err(|error| error.to_string())?;
+            Ok(record)
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn apply_mod_updates(
+    profile_id: String,
+    package_ids: Vec<String>,
+    arch: String,
+    on_progress: Channel<OperationProgress>,
+) -> Result<ProfileRecord, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        validate_profile_id(&profile_id)?;
+        if package_ids.is_empty() || package_ids.len() > 64 {
+            return Err("Choose between 1 and 64 reviewed mod updates.".into());
+        }
+        let mut selected = HashSet::new();
+        for package_id in &package_ids {
+            if package_id.is_empty() || !selected.insert(package_id.to_ascii_lowercase()) {
+                return Err("Reviewed mod updates contain an invalid or duplicate id.".into());
+            }
+        }
+        let _ = arch;
+        let arch = profile_arch(&profile_id)?;
+        let catalog = catalog()?;
+        let root = settings::profiles_root();
+        let reporter = ProgressReporter::new(on_progress);
+        profile_transaction(&root, &profile_id, |stage_root, stage_store| {
+            let mut record = stage_store
+                .load(&profile_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("profile not found")?;
+            let progress_http = ProgressHttp::new(http()?, reporter.clone());
+            for (index, package_id) in package_ids.iter().enumerate() {
+                let position = record
+                    .mods
+                    .iter()
+                    .position(|installed| installed.package_id.eq_ignore_ascii_case(package_id))
+                    .ok_or_else(|| format!("Reviewed mod is no longer installed: {package_id}"))?;
+                let existing = record.mods[position].clone();
+                if existing.managed {
+                    return Err(format!(
+                        "{} is an automatic dependency. Update its root mod instead.",
+                        existing.name
+                    ));
+                }
+                let version = existing
+                    .update
+                    .as_deref()
+                    .filter(|version| {
+                        perfect_sync_core::version::is_newer(version, &existing.version)
+                    })
+                    .ok_or_else(|| {
+                        format!("{} no longer has a newer reviewed version.", existing.name)
+                    })?
+                    .to_string();
+                let repo = existing
+                    .repo
+                    .as_deref()
+                    .and_then(resolver::parse_repo)
+                    .or_else(|| resolver::parse_repo(&existing.package_id))
+                    .ok_or_else(|| format!("Cannot resolve the source for {}.", existing.name))?;
+                let rules = catalog_entry_for(&catalog, &existing.package_id)
+                    .map(|entry| entry.asset_rules.clone())
+                    .unwrap_or_else(default_rules);
+                reporter.stage(
+                    "resolving",
+                    format!(
+                        "Resolving {} {} ({}/{})",
+                        existing.name,
+                        version,
+                        index + 1,
+                        package_ids.len()
+                    ),
+                );
+                let resolved =
+                    resolver::resolve_tag(&progress_http, &repo, &version, &rules, &arch)
+                        .map_err(|error| error.to_string())?;
+                let install = InstallContext {
+                    stage_root,
+                    profile_id: &profile_id,
+                    http: &progress_http,
+                    catalog: &catalog,
+                    arch: &arch,
+                };
+                install_record(
+                    &install,
+                    &mut record,
+                    InstallRequest {
+                        package_id: existing.package_id,
+                        name: existing.name,
+                        repo,
+                        tags: existing.tags,
+                        managed: false,
+                        resolved,
+                    },
+                )?;
+            }
+            normalize_dependency_ownership(stage_root, &profile_id, &mut record, &catalog)?;
+            reporter.stage("finalizing", "Saving the reviewed mod update batch");
             stage_store
                 .save(&record)
                 .map_err(|error| error.to_string())?;
@@ -4053,13 +4385,6 @@ fn apply_lobby_code_impl(
         .collect();
     validate_authoritative_dependencies(&catalog, &selected)?;
     let included_dependencies = selected_dependencies(&catalog, &selected)?;
-    let ordered = if selected.is_empty() {
-        Vec::new()
-    } else {
-        deps::resolve(&catalog, &selected)
-            .map_err(|error| error.to_string())?
-            .ordered
-    };
     let http = ProgressHttp::new(http()?, reporter.clone());
     let root = settings::profiles_root();
     profile_transaction(&root, &id, |stage_root, stage_store| {
@@ -4082,7 +4407,7 @@ fn apply_lobby_code_impl(
             id: id.clone(),
             name: display.clone(),
             crew_color: "#ffd23f".to_string(),
-            game_build: manifest.game_build.clone(),
+            game_build: None,
             game_instance_id: game_instance_id.clone(),
             mods: Vec::new(),
             levelimposter_maps: Vec::new(),
@@ -4095,7 +4420,7 @@ fn apply_lobby_code_impl(
         }
         record.mods.clear();
         record.name = display.clone();
-        record.game_build = manifest.game_build.clone();
+        record.game_build = None;
         record.game_instance_id = game_instance_id.clone();
         let install = InstallContext {
             stage_root,
@@ -4104,26 +4429,21 @@ fn apply_lobby_code_impl(
             catalog: &catalog,
             arch: &arch,
         };
-        for dependency in ordered.iter().filter(|id| {
-            !manifest
-                .mods
-                .iter()
-                .any(|manifest_mod| id.eq_ignore_ascii_case(&manifest_mod.id))
-        }) {
-            install_catalog_latest(&install, &mut record, dependency, true)?;
-        }
         for manifest_mod in &manifest.mods {
-            let repo = catalog_entry_for(&catalog, &manifest_mod.id)
+            let entry = catalog_entry_for(&catalog, &manifest_mod.id);
+            let repo = entry
                 .and_then(|entry| entry.repo.clone())
                 .or_else(|| resolver::parse_repo(&manifest_mod.id))
                 .ok_or_else(|| format!("cannot resolve source for {}", manifest_mod.id))?;
-            let entry = catalog_entry_for(&catalog, &manifest_mod.id);
             let rules = entry
                 .map(|entry| entry.asset_rules.clone())
                 .unwrap_or_else(default_rules);
-            let resolved = resolver::resolve_tag(&http, &repo, &manifest_mod.v, &rules, &arch)
-                .map_err(|error| error.to_string())?;
-            enforce_lobby_asset_choice(manifest_mod.asset.as_deref(), &resolved)?;
+            let resolved = if let Some(asset) = manifest_mod.asset.as_deref() {
+                selected_release_asset(&http, &repo, &manifest_mod.v, asset, Some(&rules), &arch)?
+            } else {
+                resolver::resolve_tag(&http, &repo, &manifest_mod.v, &rules, &arch)
+                    .map_err(|error| error.to_string())?
+            };
             install_record(
                 &install,
                 &mut record,
@@ -4160,8 +4480,15 @@ fn apply_lobby_code_impl(
                 installed.managed = false;
                 continue;
             }
-            let resolved = selected_release_asset(&http, &repo, &personal.tag, &personal.asset)?;
             let entry = catalog_entry_for(&catalog, &repo);
+            let resolved = selected_release_asset(
+                &http,
+                &repo,
+                &personal.tag,
+                &personal.asset,
+                entry.map(|entry| &entry.asset_rules),
+                &arch,
+            )?;
             install_record(
                 &install,
                 &mut record,
@@ -4178,6 +4505,13 @@ fn apply_lobby_code_impl(
                     resolved,
                 },
             )?;
+        }
+        for local in settings
+            .personal_local_mods
+            .iter()
+            .filter(|local| local.enabled)
+        {
+            install_local_mod_into_record(stage_root, &id, &mut record, Path::new(&local.path))?;
         }
         reporter.stage(
             "finalizing",
@@ -4336,18 +4670,69 @@ fn protected_install_hint(game_dir: &Path) -> Option<String> {
     }
 }
 
+fn sync_tou_cosmetics(
+    profiles_root: &Path,
+    profile_id: &str,
+    game_dir: &Path,
+    arch: &str,
+) -> Result<(), String> {
+    let profile = ProfileStore::new(profiles_root)
+        .load(profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("profile not found")?;
+    let plugins = game_dir.join("BepInEx").join("plugins");
+    let Some(version) = tou_cosmetics::active_version(&profile) else {
+        return tou_cosmetics::remove_managed_files(&plugins).map_err(|error| error.to_string());
+    };
+    if tou_cosmetics::installation_is_current(&plugins, version)
+        .map_err(|error| format!("Could not verify Town of Us cosmetics: {error}"))?
+    {
+        return Ok(());
+    }
+
+    let store = launch_store(game_dir)?;
+    let http = http()?;
+    let release = resolver::fetch_release_by_tag(&http, tou_cosmetics::PACKAGE_ID, version)
+        .and_then(|release| resolver::hydrate_release_assets(&http, release))
+        .map_err(|error| format!("Could not resolve Town of Us cosmetics: {error}"))?;
+    let resolved = tou_cosmetics::select_release_pack(&release, arch, store)
+        .map_err(|error| error.to_string())?;
+    log::info!(
+        "provisioning Town of Us cosmetics {} from {}",
+        version,
+        resolved.asset_name
+    );
+    let archive = download_resolved(&http, &resolved)
+        .map_err(|error| format!("Could not download Town of Us cosmetics: {error}"))?;
+    let payload = tou_cosmetics::extract_release_pack(&archive, version, &resolved.asset_name)
+        .map_err(|error| error.to_string())?;
+
+    game_is_stopped()?;
+    atomic_write(&plugins.join(tou_cosmetics::BUNDLE_NAME), &payload.bundle)?;
+    atomic_write(&plugins.join(tou_cosmetics::CATALOG_NAME), &payload.catalog)?;
+    atomic_write(&plugins.join(tou_cosmetics::MARKER_NAME), &payload.marker)?;
+    if !tou_cosmetics::installation_is_current(&plugins, version)
+        .map_err(|error| format!("Could not verify installed Town of Us cosmetics: {error}"))?
+    {
+        return Err("Installed Town of Us cosmetics failed verification.".into());
+    }
+    Ok(())
+}
+
 fn prepare_profile(game_path: &str, profile_id: &str) -> Result<Option<String>, String> {
     game_is_stopped()?;
     let game_dir = validate_game_target(game_path, Some(profile_id))?;
     let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
         .map(arch_str)
         .ok_or("Among Us executable architecture is unsupported")?;
-    with_profile_layout(&settings::profiles_root(), profile_id, || {
+    let profiles_root = settings::profiles_root();
+    with_profile_layout(&profiles_root, profile_id, || {
         game_artifact_transaction(&game_dir, || {
             restore_doorstop(&game_dir)?;
             game_is_stopped()?;
-            loader::sync_profile_plugins(&settings::profiles_root(), profile_id, &game_dir)
+            loader::sync_profile_plugins(&profiles_root, profile_id, &game_dir)
                 .map_err(|error| error.to_string())?;
+            sync_tou_cosmetics(&profiles_root, profile_id, &game_dir, &arch)?;
             loader::sync_levelimposter_maps(&settings::profiles_root(), profile_id, &game_dir)
                 .map_err(|error| error.to_string())?;
             ensure_loader_impl(game_path, profile_id, &arch)?;
@@ -4618,8 +5003,10 @@ fn launch_prepared_game(game_dir: &Path) -> Result<(), String> {
         prepare_epic_auth_stores(game_dir, &context)?;
         if cfg!(windows) {
             return spawn_launch(|| {
-                process::launch_console_interactive(&starter, game_dir)
-                    .map_err(|error| format!("couldn't run EpicGamesStarter: {error}"))
+                let helper_pid = process::launch_console_interactive(&starter, game_dir)
+                    .map_err(|error| format!("couldn't run EpicGamesStarter: {error}"))?;
+                crate::console_monitor::start(helper_pid)
+                    .map_err(|error| format!("couldn't monitor EpicGamesStarter: {error}"))
             });
         }
         let specification = compat::build_program_spec(&starter, game_dir, &context);
@@ -4628,6 +5015,20 @@ fn launch_prepared_game(game_dir: &Path) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|error| launch_err_msg(&context, &error))
         });
+    }
+    if store == Store::Msstore {
+        if !game::is_writable_game_dir(game_dir) {
+            return Err(
+                "Microsoft Store/Game Pass installs must be launched from a writable managed copy. Create one in Settings first."
+                    .into(),
+            );
+        }
+        if game::exe_arch(&game_dir.join(process::GAME_EXE)) != Some(Arch::X64) {
+            return Err(
+                "This saved Microsoft Store instance is not the expected x64 Among Us build. Re-detect the game or create a fresh managed copy."
+                    .into(),
+            );
+        }
     }
     let specification = compat::build_launch_spec(game_dir, &context);
     spawn_launch(|| {
@@ -4660,6 +5061,569 @@ pub async fn launch_vanilla(game_path: String) -> Result<(), String> {
     .await
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveBackupInfo {
+    pub id: String,
+    pub created_at: u64,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+fn unix_millis() -> Result<u64, String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| "system timestamp is too large".to_string())
+}
+
+fn innersloth_save_dir() -> Result<PathBuf, String> {
+    let local = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or("Windows LOCALAPPDATA is unavailable; save data cannot be located.")?;
+    let local_low = local
+        .parent()
+        .ok_or("Windows LOCALAPPDATA has no parent directory.")?
+        .join("LocalLow");
+    Ok(local_low.join("Innersloth").join("Among Us"))
+}
+
+fn save_backups_root() -> PathBuf {
+    settings::app_data_dir().join("backups").join("save-data")
+}
+
+fn create_save_backup_impl() -> Result<SaveBackupInfo, String> {
+    let source = innersloth_save_dir()?;
+    let metadata = fs::symlink_metadata(&source).map_err(|error| {
+        format!(
+            "Among Us save data was not found at {}: {error}",
+            source.display()
+        )
+    })?;
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err("The Among Us save-data folder is not a safe regular directory.".into());
+    }
+    let created_at = unix_millis()?;
+    let id = format!(
+        "{created_at}-{}",
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let root = save_backups_root();
+    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    let destination = root.join(&id);
+    let stage = root.join(format!(".stage-{id}"));
+    let result = (|| {
+        fs::create_dir(&stage).map_err(|error| error.to_string())?;
+        let mut files = 0;
+        let mut bytes = 0;
+        copy_game_tree(&source, &stage.join("data"), &mut files, &mut bytes)?;
+        let info = SaveBackupInfo {
+            id: id.clone(),
+            created_at,
+            files,
+            bytes,
+        };
+        let manifest = serde_json::to_vec_pretty(&info).map_err(|error| error.to_string())?;
+        atomic_write(&stage.join("manifest.json"), &manifest)?;
+        fs::rename(&stage, &destination).map_err(|error| error.to_string())?;
+        Ok(info)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn backup_save_data() -> Result<SaveBackupInfo, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        game_is_stopped()?;
+        let backup = create_save_backup_impl()?;
+        if let Err(error) = prune_save_backups() {
+            log::warn!("created save backup but could not prune old backups: {error}");
+        }
+        Ok(backup)
+    })
+    .await
+}
+
+fn prune_save_backups() -> Result<(), String> {
+    let root = save_backups_root();
+    let mut backups = list_save_backups_impl()?;
+    if backups.len() <= 25 {
+        return Ok(());
+    }
+    backups.sort_by_key(|backup| backup.created_at);
+    let excess = backups.len().saturating_sub(25);
+    for backup in backups.into_iter().take(excess) {
+        let path = root.join(backup.id);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if is_reparse(&metadata) || !metadata.is_dir() {
+            return Err("A save-backup path is not a safe regular directory.".into());
+        }
+        fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn list_save_backups_impl() -> Result<Vec<SaveBackupInfo>, String> {
+    let root = save_backups_root();
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut backups = Vec::new();
+    for entry in entries.take(256) {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        if is_reparse(&metadata) || !metadata.is_dir() {
+            continue;
+        }
+        let Some(bytes) = read_bounded(&entry.path().join("manifest.json"), 64 * 1024)? else {
+            continue;
+        };
+        let info: SaveBackupInfo =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if info.id == entry.file_name().to_string_lossy() {
+            backups.push(info);
+        }
+    }
+    backups.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(backups)
+}
+
+#[tauri::command]
+pub async fn list_save_backups() -> Result<Vec<SaveBackupInfo>, String> {
+    blocking(list_save_backups_impl).await
+}
+
+#[tauri::command]
+pub async fn restore_save_data(backup_id: String) -> Result<SaveBackupInfo, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        game_is_stopped()?;
+        if backup_id.is_empty()
+            || backup_id.len() > 64
+            || !backup_id
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '-')
+        {
+            return Err("Invalid save backup id.".into());
+        }
+        let backup = list_save_backups_impl()?
+            .into_iter()
+            .find(|backup| backup.id == backup_id)
+            .ok_or("Save backup was not found.")?;
+        let backup_data = save_backups_root().join(&backup.id).join("data");
+        let backup_metadata =
+            fs::symlink_metadata(&backup_data).map_err(|error| error.to_string())?;
+        if is_reparse(&backup_metadata) || !backup_metadata.is_dir() {
+            return Err("Save backup data is not a safe regular directory.".into());
+        }
+
+        let target = innersloth_save_dir()?;
+        let parent = target
+            .parent()
+            .ok_or("Among Us save-data folder has no parent directory.")?;
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let safety_backup = if target.is_dir() {
+            Some(create_save_backup_impl()?)
+        } else {
+            None
+        };
+        let stage = unique_sibling(&target, "restore")?;
+        let rollback = unique_sibling(&target, "rollback")?;
+        let mut files = 0;
+        let mut bytes = 0;
+        if let Err(error) = copy_game_tree(&backup_data, &stage, &mut files, &mut bytes) {
+            let _ = fs::remove_dir_all(&stage);
+            return Err(error);
+        }
+        let had_target = target.exists();
+        if had_target {
+            let metadata = fs::symlink_metadata(&target).map_err(|error| error.to_string())?;
+            if is_reparse(&metadata) || !metadata.is_dir() {
+                let _ = fs::remove_dir_all(&stage);
+                return Err("Current save data is not a safe regular directory.".into());
+            }
+            fs::rename(&target, &rollback).map_err(|error| error.to_string())?;
+        }
+        if let Err(error) = fs::rename(&stage, &target) {
+            if had_target {
+                let _ = fs::rename(&rollback, &target);
+            }
+            let _ = fs::remove_dir_all(&stage);
+            return Err(format!("Could not publish restored save data: {error}"));
+        }
+        if had_target {
+            if let Err(error) = fs::remove_dir_all(&rollback) {
+                log::warn!("restored save data but could not remove rollback folder: {error}");
+            }
+        }
+        if let Err(error) = prune_save_backups() {
+            log::warn!("restored save data but could not prune old backups: {error}");
+        }
+        Ok(safety_backup.unwrap_or(backup))
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticGame {
+    pub name: String,
+    pub store: Store,
+    pub arch: Arch,
+    pub runtime: Runtime,
+    pub build: Option<String>,
+    pub writable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticLoader {
+    pub current: bool,
+    pub installed_version: Option<String>,
+    pub winhttp: bool,
+    pub preloader: bool,
+    pub dotnet: bool,
+    pub profile_plugins: usize,
+    pub game_plugins: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticAsset {
+    pub name: String,
+    pub version: String,
+    pub file: Option<String>,
+    pub enabled: bool,
+    pub source: ModSource,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsReport {
+    pub generated_at: u64,
+    pub app_version: String,
+    pub profile_name: Option<String>,
+    pub game: Option<DiagnosticGame>,
+    pub loader: Option<DiagnosticLoader>,
+    pub assets: Vec<DiagnosticAsset>,
+    pub log_errors: Vec<String>,
+    pub game_running: Option<bool>,
+    pub warnings: Vec<String>,
+}
+
+fn count_dll_files(directory: &Path) -> Result<usize, String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut count = 0;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        if !is_reparse(&metadata)
+            && metadata.is_file()
+            && entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn redact_sensitive(mut text: String, saved: &Settings) -> String {
+    for path in saved
+        .game_instances
+        .iter()
+        .map(|instance| instance.path.as_str())
+        .chain(
+            saved
+                .personal_local_mods
+                .iter()
+                .map(|local| local.path.as_str()),
+        )
+    {
+        if !path.is_empty() {
+            text = text.replace(path, "<redacted-path>");
+        }
+    }
+    for variable in ["USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA"] {
+        if let Some(path) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+            text = text.replace(&path.to_string_lossy().to_string(), "<redacted-user-path>");
+        }
+    }
+    let token =
+        regex::Regex::new(r"(?i)\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})\b")
+            .expect("static token regex");
+    token.replace_all(&text, "<redacted-token>").into_owned()
+}
+
+fn recent_log_errors(game_dir: &Path, saved: &Settings) -> Result<Vec<String>, String> {
+    const MAX_LOG_TAIL: u64 = 2 * 1024 * 1024;
+    let path = game_dir.join("BepInEx").join("LogOutput.log");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err("BepInEx LogOutput.log is not a safe regular file.".into());
+    }
+    let mut file = File::open(&path).map_err(|error| error.to_string())?;
+    if metadata.len() > MAX_LOG_TAIL {
+        file.seek(SeekFrom::End(-(MAX_LOG_TAIL as i64)))
+            .map_err(|error| error.to_string())?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut errors: Vec<String> = text
+        .lines()
+        .filter(|line| {
+            let folded = line.to_ascii_lowercase();
+            folded.contains("[error") || folded.contains("exception")
+        })
+        .map(|line| redact_sensitive(line.trim().to_string(), saved))
+        .collect();
+    if errors.len() > 50 {
+        errors.drain(..errors.len() - 50);
+    }
+    Ok(errors)
+}
+
+fn diagnostics_report_impl(profile_id: Option<&str>) -> Result<DiagnosticsReport, String> {
+    if let Some(profile_id) = profile_id {
+        validate_profile_id(profile_id)?;
+    }
+    let saved = settings::load().map_err(|error| error.to_string())?;
+    let profile_store = recovered_profile_store(&settings::profiles_root())?;
+    let profile = match profile_id {
+        Some(profile_id) => profile_store
+            .load(profile_id)
+            .map_err(|error| error.to_string())?,
+        None => None,
+    };
+    let instance = profile
+        .as_ref()
+        .and_then(|profile| profile.game_instance_id.as_deref())
+        .and_then(|id| {
+            saved
+                .game_instances
+                .iter()
+                .find(|instance| instance.id == id)
+        })
+        .or_else(|| saved.game_instances.first());
+    let mut warnings = Vec::new();
+    let mut loader_status = None;
+    let mut log_errors = Vec::new();
+    let game_status = if let Some(instance) = instance {
+        match canonical_game_path(Path::new(&instance.path)) {
+            Ok(game_dir) => {
+                let build = game::detect_build(&game_dir);
+                let writable = game::is_writable_game_dir(&game_dir);
+                if !writable {
+                    warnings.push(
+                        "This game folder is not writable; create a managed Microsoft Store copy."
+                            .to_string(),
+                    );
+                }
+                if let Some(profile) = profile.as_ref() {
+                    let profile_dir = profile_store
+                        .profile_dir(&profile.id)
+                        .map_err(|error| error.to_string())?;
+                    loader_status = Some(DiagnosticLoader {
+                        current: loader::has_loader(&game_dir),
+                        installed_version: loader::installed_version(&game_dir),
+                        winhttp: game_dir.join("winhttp.dll").is_file(),
+                        preloader: game_dir
+                            .join("BepInEx")
+                            .join("core")
+                            .join(loader::IL2CPP_PRELOADER)
+                            .is_file(),
+                        dotnet: game_dir.join("dotnet").join("coreclr.dll").is_file(),
+                        profile_plugins: count_dll_files(
+                            &profile_dir.join("BepInEx").join("plugins"),
+                        )?,
+                        game_plugins: count_dll_files(&game_dir.join("BepInEx").join("plugins"))?,
+                    });
+                }
+                log_errors = recent_log_errors(&game_dir, &saved)?;
+                Some(DiagnosticGame {
+                    name: instance.name.clone(),
+                    store: instance.store,
+                    arch: instance.arch,
+                    runtime: instance.runtime,
+                    build,
+                    writable,
+                })
+            }
+            Err(error) => {
+                warnings.push(error);
+                None
+            }
+        }
+    } else {
+        warnings.push("No Among Us instance is configured.".to_string());
+        None
+    };
+    if let Some(loader) = loader_status.as_ref() {
+        if !loader.current || !loader.winhttp || !loader.preloader || !loader.dotnet {
+            warnings.push("BepInEx is incomplete or not current for this game folder.".to_string());
+        }
+    }
+    let game_running = match process::try_is_running() {
+        Ok(running) => Some(running),
+        Err(error) => {
+            warnings.push(format!("Could not check the Among Us process: {error}"));
+            None
+        }
+    };
+    let assets = profile
+        .as_ref()
+        .map(|profile| {
+            profile
+                .mods
+                .iter()
+                .map(|asset| DiagnosticAsset {
+                    name: asset.name.clone(),
+                    version: asset.version.clone(),
+                    file: asset.file.clone(),
+                    enabled: asset.enabled,
+                    source: asset.source,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(DiagnosticsReport {
+        generated_at: unix_millis()?,
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        profile_name: profile.as_ref().map(|profile| profile.name.clone()),
+        game: game_status,
+        loader: loader_status,
+        assets,
+        log_errors,
+        game_running,
+        warnings,
+    })
+}
+
+#[tauri::command]
+pub async fn collect_diagnostics(profile_id: Option<String>) -> Result<DiagnosticsReport, String> {
+    blocking(move || diagnostics_report_impl(profile_id.as_deref())).await
+}
+
+#[tauri::command]
+pub async fn export_support_bundle(
+    destination: String,
+    profile_id: Option<String>,
+) -> Result<String, String> {
+    blocking(move || {
+        let path = PathBuf::from(&destination);
+        if !path.is_absolute()
+            || path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_none_or(|extension| !extension.eq_ignore_ascii_case("zip"))
+        {
+            return Err("Choose an absolute .zip destination for the support bundle.".into());
+        }
+        let report = diagnostics_report_impl(profile_id.as_deref())?;
+        let saved = settings::load().map_err(|error| error.to_string())?;
+        let mut redacted_settings =
+            serde_json::to_value(&saved).map_err(|error| error.to_string())?;
+        if let Some(instances) = redacted_settings
+            .get_mut("gameInstances")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for instance in instances {
+                if let Some(object) = instance.as_object_mut() {
+                    object.insert(
+                        "path".to_string(),
+                        serde_json::Value::String("<redacted-game-path>".to_string()),
+                    );
+                }
+            }
+        }
+        if let Some(locals) = redacted_settings
+            .get_mut("personalLocalMods")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for local in locals {
+                if let Some(object) = local.as_object_mut() {
+                    object.insert(
+                        "path".to_string(),
+                        serde_json::Value::String("<redacted-local-mod-path>".to_string()),
+                    );
+                }
+            }
+        }
+        let profile = match profile_id.as_deref() {
+            Some(profile_id) => recovered_profile_store(&settings::profiles_root())?
+                .load(profile_id)
+                .map_err(|error| error.to_string())?,
+            None => None,
+        };
+        let temporary = unique_sibling(&path, "support")?;
+        let result = (|| {
+            let output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| error.to_string())?;
+            let mut archive = zip::ZipWriter::new(output);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            archive
+                .start_file("diagnostics.json", options)
+                .map_err(|error| error.to_string())?;
+            archive
+                .write_all(&serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+            archive
+                .start_file("settings-redacted.json", options)
+                .map_err(|error| error.to_string())?;
+            archive
+                .write_all(
+                    &serde_json::to_vec_pretty(&redacted_settings)
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+            if let Some(profile) = profile {
+                archive
+                    .start_file("profile.json", options)
+                    .map_err(|error| error.to_string())?;
+                archive
+                    .write_all(
+                        &serde_json::to_vec_pretty(&profile).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            let output = archive.finish().map_err(|error| error.to_string())?;
+            output.sync_all().map_err(|error| error.to_string())?;
+            atomic_replace_file(&temporary, &path).map_err(|error| error.to_string())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateInfo {
@@ -4672,22 +5636,19 @@ const REPO_SLUG: &str = "artriy/Perfect-Sync";
 #[tauri::command]
 pub async fn check_update() -> Result<Option<UpdateInfo>, String> {
     blocking(|| {
-        let api = format!("https://api.github.com/repos/{REPO_SLUG}/releases?per_page=1");
-        let text = http()?.get_text(&api).map_err(|error| error.to_string())?;
-        let releases: serde_json::Value =
-            serde_json::from_str(&text).map_err(|error| error.to_string())?;
-        let release = releases.get(0).ok_or("no releases")?;
-        let tag = release["tag_name"]
-            .as_str()
-            .filter(|tag| !tag.is_empty())
-            .ok_or("no release tag")?;
-        if !perfect_sync_core::version::is_newer(tag, env!("CARGO_PKG_VERSION")) {
+        let release = resolver::fetch_latest_release(&http()?, REPO_SLUG)
+            .map_err(|error| error.to_string())?;
+        let tag = release.tag;
+        if !perfect_sync_core::version::is_newer(&tag, env!("CARGO_PKG_VERSION")) {
             return Ok(None);
         }
-        let url = release["html_url"]
-            .as_str()
-            .ok_or("release has no canonical GitHub URL")?
-            .to_string();
+        let mut release_url = url::Url::parse(&format!("https://github.com/{REPO_SLUG}"))
+            .map_err(|error| error.to_string())?;
+        release_url
+            .path_segments_mut()
+            .map_err(|_| "invalid release base URL")?
+            .extend(["releases", "tag", tag.as_str()]);
+        let url = release_url.to_string();
         validate_release_url(&url)?;
         Ok(Some(UpdateInfo {
             version: tag.trim_start_matches('v').to_string(),
@@ -4981,6 +5942,7 @@ mod tests {
             profile,
             &DownloadHttp(b"short"),
             &resolved_download(6, None),
+            None,
         )
         .unwrap_err();
         assert!(size_error.contains("download size mismatch"));
@@ -4993,6 +5955,7 @@ mod tests {
                 4,
                 Some("sha256:770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c"),
             ),
+            None,
         )
         .unwrap_err();
         assert!(digest_error.contains("SHA-256 digest"));
@@ -5007,8 +5970,8 @@ mod tests {
         let mut zip = resolved_download(4, None);
         zip.asset_name = "mod.zip".into();
         assert_eq!(
-            install_resolved(temp.path(), profile, &DownloadHttp(b"data"), &zip),
-            Err("Only .dll mod files can be installed.".into())
+            install_resolved(temp.path(), profile, &DownloadHttp(b"data"), &zip, None),
+            Err("Catalog ZIP installs require an exact declared DLL name. Pick a DLL file manually.".into())
         );
     }
 
@@ -5046,12 +6009,10 @@ mod tests {
             .unwrap(),
             b"local-dll"
         );
-        assert!(ensure_profile_shareable(&installed)
-            .unwrap_err()
-            .contains("cannot be shared"));
+        assert!(profile::to_manifest(&installed).mods.is_empty());
         let mut disabled = installed.clone();
         disabled.mods[0].enabled = false;
-        ensure_profile_shareable(&disabled).unwrap();
+        assert!(profile::to_manifest(&disabled).mods.is_empty());
 
         let archive = temp.path().join("mod.zip");
         fs::write(&archive, b"not-a-dll").unwrap();
@@ -5080,6 +6041,38 @@ mod tests {
         assert!(is_managed_dependency(&root, "NuclearPowered/Reactor"));
         assert!(is_managed_dependency(&root, "All-Of-Us-Mods/MiraAPI"));
         assert!(!is_managed_dependency(&root, &root));
+    }
+
+    #[test]
+    fn bundled_catalog_allows_user_selected_role_mod_combinations() {
+        let catalog = bundled_catalog();
+        validate_authoritative_dependencies(
+            &catalog,
+            &[
+                "AU-Avengers/TOU-Mira".into(),
+                "TheOtherRolesAU/TheOtherRoles".into(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bundled_catalog_exposes_the_expanded_verified_mod_set() {
+        let catalog = bundled_catalog();
+        assert_eq!(catalog.mods.len(), 30);
+        for id in [
+            "D1GQ/BetterAmongUs",
+            "xChipseq/VanillaEnhancements",
+            "Mr-Fluuff/StellarRolesAU",
+            "SuperNewRoles/SuperNewRoles",
+            "CallOfCreator/NewMod",
+            "RaresHonour/HostGuard",
+            "AtomicTyler1/MinimumLevel",
+        ] {
+            let entry = catalog.get(id).unwrap_or_else(|| panic!("missing {id}"));
+            assert!(entry.repo.is_some());
+            assert!(entry.asset_rules.dll_name.is_some());
+        }
     }
 
     #[test]
@@ -5707,6 +6700,37 @@ mod tests {
                 .starts_with(".perfectsync-write-test-")
         }));
     }
+
+    #[test]
+    fn managed_game_copy_preserves_tree_and_skips_internal_work_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("managed");
+        fs::create_dir_all(source.join("Among Us_Data")).unwrap();
+        fs::write(source.join(process::GAME_EXE), b"MZ").unwrap();
+        fs::write(
+            source.join("Among Us_Data/globalgamemanagers"),
+            b"game-data",
+        )
+        .unwrap();
+        fs::write(source.join(".perfectsync-stage-stale"), b"stale").unwrap();
+        let mut files = 0;
+        let mut bytes = 0;
+
+        copy_game_tree(&source, &destination, &mut files, &mut bytes).unwrap();
+
+        assert_eq!(files, 2);
+        assert_eq!(bytes, 11);
+        assert_eq!(
+            fs::read(destination.join(process::GAME_EXE)).unwrap(),
+            b"MZ"
+        );
+        assert_eq!(
+            fs::read(destination.join("Among Us_Data/globalgamemanagers")).unwrap(),
+            b"game-data"
+        );
+        assert!(!destination.join(".perfectsync-stage-stale").exists());
+    }
     #[test]
     fn nonexistent_profile_loader_preflight_creates_no_layout_or_record() {
         use std::cell::Cell;
@@ -5793,9 +6817,9 @@ mod tests {
     }
 
     #[test]
-    fn required_explicit_dependency_cannot_be_disabled_and_remove_retains_it_managed() {
+    fn managed_dependency_can_be_disabled_and_removed_by_user_choice() {
         let temp = tempfile::tempdir().unwrap();
-        let profile_id = "required-dependency";
+        let profile_id = "user-managed-dependency";
         let installed = |id: &str, file: &str| InstalledMod {
             package_id: id.into(),
             name: id.into(),
@@ -5814,7 +6838,7 @@ mod tests {
         profile::set_plugin_enabled(temp.path(), profile_id, "Reactor.dll", false).unwrap();
         let mut record = ProfileRecord {
             id: profile_id.into(),
-            name: "Required dependency".into(),
+            name: "User-managed dependency".into(),
             crew_color: "#fff".into(),
             game_build: None,
             game_instance_id: None,
@@ -5822,6 +6846,7 @@ mod tests {
                 installed("AU-Avengers/TOU-Mira", "Tou.dll"),
                 InstalledMod {
                     enabled: false,
+                    managed: true,
                     ..installed("NuclearPowered/Reactor", "Reactor.dll")
                 },
             ],
@@ -5829,9 +6854,10 @@ mod tests {
         };
         let catalog = bundled_catalog();
 
-        let toggle =
-            validate_mod_toggle(&record, &catalog, "NuclearPowered/Reactor", false).unwrap_err();
-        assert!(toggle.contains("required by another explicit root"));
+        assert_eq!(
+            validate_mod_toggle(&record, "NuclearPowered/Reactor").unwrap(),
+            1
+        );
         remove_mod_from_record(
             temp.path(),
             profile_id,
@@ -5841,18 +6867,19 @@ mod tests {
         )
         .unwrap();
 
-        let reactor = record
+        assert!(record
             .mods
             .iter()
-            .find(|installed| installed.package_id == "NuclearPowered/Reactor")
-            .unwrap();
-        assert!(reactor.managed);
-        assert!(reactor.enabled);
-        assert!(temp
+            .all(|installed| installed.package_id != "NuclearPowered/Reactor"));
+        assert!(record
+            .mods
+            .iter()
+            .any(|installed| installed.package_id == "AU-Avengers/TOU-Mira"));
+        assert!(!temp
             .path()
             .join(profile_id)
             .join("BepInEx/plugins/Reactor.dll")
-            .is_file());
+            .exists());
         assert!(!temp
             .path()
             .join(profile_id)
@@ -5949,21 +6976,5 @@ mod tests {
         assert!(require_manual_install_confirmation(true).is_ok());
         let error = require_manual_install_confirmation(false).unwrap_err();
         assert!(error.contains("repository, release tag, and asset"));
-    }
-
-    #[test]
-    fn lobby_asset_must_match_the_architecture_selected_default() {
-        let default = ResolvedDownload {
-            url: "https://github.com/Owner/Repo/releases/download/v1/Repo-x86.dll".into(),
-            asset_name: "Repo-x86.dll".into(),
-            version: "v1".into(),
-            size: perfect_sync_core::resolver::AssetSize::new(1),
-        };
-        assert!(enforce_lobby_asset_choice(None, &default).is_ok());
-        assert!(enforce_lobby_asset_choice(Some("Repo-x86.dll"), &default).is_ok());
-        let error = enforce_lobby_asset_choice(Some("Repo-x64.dll"), &default).unwrap_err();
-        assert!(error.contains("Repo-x64.dll"));
-        assert!(error.contains("Repo-x86.dll"));
-        assert!(error.contains("Refusing"));
     }
 }

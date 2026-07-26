@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { CaretDown, DotsThree, GameController, PencilSimple, PlusCircle, ShareNetwork, Stack, TrashSimple } from "@phosphor-icons/react";
+import { ArrowsClockwise, CaretDown, DotsThree, GameController, PencilSimple, PlusCircle, ShareNetwork, Stack, TrashSimple } from "@phosphor-icons/react";
 import { ModRow } from "./ModRow";
 import { LaunchBar } from "./LaunchBar";
 import type { GameInstance, GameStatus, Profile, Trust } from "../lib/types";
@@ -16,6 +16,7 @@ interface MainPanelProps {
   onRemove: (modId: string) => Promise<void>;
   onPickRelease: (modId: string) => void;
   onShare: () => void;
+  onReviewUpdates: () => void;
   onRename: (name: string) => void;
   onDelete: () => Promise<void>;
   onLaunch: () => void;
@@ -98,14 +99,14 @@ export function MainPanel(props: MainPanelProps) {
   };
 
   return (
-    <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-      <div className="flex items-center gap-3 border-b border-white/[0.06] px-6 py-2.5">
-        <span className="text-[10.5px] font-medium tracking-[0.12em] text-ink-faint uppercase">
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden max-[720px]:overflow-visible">
+      <div className="flex items-center gap-3 border-b border-white/[0.06] px-6 py-2.5 max-[720px]:flex-wrap max-[720px]:px-3">
+        <span className="text-[12px] font-medium tracking-[0.1em] text-ink-faint uppercase">
           Among Us instance
         </span>
         {selectedGame ? (
           <>
-            <label className="glass relative flex max-w-[360px] min-w-0 flex-1 items-center gap-2 rounded-lg px-2.5 py-1.5">
+            <label className="glass relative flex max-w-[360px] min-w-0 flex-1 items-center gap-2 rounded-lg px-2.5 py-1.5 max-[720px]:max-w-none">
               <GameController size={14} className="shrink-0 text-accent-2" />
               <select
                 value={selectedGame.id}
@@ -124,7 +125,7 @@ export function MainPanel(props: MainPanelProps) {
               <CaretDown size={12} weight="bold" className="pointer-events-none absolute right-2.5 text-ink-faint" />
             </label>
             <span
-              className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-ink-faint"
+              className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink-faint max-[720px]:basis-full"
               title={displayPath(selectedGame.path)}
             >
               {displayPath(selectedGame.path)}
@@ -141,7 +142,7 @@ export function MainPanel(props: MainPanelProps) {
           </button>
         )}
       </div>
-      <div className="flex min-w-0 items-end gap-3 px-6 pt-5 pb-3">
+      <div className="flex min-w-0 items-end gap-3 px-6 pt-5 pb-3 max-[720px]:flex-wrap max-[720px]:px-3 max-[720px]:pt-4">
         <div className="min-w-0 flex-1">
           {renaming ? (
             <input
@@ -171,6 +172,18 @@ export function MainPanel(props: MainPanelProps) {
           </div>
         </div>
 
+
+        {updates > 0 && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={props.onReviewUpdates}
+            className="ring-focus flex shrink-0 items-center gap-1.5 rounded-xl bg-[#9b7bff]/14 px-3 py-2 text-[13px] font-semibold text-[#d4c6ff] transition-colors hover:bg-[#9b7bff]/22 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <ArrowsClockwise size={15} weight="bold" />
+            Review {updates} update{updates === 1 ? "" : "s"}
+          </button>
+        )}
 
         <button
           type="button"
@@ -234,7 +247,7 @@ export function MainPanel(props: MainPanelProps) {
         initial={reduce ? false : { opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
-        className="scroll-region flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-6 pb-4"
+        className="scroll-region flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-6 pb-4 max-[720px]:overflow-visible max-[720px]:px-3"
       >
         {userMods.length === 0 ? (
           <EmptyState onAddMod={props.onAddMod} busy={busy} />

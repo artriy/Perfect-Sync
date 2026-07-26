@@ -22,6 +22,7 @@ pub struct PreviewItem {
 #[serde(rename_all = "camelCase")]
 pub struct Preview {
     pub name: String,
+    pub game_build: Option<String>,
     pub items: Vec<PreviewItem>,
     pub levelimposter_maps: Vec<String>,
 }
@@ -55,7 +56,7 @@ pub fn preview(
                     row.from.clone().unwrap_or_default(),
                     row.to
                 ),
-                Action::Ok => format!("{}, already cached", row.to),
+                Action::Ok => format!("{}, already installed", row.to),
             };
             PreviewItem {
                 name,
@@ -70,10 +71,12 @@ pub fn preview(
             }
         })
         .collect();
+    let game_build = None;
     Ok(Preview {
         name: manifest
             .name
             .unwrap_or_else(|| "Imported lobby".to_string()),
+        game_build,
         levelimposter_maps: manifest.levelimposter_maps,
         items,
     })
@@ -118,10 +121,12 @@ mod tests {
         assert_eq!(p.items[0].name, "Town of Us - Mira");
         assert_eq!(p.items[0].action, Action::Change);
         assert_eq!(p.items[0].detail, "you have 1.6.2, lobby needs 1.6.3");
+        assert_eq!(p.items[0].to, "1.6.3");
         assert_eq!(
             p.items[0].asset.as_deref(),
             Some("TouMira-v1.6.3-x86-steam-itch.zip")
         );
+        assert!(p.game_build.is_none());
     }
 
     #[test]

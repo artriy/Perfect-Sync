@@ -79,13 +79,13 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
   useModalFocus(confirmOpen, confirmRef, closeConfirm);
 
   const requestRemoval = () => {
-    if (busy || mod.managed || removeInFlight.current) return;
+    if (busy || mod.tags.includes("loader") || removeInFlight.current) return;
     setRemoveError(null);
     setConfirmOpen(true);
   };
 
   const confirmRemoval = async () => {
-    if (busy || mod.managed || removeInFlight.current) return;
+    if (busy || mod.tags.includes("loader") || removeInFlight.current) return;
     removeInFlight.current = true;
     setRemoving(true);
     setRemoveError(null);
@@ -108,7 +108,7 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
         animate={{ opacity: mod.managed ? 0.72 : 1, y: 0 }}
         transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
         aria-busy={unavailable}
-        className="glass flex min-w-0 flex-wrap items-center gap-3.5 rounded-2xl px-3.5 py-3"
+        className="surface-row flex min-w-0 flex-wrap items-center gap-3.5 rounded-2xl px-3.5 py-3"
       >
         <span
           className="grid h-9 w-9 shrink-0 place-items-center rounded-[11px] text-[#0d0820]"
@@ -123,12 +123,12 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
             {mod.name}
           </div>
           {mod.managed ? (
-            <div className="truncate text-[12px] text-ink-faint" title={mod.file || undefined}>
-              {mod.tags.includes("loader") ? "Loader" : "Dependency"} · automatically managed
+            <div className="truncate text-[12.5px] text-ink-faint" title={mod.file || undefined}>
+              {mod.tags.includes("loader") ? "Loader" : "Auto-added dependency"}
               {mod.file ? ` · ${mod.file}` : ""}
             </div>
           ) : (
-            <div className="truncate text-[12px] text-ink-faint" title={mod.file || mod.repo}>
+            <div className="truncate text-[12.5px] text-ink-faint" title={mod.file || mod.repo}>
               {mod.file ? <span className="font-mono text-ink-dim">{mod.file}</span> : mod.repo}
             </div>
           )}
@@ -139,14 +139,19 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
           {trust && <TrustBadge trust={trust} compact />}
 
           {mod.update && !mod.managed && (
-            <span
-              className="flex min-w-0 max-w-56 items-center gap-1 rounded-lg border border-[rgba(255,210,63,0.35)] bg-[rgba(255,210,63,0.16)] px-2 py-1 text-[11.5px] font-medium text-[#ffe49a]"
-              aria-label={`Update available for ${mod.name}: ${mod.update}`}
-              title={mod.update}
+            <button
+              type="button"
+              onClick={() => {
+                if (!unavailable) onPickRelease();
+              }}
+              disabled={unavailable}
+              className="ring-focus flex min-w-0 max-w-56 items-center gap-1 rounded-lg border border-[rgba(255,210,63,0.35)] bg-[rgba(255,210,63,0.16)] px-2 py-1 text-[11.5px] font-semibold text-[#ffe49a] hover:bg-[rgba(255,210,63,0.24)] disabled:opacity-50"
+              aria-label={`Update ${mod.name} to version ${mod.update}`}
+              title={`Update to ${mod.update}`}
             >
               <ArrowUp size={11} weight="bold" className="shrink-0" aria-hidden="true" />
-              <span className="truncate">{mod.update}</span>
-            </span>
+              <span className="truncate">Update to {mod.update}</span>
+            </button>
           )}
 
           {busy && !mod.managed && (
@@ -207,7 +212,7 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
             </button>
           )}
 
-          {!mod.managed && (
+          {!mod.tags.includes("loader") && (
             <>
               <Toggle
                 on={mod.enabled}
@@ -228,9 +233,6 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
                 <TrashSimple size={16} aria-hidden="true" />
               </button>
             </>
-          )}
-          {mod.managed && !mod.tags.includes("loader") && (
-            <span className="sr-only">Enable and remove controls are unavailable because this dependency is automatically managed. Its installed version can still be changed.</span>
           )}
         </div>
       </motion.div>

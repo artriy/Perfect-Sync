@@ -22,8 +22,8 @@ pub struct DiffItem {
 /// `installed` is the set of (id, version) the user already has cached/installed.
 ///
 /// Repository identities are matched with GitHub's ASCII case-insensitivity.
-/// If local state contains duplicate logical identities, the first tuple wins,
-/// preserving the behavior of the former linear lookup deterministically.
+/// Version differences are changes because lobby codes reproduce the shared profile.
+/// If local state contains duplicate logical identities, the first tuple wins.
 pub fn diff(manifest: &LobbyManifest, installed: &[(String, String)]) -> Vec<DiffItem> {
     let mut installed_by_id = HashMap::with_capacity(installed.len());
     for (id, version) in installed {
@@ -42,7 +42,7 @@ pub fn diff(manifest: &LobbyManifest, installed: &[(String, String)]) -> Vec<Dif
                 .map(str::to_owned);
             let action = match &have {
                 None => Action::Install,
-                Some(v) if *v == m.v => Action::Ok,
+                Some(version) if *version == m.v => Action::Ok,
                 Some(_) => Action::Change,
             };
             DiffItem {
@@ -81,16 +81,16 @@ mod tests {
     }
 
     #[test]
-    fn classifies_install_change_ok() {
+    fn classifies_install_change_and_ok() {
         let m = man(&[("a", "1.0"), ("b", "2.0"), ("c", "3.0")]);
         let installed = vec![
             ("b".to_string(), "1.0".to_string()),
             ("c".to_string(), "3.0".to_string()),
         ];
         let d = diff(&m, &installed);
-        assert_eq!(d[0].action, Action::Install); // a not installed
-        assert_eq!(d[1].action, Action::Change); // b 1.0 -> 2.0
-        assert_eq!(d[2].action, Action::Ok); // c already 3.0
+        assert_eq!(d[0].action, Action::Install);
+        assert_eq!(d[1].action, Action::Change);
+        assert_eq!(d[2].action, Action::Ok);
         assert_eq!(d[1].from, Some("1.0".to_string()));
         assert_eq!(d[0].asset, None);
     }

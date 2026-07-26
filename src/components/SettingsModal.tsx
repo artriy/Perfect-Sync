@@ -5,16 +5,28 @@ import {
   CaretDown,
   CheckCircle,
   FolderOpen,
+  FileCode,
   GameController,
   GithubLogo,
+  HardDrives,
   Plus,
   TrashSimple,
   X,
   XCircle,
 } from "@phosphor-icons/react";
-import { inspectGame, loaderStatus, pickFolder, reinstallLoader, type LoaderStatus } from "../lib/bridge";
+import {
+  createManagedGameCopy,
+  inspectGame,
+  loaderStatus,
+  pickFolder,
+  pickLocalDll,
+  pickManagedCopyDestination,
+  reinstallLoader,
+  type LoaderStatus,
+} from "../lib/bridge";
 import { useModalFocus } from "../lib/useModalFocus";
 import { TrustBadge } from "./TrustBadge";
+import { ReleasePicker } from "./ReleasePicker";
 import type { GameInstance, GithubTokenAction, Settings, Store, Trust } from "../lib/types";
 import { displayPath } from "../lib/displayPath";
 
@@ -25,9 +37,6 @@ interface SettingsModalProps {
   profileGameInstanceId?: string;
   onClose: () => void;
   onSave: (settings: Settings, tokenAction: GithubTokenAction) => Promise<void>;
-  onAddPersonal: (repo: string, name: string) => Promise<void>;
-  onRemovePersonal: (repo: string) => Promise<void>;
-  onTogglePersonal: (repo: string, enabled: boolean) => Promise<void>;
   trustOf: (repo: string) => Trust;
 }
 
@@ -50,9 +59,6 @@ export function SettingsModal({
   profileGameInstanceId,
   onClose,
   onSave,
-  onAddPersonal,
-  onRemovePersonal,
-  onTogglePersonal,
   trustOf,
 }: SettingsModalProps) {
   const reduce = useReducedMotion();
@@ -61,13 +67,19 @@ export function SettingsModal({
   const [token, setToken] = useState("");
   const [tokenIntent, setTokenIntent] = useState<TokenIntent>("unchanged");
   const [instances, setInstances] = useState<GameInstance[]>(settings.gameInstances ?? []);
+  const [personalMods, setPersonalMods] = useState(settings.personalMods ?? []);
+  const [personalLocalMods, setPersonalLocalMods] = useState(settings.personalLocalMods ?? []);
+  const [personalPicker, setPersonalPicker] = useState<{
+    repo: string;
+    name: string;
+    currentVersion?: string;
+  } | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loaderView, setLoaderView] = useState<LoaderView>({ kind: "idle" });
   const [loaderRetry, setLoaderRetry] = useState(0);
   const [folderPending, setFolderPending] = useState(false);
   const [reinstalling, setReinstalling] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [personalPending, setPersonalPending] = useState<string | null>(null);
   const [draftError, setDraftError] = useState("");
   const [personalError, setPersonalError] = useState("");
   const [loaderNotice, setLoaderNotice] = useState<{ path: string; profileId: string; text: string } | null>(null);
@@ -83,7 +95,6 @@ export function SettingsModal({
   const installRequestRef = useRef(0);
   const reinstallPendingRef = useRef(false);
   const folderPendingRef = useRef(false);
-  const personalPendingRef = useRef<string | null>(null);
   const savePendingRef = useRef(false);
 
   const selected = instances.find((instance) => instance.id === selectedId) ?? null;
@@ -95,7 +106,7 @@ export function SettingsModal({
   latestOpenDataRef.current = { settings, profileGameInstanceId };
   selectedRef.current = selected;
 
-  const hasPendingWork = folderPending || reinstalling || saving || personalPending !== null;
+  const hasPendingWork = folderPending || reinstalling || saving;
   const canDismissRef = useRef(!hasPendingWork);
   canDismissRef.current = !hasPendingWork;
 
@@ -104,7 +115,6 @@ export function SettingsModal({
       canDismissRef.current &&
       !folderPendingRef.current &&
       !reinstallPendingRef.current &&
-      !personalPendingRef.current &&
       !savePendingRef.current
     ) closeRef.current();
   }, []);
@@ -118,6 +128,9 @@ export function SettingsModal({
       setToken("");
       setTokenIntent("unchanged");
       setInstances(next);
+      setPersonalMods(opening.settings.personalMods ?? []);
+      setPersonalLocalMods(opening.settings.personalLocalMods ?? []);
+      setPersonalPicker(null);
       setSelectedId(
         next.some((instance) => instance.id === opening.profileGameInstanceId)
           ? (opening.profileGameInstanceId ?? null)
@@ -127,14 +140,12 @@ export function SettingsModal({
       setFolderPending(false);
       setReinstalling(false);
       setSaving(false);
-      setPersonalPending(null);
       setDraftError("");
       setPersonalError("");
       setLoaderNotice(null);
       setPersonalUrl("");
       folderPendingRef.current = false;
       reinstallPendingRef.current = false;
-      personalPendingRef.current = null;
       savePendingRef.current = false;
     } else if (!open && wasOpenRef.current) {
       sessionRef.current += 1;
@@ -142,7 +153,6 @@ export function SettingsModal({
       installRequestRef.current += 1;
       folderPendingRef.current = false;
       reinstallPendingRef.current = false;
-      personalPendingRef.current = null;
       savePendingRef.current = false;
     }
     wasOpenRef.current = open;
@@ -206,6 +216,8 @@ export function SettingsModal({
           arch: game.arch,
           store: game.store,
           runtime: game.runtime ?? "native",
+          build: game.build,
+          writable: game.writable,
         };
         setSelectedId(instance.id);
         return [...current, instance];
@@ -234,7 +246,15 @@ export function SettingsModal({
       setInstances((current) =>
         current.map((instance) =>
           instance.id === targetId
-            ? { ...instance, path: game.path, arch: game.arch, store: game.store, runtime: game.runtime ?? "native" }
+            ? {
+                ...instance,
+                path: game.path,
+                arch: game.arch,
+                store: game.store,
+                runtime: game.runtime ?? "native",
+                build: game.build,
+                writable: game.writable,
+              }
             : instance,
         ),
       );
@@ -242,6 +262,76 @@ export function SettingsModal({
       if (sameSelectedSession(session, requestProfileId, targetId, originalPath, openRef, sessionRef, profileIdRef, selectedRef)) {
         setDraftError(errorMessage(error));
       }
+    } finally {
+      endFolderWork(session);
+    }
+  };
+
+  const createManagedCopy = async () => {
+    const target = selectedRef.current;
+    if (!target || target.store !== "msstore" || target.writable !== false || !beginFolderWork()) return;
+    const session = sessionRef.current;
+    const requestProfileId = profileIdRef.current;
+    const targetId = target.id;
+    const originalPath = target.path;
+    try {
+      const destination = await pickManagedCopyDestination();
+      if (
+        !destination ||
+        !sameSelectedSession(
+          session,
+          requestProfileId,
+          targetId,
+          originalPath,
+          openRef,
+          sessionRef,
+          profileIdRef,
+          selectedRef,
+        )
+      ) return;
+      const game = await createManagedGameCopy(originalPath, destination);
+      if (
+        !sameSelectedSession(
+          session,
+          requestProfileId,
+          targetId,
+          originalPath,
+          openRef,
+          sessionRef,
+          profileIdRef,
+          selectedRef,
+        )
+      ) return;
+      setInstances((current) =>
+        current.map((instance) =>
+          instance.id === targetId
+            ? {
+                ...instance,
+                name: instance.name.includes("managed") ? instance.name : `${instance.name} managed`,
+                path: game.path,
+                store: game.store,
+                arch: game.arch,
+                runtime: game.runtime ?? "native",
+                build: game.build,
+                writable: game.writable,
+              }
+            : instance,
+        ),
+      );
+      setLoaderRetry((value) => value + 1);
+    } catch (error) {
+      if (
+        sameSelectedSession(
+          session,
+          requestProfileId,
+          targetId,
+          originalPath,
+          openRef,
+          sessionRef,
+          profileIdRef,
+          selectedRef,
+        )
+      ) setDraftError(errorMessage(error));
     } finally {
       endFolderWork(session);
     }
@@ -288,47 +378,39 @@ export function SettingsModal({
     }
   };
 
-  const runPersonal = async (key: string, action: () => Promise<void>, clearInput = false) => {
-    if (personalPendingRef.current) return;
-    const session = sessionRef.current;
-    const requestProfileId = profileIdRef.current;
-    personalPendingRef.current = key;
-    setPersonalPending(key);
-    setPersonalError("");
-    try {
-      await action();
-      if (
-        !sameOpenSession(session, requestProfileId, openRef, sessionRef, profileIdRef) ||
-        personalPendingRef.current !== key
-      ) return;
-      if (clearInput) setPersonalUrl("");
-    } catch (error) {
-      if (
-        sameOpenSession(session, requestProfileId, openRef, sessionRef, profileIdRef) &&
-        personalPendingRef.current === key
-      ) {
-        setPersonalError(errorMessage(error));
-      }
-    } finally {
-      if (
-        openRef.current &&
-        sessionRef.current === session &&
-        personalPendingRef.current === key
-      ) {
-        personalPendingRef.current = null;
-        setPersonalPending(null);
-      }
-    }
-  };
 
   const submitPersonal = () => {
     const match = personalUrl.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
     const repo = (match ? `${match[1]}/${match[2]}` : personalUrl).trim().replace(/\.git$/i, "");
-    if (!repo) {
+    if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) {
       setPersonalError("Enter an owner/repository name or GitHub repository URL.");
       return;
     }
-    void runPersonal(`add:${repo}`, () => onAddPersonal(repo, match ? match[2].replace(/\.git$/i, "") : repo), true);
+    setPersonalError("");
+    setPersonalPicker({
+      repo,
+      name: match ? match[2].replace(/\.git$/i, "") : (repo.split("/").at(-1) ?? repo),
+    });
+  };
+
+  const addLocalLobbyDefault = async () => {
+    if (hasPendingWork) return;
+    try {
+      const path = await pickLocalDll();
+      if (!path) return;
+      if (personalLocalMods.some((candidate) => candidate.path.toLowerCase() === path.toLowerCase())) {
+        setPersonalError("That local DLL is already a lobby default.");
+        return;
+      }
+      const fileName = path.split(/[\\/]/u).at(-1) ?? "Local DLL";
+      setPersonalLocalMods((current) => [
+        ...current,
+        { path, name: fileName.replace(/\.dll$/iu, ""), enabled: true },
+      ]);
+      setPersonalError("");
+    } catch (error) {
+      setPersonalError(errorMessage(error));
+    }
   };
 
   const startTokenReplacement = () => {
@@ -342,7 +424,6 @@ export function SettingsModal({
       savePendingRef.current ||
       folderPendingRef.current ||
       reinstallPendingRef.current ||
-      personalPendingRef.current ||
       hasPendingWork
     ) return;
     const validation = validateInstances(instances);
@@ -373,6 +454,8 @@ export function SettingsModal({
         {
           ...settings,
           gameInstances: instances.map((instance) => ({ ...instance, name: instance.name.trim() })),
+          personalMods,
+          personalLocalMods,
         },
         tokenAction,
       );
@@ -393,7 +476,12 @@ export function SettingsModal({
   };
 
   const selectedNameError = selected ? instanceNameError(selected, instances) : "";
-  const personalBusy = personalPending !== null;
+  const hasInstanceDrafts = JSON.stringify(instances) !== JSON.stringify(settings.gameInstances ?? []);
+  const hasPersonalDrafts = JSON.stringify(personalMods) !== JSON.stringify(settings.personalMods ?? []);
+  const hasPersonalLocalDrafts =
+    JSON.stringify(personalLocalMods) !== JSON.stringify(settings.personalLocalMods ?? []);
+  const hasDraftChanges =
+    hasInstanceDrafts || hasPersonalDrafts || hasPersonalLocalDrafts || tokenIntent !== "unchanged";
   const visibleLoaderView: LoaderView =
     !selected
       ? { kind: "idle" }
@@ -411,7 +499,7 @@ export function SettingsModal({
     <AnimatePresence>
       {open && (
         <motion.div
-          className="fixed inset-0 z-50 grid place-items-center p-6"
+          className="fixed inset-0 z-50 grid place-items-center p-6 max-[600px]:p-0"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
@@ -436,21 +524,21 @@ export function SettingsModal({
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.97, y: 8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="glass-strong relative flex max-h-[90vh] w-[520px] max-w-full flex-col rounded-3xl p-6"
+            className="glass-strong relative flex max-h-[90vh] w-[520px] max-w-full flex-col rounded-3xl p-6 max-[600px]:h-[100dvh] max-[600px]:max-h-none max-[600px]:w-full max-[600px]:rounded-none max-[600px]:p-4"
           >
             <button
               type="button"
               onClick={requestClose}
               disabled={hasPendingWork}
               aria-label="Close settings"
-              className="ring-focus absolute top-4 right-4 grid h-8 w-8 place-items-center rounded-lg text-ink-faint hover:bg-white/10 hover:text-ink disabled:opacity-40"
+              className="ring-focus absolute top-4 right-4 grid h-9 w-9 place-items-center rounded-lg text-ink-faint hover:bg-white/10 hover:text-ink disabled:opacity-40"
             >
               <X size={16} weight="bold" />
             </button>
 
             <h2 className="text-[20px] font-semibold text-ink">Settings</h2>
 
-            <div className="scroll-region -mr-2 min-h-0 flex-1 overflow-y-auto pr-2">
+            <div className="scroll-region min-h-0 flex-1 overflow-x-hidden overflow-y-auto pr-2">
               <div className="mt-5 mb-2 flex items-center justify-between">
                 <span className="text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
                   Among Us instances
@@ -487,11 +575,11 @@ export function SettingsModal({
                             <span className="truncate text-[13px] font-semibold text-ink">
                               {instance.name || "Unnamed instance"}
                             </span>
-                            <span className="font-mono text-[10.5px] text-ink-faint">
+                            <span className="font-mono text-[12px] text-ink-faint">
                               {instance.store} · {instance.arch} · {instance.runtime}
                             </span>
                           </span>
-                          <span className="block truncate font-mono text-[10.5px] text-ink-faint">
+                          <span className="block truncate font-mono text-[12px] text-ink-faint">
                             {displayPath(instance.path)}
                           </span>
                         </span>
@@ -515,8 +603,8 @@ export function SettingsModal({
                 )}
               </div>
               {selected && (
-                <div className="mt-2 grid gap-2">
-                  <label className="glass flex items-center gap-2 rounded-xl px-3 py-2.5 text-ink-dim focus-within:text-ink">
+                <div className="mt-2 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
+                  <label className="glass flex min-w-0 items-center gap-2 rounded-xl px-3 py-2.5 text-ink-dim focus-within:text-ink">
                     <GameController size={16} className="opacity-75" />
                     <input
                       value={selected.name}
@@ -533,7 +621,7 @@ export function SettingsModal({
                       aria-label="Instance name"
                       aria-invalid={!!selectedNameError}
                       aria-describedby={selectedNameError ? "instance-name-error" : undefined}
-                      className="w-full bg-transparent text-[12.5px] text-ink placeholder:text-ink-faint focus:outline-none disabled:opacity-50"
+                      className="min-w-0 flex-1 bg-transparent text-[12.5px] text-ink placeholder:text-ink-faint focus:outline-none disabled:opacity-50"
                     />
                   </label>
                   {selectedNameError && (
@@ -541,10 +629,10 @@ export function SettingsModal({
                       {selectedNameError}
                     </p>
                   )}
-                  <div className="flex items-center gap-2">
+                  <div className="flex min-w-0 items-center gap-2">
                     <div className="glass flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-2.5 text-ink-dim">
                       <FolderOpen size={16} className="shrink-0 opacity-75" />
-                      <span className="truncate font-mono text-[11.5px] text-ink">
+                      <span className="truncate font-mono text-[12px] text-ink">
                         {displayPath(selected.path)}
                       </span>
                     </div>
@@ -557,6 +645,29 @@ export function SettingsModal({
                       Change
                     </button>
                   </div>
+                  {selected.store === "msstore" && selected.writable === false && (
+                    <div className="rounded-xl border border-[#ffd23f]/25 bg-[#ffd23f]/8 px-3.5 py-3">
+                      <div className="flex items-start gap-3">
+                        <HardDrives size={18} className="mt-0.5 shrink-0 text-crew-gold" />
+                        <div className="min-w-0 flex-1">
+                          <p className="text-[12.5px] font-semibold text-ink">
+                            This Microsoft Store folder is protected
+                          </p>
+                          <p className="mt-1 text-[12px] leading-relaxed text-ink-dim">
+                            Create a verified writable copy before installing BepInEx or launching a modded profile.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void createManagedCopy()}
+                          disabled={hasPendingWork}
+                          className="ring-focus shrink-0 rounded-lg bg-[#ffd23f] px-3 py-2 text-[12px] font-bold text-[#241900] disabled:opacity-50"
+                        >
+                          {folderPending ? "Copying…" : "Create managed copy"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -639,28 +750,35 @@ export function SettingsModal({
                 )}
               </div>
               <p className="mt-2 px-1 text-[12px] text-ink-faint">
-                Stored securely by the desktop app. It raises the GitHub API rate limit without exposing the saved value to this form.
+                Stored securely by the desktop app. Normal catalog release checks use API-free GitHub pages; this token is only used for authenticated GitHub traffic.
               </p>
 
               <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
-                Always add to lobbies · saves immediately
+                Lobby defaults
               </span>
-              <p className="mb-2 px-1 text-[12px] text-ink-faint">
-                Adding, changing, enabling, or removing a personal mod saves immediately. Cancel only discards token and instance drafts.
+              <p className="mb-2 px-1 text-[12.5px] text-ink-faint">
+                These personal mods join every lobby profile. All changes are saved together with the rest of Settings.
               </p>
               <div className="flex flex-col gap-1.5">
-                {(settings.personalMods ?? []).map((personalMod) => {
+                {personalMods.map((personalMod) => {
                   const enabled = personalMod.enabled !== false;
-                  const rowBusy = personalPending?.endsWith(`:${personalMod.repo}`) ?? false;
                   return (
-                    <div key={personalMod.repo} className="glass flex items-center gap-2 rounded-lg px-3 py-2 text-[12.5px]">
+                    <div key={personalMod.repo} className="surface-row flex items-center gap-2 rounded-lg px-3 py-2 text-[12.5px]">
                       <button
                         type="button"
                         role="switch"
                         aria-checked={enabled}
-                        aria-label={`${enabled ? "Disable" : "Enable"} ${personalMod.name ?? personalMod.repo}; saves immediately`}
-                        onClick={() => void runPersonal(`toggle:${personalMod.repo}`, () => onTogglePersonal(personalMod.repo, !enabled))}
-                        disabled={personalBusy}
+                        aria-label={`${enabled ? "Disable" : "Enable"} ${personalMod.name ?? personalMod.repo}`}
+                        onClick={() =>
+                          setPersonalMods((current) =>
+                            current.map((candidate) =>
+                              candidate.repo === personalMod.repo
+                                ? { ...candidate, enabled: !enabled }
+                                : candidate,
+                            ),
+                          )
+                        }
+                        disabled={hasPendingWork}
                         className={`ring-focus relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-50 ${
                           enabled ? "accent-grad" : "bg-white/15"
                         }`}
@@ -677,29 +795,39 @@ export function SettingsModal({
                       <TrustBadge trust={trustOf(personalMod.repo)} compact />
                       <button
                         type="button"
-                        onClick={() => void runPersonal(`version:${personalMod.repo}`, () => onAddPersonal(personalMod.repo, personalMod.name ?? personalMod.repo))}
-                        disabled={personalBusy}
-                        aria-label={`Change ${personalMod.name ?? personalMod.repo} version; saves immediately`}
-                        title="Change version (saves immediately)"
-                        className="ring-focus glass-2 flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-mono text-[11.5px] text-ink-dim hover:text-ink disabled:opacity-50"
+                        onClick={() =>
+                          setPersonalPicker({
+                            repo: personalMod.repo,
+                            name: personalMod.name ?? personalMod.repo,
+                            currentVersion: personalMod.tag,
+                          })
+                        }
+                        disabled={hasPendingWork}
+                        aria-label={`Change ${personalMod.name ?? personalMod.repo} version`}
+                        title="Change version"
+                        className="ring-focus glass-2 flex shrink-0 items-center gap-1 rounded-md px-2 py-1 font-mono text-[12px] text-ink-dim hover:text-ink disabled:opacity-50"
                       >
-                        {rowBusy ? "Saving…" : personalMod.tag}
+                        {personalMod.tag}
                         <CaretDown size={11} weight="bold" />
                       </button>
                       <button
                         type="button"
-                        onClick={() => void runPersonal(`remove:${personalMod.repo}`, () => onRemovePersonal(personalMod.repo))}
-                        disabled={personalBusy}
-                        aria-label={`Remove ${personalMod.repo}; saves immediately`}
-                        className="ring-focus grid h-7 w-7 place-items-center rounded-md text-ink-faint hover:bg-white/10 hover:text-[#ff8a8a] disabled:opacity-50"
+                        onClick={() =>
+                          setPersonalMods((current) =>
+                            current.filter((candidate) => candidate.repo !== personalMod.repo),
+                          )
+                        }
+                        disabled={hasPendingWork}
+                        aria-label={`Remove ${personalMod.repo} from lobby defaults`}
+                        className="ring-focus grid h-8 w-8 place-items-center rounded-md text-ink-faint hover:bg-white/10 hover:text-[#ff8a8a] disabled:opacity-50"
                       >
                         <TrashSimple size={14} />
                       </button>
                     </div>
                   );
                 })}
-                {(settings.personalMods ?? []).length === 0 && (
-                  <p className="px-1 text-[12px] text-ink-faint">None yet.</p>
+                {personalMods.length === 0 && (
+                  <p className="px-1 text-[12.5px] text-ink-faint">No personal mods are added to every lobby.</p>
                 )}
               </div>
               <label className="glass mt-2 flex items-center gap-2 rounded-xl px-3 py-2 text-ink-dim focus-within:text-ink">
@@ -707,25 +835,28 @@ export function SettingsModal({
                 <input
                   value={personalUrl}
                   maxLength={300}
-                  disabled={personalBusy}
-                  onChange={(event) => setPersonalUrl(event.target.value)}
+                  disabled={hasPendingWork}
+                  onChange={(event) => {
+                    setPersonalUrl(event.target.value);
+                    if (personalError) setPersonalError("");
+                  }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
                       event.preventDefault();
                       submitPersonal();
                     }
                   }}
-                  placeholder="Paste a GitHub repo to always include"
-                  aria-label="Always-include repo; selection saves immediately"
+                  placeholder="owner/repository or GitHub URL"
+                  aria-label="Personal mod repository"
                   className="w-full min-w-0 bg-transparent text-[12.5px] text-ink placeholder:text-ink-faint focus:outline-none disabled:opacity-50"
                 />
                 <button
                   type="button"
                   onClick={submitPersonal}
-                  disabled={personalBusy}
+                  disabled={hasPendingWork || !personalUrl.trim()}
                   className="ring-focus flex shrink-0 items-center gap-1 rounded-lg bg-white/10 px-2.5 py-1 text-[12px] font-semibold text-ink disabled:opacity-50"
                 >
-                  <Plus size={12} weight="bold" /> {personalBusy ? "Saving…" : "Add"}
+                  <Plus size={12} weight="bold" /> Add
                 </button>
               </label>
               {personalError && (
@@ -733,6 +864,72 @@ export function SettingsModal({
                   {personalError}
                 </p>
               )}
+
+              <div className="mt-3 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-[12.5px] font-semibold text-ink">Local DLL defaults</p>
+                  <p className="mt-0.5 text-[12px] text-ink-faint">
+                    Installed locally for new lobby profiles. Never included in shared lobby codes.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void addLocalLobbyDefault()}
+                  disabled={hasPendingWork}
+                  className="ring-focus glass flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-[12px] font-semibold text-ink-dim hover:text-ink disabled:opacity-50"
+                >
+                  <FileCode size={14} /> Add local DLL
+                </button>
+              </div>
+              <div className="mt-2 flex flex-col gap-1.5">
+                {personalLocalMods.map((local) => {
+                  const enabled = local.enabled !== false;
+                  return (
+                    <div key={local.path} className="surface-row flex items-center gap-2 rounded-lg px-3 py-2 text-[12.5px]">
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={enabled}
+                        aria-label={`${enabled ? "Disable" : "Enable"} ${local.name}`}
+                        onClick={() =>
+                          setPersonalLocalMods((current) =>
+                            current.map((candidate) =>
+                              candidate.path === local.path ? { ...candidate, enabled: !enabled } : candidate,
+                            ),
+                          )
+                        }
+                        disabled={hasPendingWork}
+                        className={`ring-focus relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-50 ${
+                          enabled ? "accent-grad" : "bg-white/15"
+                        }`}
+                      >
+                        <span
+                          className={`absolute top-1/2 h-4 w-4 -translate-y-1/2 rounded-full bg-white transition-all ${
+                            enabled ? "left-[18px]" : "left-0.5"
+                          }`}
+                        />
+                      </button>
+                      <span className="min-w-0 flex-1">
+                        <span className={`block truncate ${enabled ? "text-ink" : "text-ink-faint"}`}>{local.name}</span>
+                        <span className="block truncate font-mono text-[11px] text-ink-faint">{displayPath(local.path)}</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setPersonalLocalMods((current) =>
+                            current.filter((candidate) => candidate.path !== local.path),
+                          )
+                        }
+                        disabled={hasPendingWork}
+                        aria-label={`Remove ${local.name} from local lobby defaults`}
+                        className="ring-focus grid h-8 w-8 shrink-0 place-items-center rounded-md text-ink-faint hover:bg-white/10 hover:text-[#ff8a8a] disabled:opacity-50"
+                      >
+                        <TrashSimple size={14} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
 
               <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
                 BepInEx loader
@@ -772,30 +969,59 @@ export function SettingsModal({
               )}
             </div>
 
-            <div className="mt-4 flex items-center justify-between gap-2.5 border-t border-white/10 pt-4">
-              <p className="max-w-[250px] text-[11.5px] text-ink-faint">
-                Cancel discards only unsaved token and instance changes.
+            <div className="mt-4 flex items-center justify-between gap-2.5 border-t border-white/10 pt-4 max-[520px]:flex-col max-[520px]:items-stretch">
+              <p className="max-w-[250px] text-[12px] text-ink-faint max-[520px]:max-w-none" aria-live="polite">
+                {hasDraftChanges ? "Your changes are ready to save together." : "No unsaved changes."}
               </p>
-              <div className="flex gap-2.5">
+              <div className="flex gap-2.5 max-[520px]:w-full">
                 <button
                   type="button"
                   onClick={requestClose}
                   disabled={hasPendingWork}
-                  className="ring-focus glass rounded-xl px-4 py-2.5 text-[14px] text-ink disabled:opacity-50"
+                  className="ring-focus glass rounded-xl px-4 py-2.5 text-[14px] text-ink disabled:opacity-50 max-[520px]:flex-1"
                 >
-                  Cancel drafts
+                  {hasDraftChanges ? "Discard changes" : "Close"}
                 </button>
                 <button
                   type="button"
                   onClick={() => void save()}
-                  disabled={hasPendingWork}
-                  className="ring-focus accent-grad rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820] disabled:opacity-50"
+                  disabled={hasPendingWork || !hasDraftChanges}
+                  className="ring-focus accent-grad rounded-xl px-5 py-2.5 text-[14px] font-bold text-[#0d0820] disabled:opacity-50 max-[520px]:flex-1"
                 >
-                  {saving ? "Saving…" : "Save"}
+                  {saving ? "Saving…" : "Save changes"}
                 </button>
               </div>
             </div>
           </motion.div>
+          <ReleasePicker
+            open={personalPicker !== null}
+            repo={personalPicker?.repo ?? ""}
+            modName={personalPicker?.name ?? ""}
+            trust={personalPicker ? trustOf(personalPicker.repo) : "flagged"}
+            busy={saving}
+            profileId={profileId}
+            currentVersion={personalPicker?.currentVersion}
+            onClose={() => setPersonalPicker(null)}
+            onPick={(repo, tag, assetName) => {
+              const target = personalPicker;
+              if (!target || target.repo !== repo) return;
+              setPersonalMods((current) => {
+                const previous = current.find((candidate) => candidate.repo === repo);
+                return [
+                  ...current.filter((candidate) => candidate.repo !== repo),
+                  {
+                    repo,
+                    tag,
+                    asset: assetName,
+                    name: target.name,
+                    enabled: previous?.enabled ?? true,
+                  },
+                ];
+              });
+              setPersonalPicker(null);
+              setPersonalUrl("");
+            }}
+          />
         </motion.div>
       )}
     </AnimatePresence>

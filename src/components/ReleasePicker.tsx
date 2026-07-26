@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { DownloadSimple, FileArrowDown, Warning, X } from "@phosphor-icons/react";
-import { listReleases, type GhRelease } from "../lib/bridge";
-import type { Trust } from "../lib/types";
+import { ArrowRight, CaretDown, DownloadSimple, FileArrowDown, Warning, X } from "@phosphor-icons/react";
+import { listInstallOptions } from "../lib/bridge";
+import type { ModInstallOption, Trust } from "../lib/types";
 import { useModalFocus } from "../lib/useModalFocus";
 import { TrustBadge } from "./TrustBadge";
 
@@ -12,13 +12,17 @@ interface ReleasePickerProps {
   modName: string;
   trust: Trust;
   busy: boolean;
+  profileId: string;
+  currentVersion?: string;
+  recommendedVersion?: string;
   onClose: () => void;
   onPick: (repo: string, tag: string, assetName: string) => void | Promise<void>;
 }
 
-interface ReleaseResult {
+interface InstallOptionsResult {
   repo: string;
-  releases: GhRelease[];
+  profileId: string;
+  options: ModInstallOption[];
 }
 
 interface AssetChoice {
@@ -33,6 +37,10 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
+function assetKind(name: string): "DLL" | "ZIP" {
+  return name.toLowerCase().endsWith(".zip") ? "ZIP" : "DLL";
+}
+
 
 const trustDescription: Record<Trust, string> = {
   trusted: "Trusted catalog repository",
@@ -40,7 +48,18 @@ const trustDescription: Record<Trust, string> = {
   flagged: "Unverified repository. Confirm the exact asset before installing.",
 };
 
-export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPick }: ReleasePickerProps) {
+export function ReleasePicker({
+  open,
+  repo,
+  modName,
+  trust,
+  busy,
+  profileId,
+  currentVersion,
+  recommendedVersion,
+  onClose,
+  onPick,
+}: ReleasePickerProps) {
   const reduce = useReducedMotion();
   const modalRef = useRef<HTMLDivElement>(null);
   const openRef = useRef(open);
@@ -48,9 +67,9 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
   const sessionRef = useRef(0);
   const requestRef = useRef(0);
   const pickingRef = useRef<string | null>(null);
-  const [result, setResult] = useState<ReleaseResult | null>(null);
-  const [loadingRepo, setLoadingRepo] = useState<string | null>(null);
-  const [error, setError] = useState<{ repo: string; message: string } | null>(null);
+  const [result, setResult] = useState<InstallOptionsResult | null>(null);
+  const [loadingKey, setLoadingKey] = useState<string | null>(null);
+  const [error, setError] = useState<{ key: string; message: string } | null>(null);
   const [confirmation, setConfirmation] = useState<AssetChoice | null>(null);
   const [picking, setPicking] = useState<string | null>(null);
   const [pickError, setPickError] = useState<string | null>(null);
@@ -80,37 +99,74 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
     pickingRef.current = null;
     setPicking(null);
     if (!open) {
-      setLoadingRepo(null);
+      setLoadingKey(null);
       return;
     }
 
     const session = sessionRef.current;
     const request = ++requestRef.current;
     const requestedRepo = repo;
-    setLoadingRepo(requestedRepo);
+    const requestedProfileId = profileId;
+    const requestKey = `${requestedRepo}\n${requestedProfileId}`;
+    setLoadingKey(requestKey);
 
-    listReleases(requestedRepo)
-      .then((releases) => {
-        if (!openRef.current || currentRepoRef.current !== requestedRepo || sessionRef.current !== session || requestRef.current !== request) return;
-        setResult({ repo: requestedRepo, releases });
+    listInstallOptions(requestedRepo, requestedProfileId)
+      .then((options) => {
+        if (
+          !openRef.current ||
+          currentRepoRef.current !== requestedRepo ||
+          sessionRef.current !== session ||
+          requestRef.current !== request
+        ) return;
+        setResult({ repo: requestedRepo, profileId: requestedProfileId, options });
       })
       .catch((reason: unknown) => {
-        if (!openRef.current || currentRepoRef.current !== requestedRepo || sessionRef.current !== session || requestRef.current !== request) return;
-        setError({ repo: requestedRepo, message: String(reason) });
+        if (
+          !openRef.current ||
+          currentRepoRef.current !== requestedRepo ||
+          sessionRef.current !== session ||
+          requestRef.current !== request
+        ) return;
+        setError({
+          key: requestKey,
+          message: reason instanceof Error ? reason.message : String(reason),
+        });
       })
       .finally(() => {
-        if (!openRef.current || currentRepoRef.current !== requestedRepo || sessionRef.current !== session || requestRef.current !== request) return;
-        setLoadingRepo(null);
+        if (
+          !openRef.current ||
+          currentRepoRef.current !== requestedRepo ||
+          sessionRef.current !== session ||
+          requestRef.current !== request
+        ) return;
+        setLoadingKey(null);
       });
-  }, [open, repo]);
+  }, [open, profileId, repo]);
 
-  const releases = result?.repo === repo ? result.releases : [];
-  const loading = loadingRepo === repo;
-  const currentError = error?.repo === repo ? error.message : null;
-  const hasEligibleAssets = releases.some((release) =>
-    release.assets.some((asset) => /\.dll$/i.test(asset.name)),
-  );
+  const resultMatches = result?.repo === repo && result.profileId === profileId;
+  const options = resultMatches ? result.options : [];
+  const requestKey = `${repo}\n${profileId}`;
+  const loading = loadingKey === requestKey;
+  const currentError = error?.key === requestKey ? error.message : null;
+  const hasOptions = options.length > 0;
   const controlsBusy = busy || picking !== null;
+  const updateVersion =
+    recommendedVersion && recommendedVersion !== currentVersion
+      ? recommendedVersion
+      : undefined;
+  const recommendedOption = updateVersion
+    ? options.find((option) => option.tag === updateVersion)
+    : undefined;
+  const latestVersion = recommendedVersion ?? options[0]?.tag;
+  const optionGroups = options.reduce<Array<{ tag: string; options: ModInstallOption[] }>>(
+    (groups, option) => {
+      const current = groups.at(-1);
+      if (current?.tag === option.tag) current.options.push(option);
+      else groups.push({ tag: option.tag, options: [option] });
+      return groups;
+    },
+    [],
+  );
 
   const install = async (choice: AssetChoice) => {
     if (choice.repo !== currentRepoRef.current || pickingRef.current !== null || busy) return;
@@ -124,7 +180,7 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
       await onPick(choice.repo, choice.tag, choice.assetName);
     } catch (reason: unknown) {
       if (openRef.current && currentRepoRef.current === choice.repo && sessionRef.current === session) {
-        setPickError(String(reason));
+        setPickError(reason instanceof Error ? reason.message : String(reason));
       }
     } finally {
       if (pickingRef.current === key) pickingRef.current = null;
@@ -137,12 +193,21 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
     setConfirmation(choice);
   };
 
+  const chooseRecommended = () => {
+    if (!recommendedOption || controlsBusy) return;
+    const choice = {
+      repo,
+      tag: recommendedOption.tag,
+      assetName: recommendedOption.assetName,
+    };
+    choose(choice);
+  };
 
   return (
     <AnimatePresence>
       {open && (
         <motion.div
-          className="fixed inset-0 z-50 grid place-items-center p-4 sm:p-6"
+          className="fixed inset-0 z-50 grid place-items-center p-4 sm:p-6 max-[600px]:p-0"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
@@ -160,7 +225,7 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
             ref={modalRef}
             role="dialog"
             aria-modal="true"
-            aria-label={`Pick a release file for ${modName}`}
+            aria-label={`${recommendedOption ? "Update" : "Choose a release file for"} ${modName}`}
             aria-hidden={confirmChoice !== null}
             inert={confirmChoice !== null}
             tabIndex={-1}
@@ -168,69 +233,152 @@ export function ReleasePicker({ open, repo, modName, trust, busy, onClose, onPic
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.97, y: 8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="glass-strong relative flex max-h-[88vh] w-[600px] max-w-full flex-col rounded-3xl p-5 sm:p-6"
+            className="glass-strong relative flex max-h-[88vh] w-[600px] max-w-full flex-col rounded-3xl p-5 sm:p-6 max-[600px]:h-[100dvh] max-[600px]:max-h-none max-[600px]:w-full max-[600px]:rounded-none max-[600px]:p-4"
           >
-            <button type="button" onClick={closePicker} disabled={controlsBusy} aria-label="Close release picker" className="ring-focus absolute top-4 right-4 grid h-8 w-8 place-items-center rounded-lg text-ink-faint hover:bg-white/10 hover:text-ink disabled:opacity-40">
+            <button
+              type="button"
+              onClick={closePicker}
+              disabled={controlsBusy}
+              aria-label="Close release picker"
+              className="ring-focus absolute top-4 right-4 grid h-9 w-9 place-items-center rounded-lg text-ink-faint hover:bg-white/10 hover:text-ink disabled:opacity-40"
+            >
               <X size={16} weight="bold" />
             </button>
 
-            <h2 className="pr-10 text-[20px] font-semibold text-ink">Pick a file</h2>
+            <h2 className="pr-12 text-[20px] font-semibold text-ink">
+              {recommendedOption ? `Update ${modName}` : "Choose a version"}
+            </h2>
             <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-2 text-[13px] text-ink-dim">
-              <span className="max-w-full truncate" title={modName} aria-label={`Mod ${modName}`}>{modName}</span>
+              <span className="max-w-full truncate" title={modName} aria-label={`Mod ${modName}`}>
+                {modName}
+              </span>
               <span aria-hidden="true">·</span>
-              <span className="max-w-full truncate font-mono" title={repo} aria-label={`Repository ${repo}`}>{repo}</span>
+              <span className="max-w-full truncate font-mono" title={repo} aria-label={`Repository ${repo}`}>
+                {repo}
+              </span>
               <TrustBadge trust={trust} compact />
             </div>
-            <p className={`mt-2 rounded-lg px-3 py-2 text-[12.5px] ${trust === "flagged" ? "bg-[rgba(255,170,60,0.12)] text-[#ffd9a8]" : "bg-white/[0.05] text-ink-dim"}`} role="status" aria-live="polite">
+            <p
+              className={`mt-2 rounded-lg px-3 py-2 text-[12.5px] ${
+                trust === "flagged"
+                  ? "bg-[rgba(255,170,60,0.12)] text-[#ffd9a8]"
+                  : "bg-white/[0.05] text-ink-dim"
+              }`}
+              role="status"
+              aria-live="polite"
+            >
               {trustDescription[trust]}
             </p>
 
-            {pickError && <p className="mt-3 rounded-xl bg-[rgba(226,59,59,0.12)] px-3.5 py-2.5 text-[13px] break-words text-[#ff8a8a]" role="alert">Install failed: {pickError}</p>}
+            {pickError && (
+              <p className="mt-3 rounded-xl bg-[rgba(226,59,59,0.12)] px-3.5 py-2.5 text-[13px] break-words text-[#ff8a8a]" role="alert">
+                Update failed: {pickError}
+              </p>
+            )}
 
-            <div className="scroll-region mt-4 flex-1 overflow-y-auto pr-1">
-              {loading && <p className="py-8 text-center text-[13px] text-ink-faint" role="status">Loading releases…</p>}
-              {currentError && <p className="py-8 text-center text-[13px] break-words text-[#ff8a8a]" role="alert">Could not load releases: {currentError}</p>}
-              {!loading && !currentError && !hasEligibleAssets && (
-                <p className="py-8 text-center text-[13px] text-ink-faint">No .dll files were found in this repository&apos;s releases.</p>
-              )}
-              {!loading && !currentError && releases.map((release) => {
-                const assets = release.assets.filter((asset) => /\.dll$/i.test(asset.name));
-                if (assets.length === 0) return null;
-                return (
-                  <div key={`${repo}-${release.tag_name}`} className="mb-3 min-w-0">
-                    <div className="mb-1.5 flex min-w-0 items-center gap-2 px-1">
-                      <span className="max-w-[70%] truncate font-mono text-[12.5px] text-ink" title={release.tag_name} aria-label={`Release ${release.tag_name}`}>{release.tag_name}</span>
-                      <div className="h-px flex-1 bg-white/10" />
+            {loading && (
+              <p className="py-8 text-center text-[13px] text-ink-faint" role="status">
+                Finding compatible versions…
+              </p>
+            )}
+            {currentError && (
+              <p className="py-8 text-center text-[13px] break-words text-[#ff8a8a]" role="alert">
+                Could not load versions: {currentError}
+              </p>
+            )}
+            {!loading && !currentError && !hasOptions && (
+              <p className="py-8 text-center text-[13px] text-ink-faint">
+                No compatible mod files were found in this repository&apos;s releases.
+              </p>
+            )}
+
+            {!loading && !currentError && recommendedOption && (
+              <section className="mt-4 rounded-2xl border border-accent/30 bg-accent/10 p-4">
+                <span className="text-[12px] font-semibold text-accent-2">Recommended update</span>
+                <div className="mt-2 flex min-w-0 items-center gap-3">
+                  <span className="truncate font-mono text-[15px] text-ink-dim">{currentVersion}</span>
+                  <ArrowRight size={16} className="shrink-0 text-ink-faint" aria-hidden="true" />
+                  <span className="truncate font-mono text-[17px] font-semibold text-ink">{recommendedOption.tag}</span>
+                </div>
+                <p className="mt-1.5 truncate font-mono text-[12.5px] text-ink-faint" title={recommendedOption.assetName}>
+                  Uses {recommendedOption.assetName}
+                </p>
+                <button
+                  data-autofocus
+                  type="button"
+                  disabled={controlsBusy}
+                  onClick={chooseRecommended}
+                  className="ring-focus accent-grad mt-4 flex w-full items-center justify-center gap-2 rounded-xl px-5 py-3 text-[14px] font-bold text-[#0d0820] disabled:opacity-50"
+                >
+                  <DownloadSimple size={16} weight="bold" aria-hidden="true" />
+                  {picking ? "Updating…" : `Update to ${recommendedOption.tag}`}
+                </button>
+              </section>
+            )}
+
+            {!loading && !currentError && hasOptions && (
+              <details className="mt-4 flex min-h-0 flex-col" open={!recommendedOption}>
+                <summary className="ring-focus flex cursor-pointer list-none items-center justify-between rounded-xl px-3 py-2.5 text-[13px] font-semibold text-ink-dim hover:bg-white/[0.06] hover:text-ink">
+                  <span>{recommendedOption ? "Choose another version or file" : "Available versions and files"}</span>
+                  <CaretDown size={14} weight="bold" aria-hidden="true" />
+                </summary>
+                <div className="scroll-region mt-2 min-h-0 flex-1 overflow-y-auto pr-1">
+                  {optionGroups.map((group) => (
+                    <div key={`${repo}-${group.tag}`} className="mb-3 min-w-0">
+                      <div className="mb-1.5 flex min-w-0 items-center gap-2 px-1">
+                        <span className="max-w-[70%] truncate font-mono text-[12.5px] text-ink" title={group.tag}>
+                          {group.tag}
+                        </span>
+                        {group.tag === latestVersion && (
+                          <span className="rounded-md bg-accent/15 px-1.5 py-0.5 text-[10.5px] font-semibold text-accent-2">
+                            Latest
+                          </span>
+                        )}
+                        {group.tag === currentVersion && (
+                          <span className="rounded-md bg-white/[0.07] px-1.5 py-0.5 text-[10.5px] font-semibold text-ink-dim">
+                            Current
+                          </span>
+                        )}
+                        <div className="h-px flex-1 bg-white/10" />
+                      </div>
+                      <div className="flex flex-col gap-1.5">
+                        {group.options.map((option) => {
+                          const choice = { repo, tag: option.tag, assetName: option.assetName };
+                          const key = `${repo}\n${option.tag}\n${option.assetName}`;
+                          return (
+                            <button
+                              key={`${option.tag}-${option.assetName}`}
+                              type="button"
+                              disabled={controlsBusy}
+                              onClick={() => choose(choice)}
+                              aria-label={`Install ${option.assetName}, ${assetKind(option.assetName)} file, ${formatSize(option.size)}, from ${repo} release ${option.tag}`}
+                              title={`${option.assetName} · ${assetKind(option.assetName)} · ${formatSize(option.size)}`}
+                              className="ring-focus surface-row flex min-w-0 items-center gap-2.5 rounded-xl px-3 py-2.5 text-left hover:bg-white/[0.075] disabled:opacity-50"
+                            >
+                              <FileArrowDown size={16} className="shrink-0 text-ink-dim" aria-hidden="true" />
+                              <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">
+                                {option.assetName}
+                              </span>
+                              <span className="shrink-0 rounded bg-white/[0.07] px-1.5 py-0.5 text-[10.5px] font-semibold text-ink-dim">
+                                {assetKind(option.assetName)}
+                              </span>
+                              <span className="shrink-0 text-[12px] text-ink-faint">
+                                {formatSize(option.size)}
+                              </span>
+                              {picking === key ? (
+                                <span className="shrink-0 text-[12px] text-ink-dim">Installing…</span>
+                              ) : (
+                                <DownloadSimple size={14} className="shrink-0 text-accent" aria-hidden="true" />
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
                     </div>
-                    <div className="flex flex-col gap-1.5">
-                      {assets.map((asset) => {
-                        const choice = { repo, tag: release.tag_name, assetName: asset.name };
-                        const key = `${repo}\n${release.tag_name}\n${asset.name}`;
-                        const type = "DLL";
-                        const size = formatSize(asset.size);
-                        return (
-                          <button
-                            key={`${release.tag_name}-${asset.name}`}
-                            type="button"
-                            disabled={controlsBusy}
-                            onClick={() => choose(choice)}
-                            aria-label={`Install ${asset.name}, ${type} file, ${size}, from ${repo} release ${release.tag_name}`}
-                            title={`${asset.name} · ${type} · ${size}`}
-                            className="ring-focus glass flex min-w-0 items-center gap-2.5 rounded-xl px-3 py-2.5 text-left hover:bg-white/10 disabled:opacity-50"
-                          >
-                            <FileArrowDown size={16} className="shrink-0 text-ink-dim" />
-                            <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">{asset.name}</span>
-                            <span className="shrink-0 rounded bg-white/[0.07] px-1.5 py-0.5 text-[10.5px] font-semibold text-ink-dim">{type}</span>
-                            <span className="shrink-0 text-[11.5px] text-ink-faint">{size}</span>
-                            {picking === key ? <span className="shrink-0 text-[11.5px] text-ink-dim">Installing…</span> : <DownloadSimple size={14} className="shrink-0 text-[#9b7bff]" />}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+                  ))}
+                </div>
+              </details>
+            )}
           </motion.div>
 
           <AssetConfirmation

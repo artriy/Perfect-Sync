@@ -77,7 +77,6 @@ export function BatchInstallReview({
   const [states, setStates] = useState<Record<string, OptionState>>({});
   const [chosenVersion, setChosenVersion] = useState<Record<string, string>>({});
   const [chosenAsset, setChosenAsset] = useState<Record<string, string>>({});
-  const [included, setIncluded] = useState<Record<string, boolean>>({});
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -95,21 +94,18 @@ export function BatchInstallReview({
     if (!open) return;
 
     const loadingStates: Record<string, OptionState> = {};
-    const nextIncluded: Record<string, boolean> = {};
     for (const row of rows) {
       loadingStates[row.item.id] = { loading: true, options: [] };
-      if (row.managed) nextIncluded[row.item.id] = true;
     }
     setStates(loadingStates);
     setChosenVersion({});
     setChosenAsset({});
-    setIncluded(nextIncluded);
 
     void Promise.all(
       rows.map(async ({ item }) => {
         try {
           const options = await listInstallOptions(item.repo, profileId);
-          if (options.length === 0) throw new Error("No direct .dll release asset was found.");
+          if (options.length === 0) throw new Error("No compatible release asset was found.");
           return { id: item.id, options };
         } catch (reason: unknown) {
           return { id: item.id, options: [], error: String(reason) };
@@ -133,10 +129,9 @@ export function BatchInstallReview({
     });
   }, [open, profileId, rows]);
 
-  const activeRows = rows.filter((row) => !row.managed || included[row.item.id]);
   const ready =
     items.length > 0 &&
-    activeRows.every(({ item }) => {
+    rows.every(({ item }) => {
       const state = states[item.id];
       return !!state && !state.loading && !state.error && state.options.some((option) =>
         option.tag === chosenVersion[item.id] && option.assetName === chosenAsset[item.id]
@@ -145,11 +140,11 @@ export function BatchInstallReview({
 
   const install = async () => {
     if (!ready || controlsBusy || pendingRef.current) return;
-    const selections = activeRows.map(({ item, managed }) => {
+    const selections = rows.map(({ item, managed }) => {
       const option = states[item.id].options.find((candidate) =>
         candidate.tag === chosenVersion[item.id] && candidate.assetName === chosenAsset[item.id]
       );
-      if (!option) throw new Error(`Choose a version and DLL for ${item.name}.`);
+      if (!option) throw new Error(`Choose a version and mod file for ${item.name}.`);
       return {
         id: item.id,
         repo: item.repo,
@@ -172,7 +167,7 @@ export function BatchInstallReview({
     }
   };
 
-  const dependencyCount = activeRows.filter((row) => row.managed).length;
+  const dependencyCount = rows.filter((row) => row.managed).length;
   return (
     <AnimatePresence>
       {open && (
@@ -194,7 +189,7 @@ export function BatchInstallReview({
               <X size={16} weight="bold" />
             </button>
             <h2 className="pr-10 text-[20px] font-semibold text-ink">Review your mods</h2>
-            <p className="mt-1 text-[13px] text-ink-dim">The latest version and catalog DLL are selected by default. Change either one or exclude automatic dependencies before installing to {profileName}. ZIP assets are never installed.</p>
+            <p className="mt-1 text-[13px] text-ink-dim">The latest version and catalog file are selected by default. Required dependencies are added automatically, but you can remove them from the profile later. Catalog ZIP packages are safely reduced to their declared plugin DLL.</p>
 
             {error && <p className="mt-3 rounded-xl bg-[rgba(226,59,59,0.12)] px-3.5 py-2.5 text-[13px] break-words text-[#ff8a8a]" role="alert">Install failed: {error}</p>}
 
@@ -205,32 +200,23 @@ export function BatchInstallReview({
                 const versions = Array.from(new Set(state.options.map((candidate) => candidate.tag)));
                 const assets = state.options.filter((candidate) => candidate.tag === chosenVersion[item.id]);
                 const option = assets.find((candidate) => candidate.assetName === chosenAsset[item.id]);
-                const enabled = !row.managed || included[item.id];
                 return (
                   <div
                     key={item.id}
-                    className={`glass min-w-0 rounded-2xl p-3.5 ${row.managed ? "border-l-2 border-l-accent/35" : ""}`}
+                    className={`surface-row min-w-0 rounded-2xl p-3.5 ${row.managed ? "bg-accent/[0.035]" : ""}`}
                     style={row.managed ? { marginLeft: `${Math.min(row.depth, 2) * 18}px` } : undefined}
                   >
                     <div className="flex min-w-0 items-center gap-2">
                       {row.managed && (
-                        <label className="ring-focus flex shrink-0 cursor-pointer items-center gap-2 rounded-lg px-1.5 py-1 text-[12px] text-ink-dim">
-                          <input
-                            type="checkbox"
-                            checked={enabled}
-                            disabled={controlsBusy}
-                            onChange={(event) => setIncluded((current) => ({ ...current, [item.id]: event.target.checked }))}
-                            aria-label={`Auto include ${item.name}`}
-                            className="accent-[#9b7bff]"
-                          />
-                          Auto include
-                        </label>
+                        <span className="shrink-0 rounded-lg bg-accent/10 px-2 py-1 text-[11.5px] font-semibold text-[#d4c6ff]">
+                          Auto-added
+                        </span>
                       )}
-                      <span className={`min-w-0 flex-1 truncate text-[14.5px] font-semibold ${enabled ? "text-ink" : "text-ink-faint"}`} title={item.name}>{item.name}</span>
+                      <span className="min-w-0 flex-1 truncate text-[14.5px] font-semibold text-ink" title={item.name}>{item.name}</span>
                       <TrustBadge trust={item.trust ?? "flagged"} compact />
                     </div>
                     <p className="mt-1 truncate font-mono text-[11.5px] text-ink-faint" title={item.repo}>{item.repo}</p>
-                    {row.managed && <p className="mt-1 text-[11.5px] text-ink-faint">Dependency for {row.rootName}. Excluding it may prevent that mod from loading.</p>}
+                    {row.managed && <p className="mt-1 text-[11.5px] text-ink-faint">Required by {row.rootName}. You can remove it from the profile after installation.</p>}
                     {state.loading ? (
                       <p className="mt-3 text-[12.5px] text-ink-dim" role="status">Finding compatible versions…</p>
                     ) : state.error ? (
@@ -247,7 +233,7 @@ export function BatchInstallReview({
                               setChosenVersion((current) => ({ ...current, [item.id]: version }));
                               setChosenAsset((current) => ({ ...current, [item.id]: firstAsset?.assetName ?? "" }));
                             }}
-                            disabled={controlsBusy || !enabled}
+                            disabled={controlsBusy}
                             aria-label={`${item.name} version`}
                             className="ring-focus glass w-full min-w-0 rounded-xl px-3 py-2 text-[12.5px] text-ink disabled:opacity-50"
                           >
@@ -255,19 +241,19 @@ export function BatchInstallReview({
                           </select>
                         </label>
                         <label className="min-w-0">
-                          <span className="mb-1 block text-[10.5px] tracking-[0.12em] text-ink-faint uppercase">DLL file</span>
+                          <span className="mb-1 block text-[10.5px] tracking-[0.12em] text-ink-faint uppercase">Mod file</span>
                           <select
                             value={chosenAsset[item.id] ?? ""}
                             onChange={(event) => setChosenAsset((current) => ({ ...current, [item.id]: event.target.value }))}
-                            disabled={controlsBusy || !enabled}
-                            aria-label={`${item.name} DLL file`}
+                            disabled={controlsBusy}
+                            aria-label={`${item.name} mod file`}
                             className="ring-focus glass w-full min-w-0 rounded-xl px-3 py-2 font-mono text-[11.5px] text-ink disabled:opacity-50"
                           >
                             {assets.map((candidate) => (
                               <option key={candidate.assetName} value={candidate.assetName}>{candidate.assetName} · {formatSize(candidate.size)}</option>
                             ))}
                           </select>
-                          {option && <span className="sr-only">Selected DLL size {formatSize(option.size)}</span>}
+                          {option && <span className="sr-only">Selected file size {formatSize(option.size)}</span>}
                         </label>
                       </div>
                     )}

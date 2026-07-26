@@ -21,6 +21,8 @@ const MAX_PROFILE_ID_BYTES: usize = 64;
 const MAX_DLL_NAME_BYTES: usize = 180;
 const MAX_PROFILE_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PLUGIN_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PLUGIN_ARCHIVE_ENTRIES: usize = 4_096;
+const MAX_PLUGIN_ARCHIVE_PATH_BYTES: usize = 1_024;
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -466,8 +468,8 @@ impl ProfileStore {
     }
 }
 
-/// Encode a profile's enabled mods into a shareable lobby manifest. Versions are
-/// preserved exactly so a recipient reproduces a handshake-compatible set.
+/// Encode a profile's enabled, shareable mods into a lobby manifest.
+/// Mod versions, release assets, and LevelImposter maps are preserved exactly.
 pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
     let levelimposter_enabled = profile.mods.iter().any(|installed| {
         installed.enabled
@@ -483,11 +485,11 @@ pub fn to_manifest(profile: &ProfileRecord) -> LobbyManifest {
         v: 1,
         name: Some(profile.name.clone()),
         platform: None,
-        game_build: profile.game_build.clone(),
+        game_build: None,
         mods: profile
             .mods
             .iter()
-            .filter(|m| m.enabled)
+            .filter(|m| m.enabled && m.source != ModSource::File)
             .map(|m| ManifestMod {
                 id: m.package_id.clone(),
                 v: m.version.clone(),
@@ -590,6 +592,82 @@ pub fn install_plugin_bytes(
     bytes: &[u8],
 ) -> io::Result<PathBuf> {
     publish_plugin(profiles_root, id, file_name, Cursor::new(bytes))
+}
+
+/// Extract one catalog-declared DLL from a release ZIP without materializing
+/// any archive-controlled path. The expected DLL must occur exactly once.
+pub fn install_plugin_zip_bytes(
+    profiles_root: &Path,
+    id: &str,
+    dll_name: &str,
+    bytes: &[u8],
+) -> io::Result<PathBuf> {
+    validate_profile_id(id)?;
+    validate_dll_name(dll_name)?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if archive.is_empty() || archive.len() > MAX_PLUGIN_ARCHIVE_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "plugin ZIP is empty or has too many entries",
+        ));
+    }
+
+    let mut selected = None;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let entry_name = entry.name();
+        if entry_name.len() > MAX_PLUGIN_ARCHIVE_PATH_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "plugin ZIP contains an overlong path",
+            ));
+        }
+        let basename = entry_name.rsplit('/').next().unwrap_or_default();
+        if !basename.eq_ignore_ascii_case(dll_name) {
+            continue;
+        }
+        if entry.is_dir() || entry.enclosed_name().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "plugin ZIP uses an unsafe path for the declared DLL",
+            ));
+        }
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "plugin ZIP declares the DLL as a symbolic link",
+            ));
+        }
+        if entry.size() == 0 || entry.size() > MAX_PLUGIN_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "plugin DLL is empty or exceeds the expanded-size limit",
+            ));
+        }
+        if selected.replace(index).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "plugin ZIP contains the declared DLL more than once",
+            ));
+        }
+    }
+
+    let index = selected.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("plugin ZIP does not contain {dll_name}"),
+        )
+    })?;
+    let entry = archive
+        .by_index(index)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    publish_plugin(profiles_root, id, dll_name, entry)
 }
 
 /// Remove a plugin file (enabled or `.disabled`) from a profile.
@@ -820,6 +898,8 @@ mod tests {
         assert_eq!(manifest.mods.len(), 1);
         assert_eq!(manifest.mods[0].id, "AU-Avengers/TOU-Mira");
         assert_eq!(manifest.mods[0].v, "1.6.3");
+        assert_eq!(manifest.mods[0].asset, None);
+        assert!(manifest.game_build.is_none());
         // survives a codec round-trip
         let code = crate::codec::encode(&manifest).unwrap();
         assert_eq!(crate::codec::decode(&code).unwrap(), manifest);
@@ -827,8 +907,7 @@ mod tests {
 
     #[test]
     fn to_manifest_includes_enabled_libraries() {
-        // a library/dependency the host has enabled must be in the code verbatim,
-        // so the recipient reproduces the EXACT mod set (no re-resolution).
+        // Enabled libraries remain part of the exact requested mod set.
         let mut p = sample_profile();
         p.mods.push(InstalledMod {
             package_id: "NuclearPowered/Reactor".into(),
@@ -885,9 +964,60 @@ mod tests {
         assert!(to_manifest(&profile).levelimposter_maps.is_empty());
     }
 
+    fn plugin_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut archive = zip::ZipWriter::new(&mut bytes);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, contents) in entries {
+                archive.start_file(*name, options).unwrap();
+                archive.write_all(contents).unwrap();
+            }
+            archive.finish().unwrap();
+        }
+        bytes.into_inner()
+    }
+
     #[test]
-    fn to_manifest_sets_github_ref_for_custom_mod() {
-        // a mod NOT in any catalog, added by pasting a GitHub URL
+    fn installs_exact_declared_dll_from_nested_release_zip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = plugin_zip(&[
+            ("README.md", b"docs"),
+            ("BepInEx/plugins/TownOfUs.dll", b"plugin"),
+        ]);
+        let destination =
+            install_plugin_zip_bytes(tmp.path(), "p1", "TownOfUs.dll", &bytes).unwrap();
+        assert_eq!(
+            destination,
+            loader::profile_plugins_dir(tmp.path(), "p1").join("TownOfUs.dll")
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"plugin");
+        assert!(!tmp.path().join("p1").join("README.md").exists());
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_missing_dll_in_release_zip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let duplicate = plugin_zip(&[("one/Mod.dll", b"one"), ("two/Mod.dll", b"two")]);
+        assert_eq!(
+            install_plugin_zip_bytes(tmp.path(), "p1", "Mod.dll", &duplicate)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let missing = plugin_zip(&[("Other.dll", b"other")]);
+        assert_eq!(
+            install_plugin_zip_bytes(tmp.path(), "p1", "Mod.dll", &missing)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn to_manifest_keeps_custom_github_release_and_asset() {
+        // A mod not in the catalog still retains the exact installed GitHub release.
         let p = ProfileRecord {
             id: "p".into(),
             name: "Custom".into(),
@@ -911,9 +1041,10 @@ mod tests {
             levelimposter_maps: Vec::new(),
         };
         let m = to_manifest(&p);
-        // id is owner/repo; the recipient derives the GitHub repo from it (no ref needed)
+        // The recipient derives the repository from the id and installs this exact asset.
         assert_eq!(m.mods[0].id, "SomeUser/CoolMod");
         assert_eq!(m.mods[0].v, "1.2.3");
+        assert_eq!(m.mods[0].asset.as_deref(), Some("CoolMod.dll"));
         assert_eq!(
             crate::resolver::parse_repo(&m.mods[0].id).as_deref(),
             Some("SomeUser/CoolMod")

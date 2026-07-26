@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(release.tag, "release/1.0");
         assert_eq!(
             http.urls.into_inner(),
-            ["https://api.github.com/repos/Owner/.github/releases/tags/release%2F1%2E0"]
+            ["https://github.com/Owner/.github/releases/expanded_assets/release%2F1%2E0"]
         );
     }
 

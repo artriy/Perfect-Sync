@@ -1,10 +1,11 @@
 import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrent as getCurrentDeepLinks, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import type {
   CatalogItem,
   DiffItem,
+  Arch,
   GameInstall,
   GithubTokenAction,
   LevelImposterMap,
@@ -12,9 +13,11 @@ import type {
   ModInstallOption,
   ModInstallSelection,
   OperationProgress,
+  ModSource,
   Profile,
   ProfileMod,
   Runtime,
+  Store,
   Settings,
   Trust,
 } from "./types";
@@ -74,7 +77,54 @@ async function simulateBrowserTransfers(
 export interface Preview {
   name: string;
   items: DiffItem[];
+  gameBuild?: string;
   levelImposterMaps: string[];
+}
+
+export interface SaveBackupInfo {
+  id: string;
+  createdAt: number;
+  files: number;
+  bytes: number;
+}
+
+export interface DiagnosticGame {
+  name: string;
+  store: Store;
+  arch: Arch;
+  runtime: Runtime;
+  build?: string;
+  writable: boolean;
+}
+
+export interface DiagnosticLoader {
+  current: boolean;
+  installedVersion?: string;
+  winhttp: boolean;
+  preloader: boolean;
+  dotnet: boolean;
+  profilePlugins: number;
+  gamePlugins: number;
+}
+
+export interface DiagnosticAsset {
+  name: string;
+  version: string;
+  file?: string;
+  enabled: boolean;
+  source: ModSource;
+}
+
+export interface DiagnosticsReport {
+  generatedAt: number;
+  appVersion: string;
+  profileName?: string;
+  game?: DiagnosticGame;
+  loader?: DiagnosticLoader;
+  assets: DiagnosticAsset[];
+  logErrors: string[];
+  gameRunning?: boolean;
+  warnings: string[];
 }
 
 // ----------------------------------------------------------- window controls
@@ -137,7 +187,9 @@ export async function listReleases(repo: string): Promise<GhRelease[]> {
   const assetStem = parsed[2].replace(/\.git$/i, "") || "mod";
   const assetNames = normalized.toLowerCase() === "au-avengers/tou-mira"
     ? ["TownOfUsMira.dll", "MiraAPI.dll"]
-    : [`${assetStem}.dll`];
+    : normalized.toLowerCase() === "theotherrolesau/theotherroles"
+      ? ["TheOtherRoles.zip"]
+      : [`${assetStem}.dll`];
   return fixtureVersions(normalized).map((version) => ({
     tag_name: version,
     assets: assetNames.map((name) => ({
@@ -148,12 +200,12 @@ export async function listReleases(repo: string): Promise<GhRelease[]> {
   }));
 }
 
-/** List every direct DLL asset, with the catalog default first for each release. */
+/** List installable release assets, with the catalog default first. */
 export async function listInstallOptions(repo: string, profileId: string): Promise<ModInstallOption[]> {
   if (inTauri) return invoke<ModInstallOption[]>("list_install_options", { repo, profileId });
   return (await listReleases(repo)).flatMap((release) =>
     release.assets
-      .filter((asset) => /\.dll$/i.test(asset.name))
+      .filter((asset) => /\.(?:dll|zip)$/i.test(asset.name))
       .map((asset) => ({ tag: release.tag_name, assetName: asset.name, size: asset.size })),
   );
 }
@@ -177,7 +229,7 @@ export async function installAsset(
   onProgress?: ProgressHandler,
 ): Promise<Profile> {
   if (!confirmed) throw new Error("Confirm the exact release asset before installing.");
-  if (!assetName.toLowerCase().endsWith(".dll")) throw new Error("Only .dll mod files can be installed.");
+  if (!/\.(?:dll|zip)$/i.test(assetName)) throw new Error("Only .dll and catalog-selected .zip mod files can be installed.");
   if (inTauri) {
     return invoke<Profile>("install_asset", {
       profileId: profile.id,
@@ -223,8 +275,8 @@ export async function installAssets(
   onProgress?: ProgressHandler,
 ): Promise<Profile> {
   if (!confirmed) throw new Error("Review the selected versions before installing.");
-  if (selections.some((selection) => !selection.assetName.toLowerCase().endsWith(".dll"))) {
-    throw new Error("Only .dll mod files can be installed.");
+  if (selections.some((selection) => !/\.(?:dll|zip)$/i.test(selection.assetName))) {
+    throw new Error("Only .dll and catalog-selected .zip mod files can be installed.");
   }
   if (inTauri) {
     return invoke<Profile>("install_assets", {
@@ -422,11 +474,54 @@ export async function pickFolder(): Promise<string | null> {
   return typeof picked === "string" ? picked : null;
 }
 
+/** Native DLL picker for local profile and lobby-default mods. */
+export async function pickLocalDll(): Promise<string | null> {
+  if (!inTauri) return "C:/Mods/LocalUtility.dll";
+  const picked = await openDialog({
+    directory: false,
+    multiple: false,
+    title: "Choose a local mod DLL",
+    filters: [{ name: "BepInEx plugin", extensions: ["dll"] }],
+  });
+  return typeof picked === "string" ? picked : null;
+}
+
 /** Validate and classify a manually selected Among Us folder. */
 export async function inspectGame(gamePath: string): Promise<GameInstall> {
   if (inTauri) return invoke<GameInstall>("inspect_game", { gamePath });
   if (!gamePath.trim()) throw new Error("Choose an Among Us folder.");
   return { path: gamePath.trim(), store: "manual", arch: "x86", runtime: "native" };
+}
+
+/** Create a writable, managed copy of an existing Among Us installation. */
+export async function createManagedGameCopy(
+  sourcePath: string,
+  destinationParent: string,
+): Promise<GameInstall> {
+  if (inTauri) {
+    return invoke<GameInstall>("create_managed_game_copy", { sourcePath, destinationParent });
+  }
+  if (!sourcePath.trim() || !destinationParent.trim()) {
+    throw new Error("Choose the source game and a destination folder.");
+  }
+  return {
+    path: `${destinationParent.replace(/[\\/]+$/u, "")}/Perfect-Sync Among Us`,
+    store: "msstore",
+    arch: "x64",
+    runtime: "native",
+    build: "2026.3.31",
+    writable: true,
+  };
+}
+
+export async function pickManagedCopyDestination(): Promise<string | null> {
+  if (!inTauri) return "C:/Games";
+  const picked = await openDialog({
+    directory: true,
+    multiple: false,
+    title: "Choose where to create the managed Among Us copy",
+  });
+  return typeof picked === "string" ? picked : null;
 }
 
 // ------------------------------------------------------------------ catalog
@@ -476,6 +571,8 @@ export async function detectGames(): Promise<GameInstall[]> {
       store: "steam",
       arch: "x86",
       runtime: "native",
+      build: "2026.3.31",
+      writable: true,
     },
   ];
 }
@@ -514,6 +611,7 @@ function normalizeBrowserSettings(settings: Settings): Settings {
     ...structuredClone(settings),
     gameInstances: structuredClone(settings.gameInstances ?? []),
     personalMods: structuredClone(settings.personalMods ?? []),
+    personalLocalMods: structuredClone(settings.personalLocalMods ?? []),
     setupComplete: !!settings.setupComplete,
     hasGithubToken: browserSettings.hasGithubToken,
     recoveryWarning: undefined,
@@ -549,6 +647,86 @@ export async function saveSettings(
     hasGithubToken,
   };
   return structuredClone(browserSettings);
+}
+
+let browserBackups: SaveBackupInfo[] = [];
+
+export async function backupSaveData(): Promise<SaveBackupInfo> {
+  if (inTauri) return invoke<SaveBackupInfo>("backup_save_data");
+  const createdAt = Date.now();
+  const backup = { id: `${createdAt}-1`, createdAt, files: 18, bytes: 94_208 };
+  browserBackups = [backup, ...browserBackups].slice(0, 25);
+  return structuredClone(backup);
+}
+
+export async function listSaveBackups(): Promise<SaveBackupInfo[]> {
+  if (inTauri) return invoke<SaveBackupInfo[]>("list_save_backups");
+  return structuredClone(browserBackups);
+}
+
+export async function restoreSaveData(backupId: string): Promise<SaveBackupInfo> {
+  if (inTauri) return invoke<SaveBackupInfo>("restore_save_data", { backupId });
+  const backup = browserBackups.find((candidate) => candidate.id === backupId);
+  if (!backup) throw new Error("Save backup was not found.");
+  return structuredClone(backup);
+}
+
+export async function collectDiagnostics(profileId?: string): Promise<DiagnosticsReport> {
+  if (inTauri) return invoke<DiagnosticsReport>("collect_diagnostics", { profileId });
+  const profile = profileId
+    ? browserProfiles.find((candidate) => candidate.id === profileId)
+    : browserProfiles[0];
+  const instance = browserSettings.gameInstances.find(
+    (candidate) => candidate.id === profile?.gameInstanceId,
+  ) ?? browserSettings.gameInstances[0];
+  return {
+    generatedAt: Date.now(),
+    appVersion: "0.1.3",
+    profileName: profile?.name,
+    game: instance
+      ? {
+          name: instance.name,
+          store: instance.store,
+          arch: instance.arch,
+          runtime: instance.runtime,
+          build: instance.build ?? profile?.gameBuild ?? "2026.3.31",
+          writable: instance.writable ?? true,
+        }
+      : undefined,
+    loader: {
+      current: true,
+      installedVersion: "6.0.0-be.735",
+      winhttp: true,
+      preloader: true,
+      dotnet: true,
+      profilePlugins: profile?.mods.length ?? 0,
+      gamePlugins: 0,
+    },
+    assets: (profile?.mods ?? []).map((mod) => ({
+      name: mod.name,
+      version: mod.version,
+      file: mod.file,
+      enabled: mod.enabled,
+      source: mod.source,
+    })),
+    logErrors: [],
+    gameRunning: browserRunning,
+    warnings: [],
+  };
+}
+
+export async function exportSupportBundle(profileId?: string): Promise<string | null> {
+  if (!inTauri) {
+    await collectDiagnostics(profileId);
+    return "Perfect-Sync-support.zip";
+  }
+  const destination = await saveDialog({
+    title: "Export Perfect-Sync support bundle",
+    defaultPath: "Perfect-Sync-support.zip",
+    filters: [{ name: "ZIP archive", extensions: ["zip"] }],
+  });
+  if (typeof destination !== "string") return null;
+  return invoke<string>("export_support_bundle", { destination, profileId });
 }
 
 let browserRunning = false;
@@ -637,6 +815,35 @@ export async function checkModUpdates(profileId: string, arch: string): Promise<
       return { ...mod, update: latest && latest !== mod.version ? latest : undefined };
     }),
   });
+}
+
+export async function applyModUpdates(
+  profile: Profile,
+  packageIds: string[],
+  arch: string,
+  onProgress?: ProgressHandler,
+): Promise<Profile> {
+  if (inTauri) {
+    return invoke<Profile>("apply_mod_updates", {
+      profileId: profile.id,
+      packageIds,
+      arch,
+      onProgress: progressChannel(onProgress),
+    });
+  }
+  if (packageIds.length === 0) throw new Error("Choose at least one reviewed mod update.");
+  onProgress?.({ phase: "resolving", message: "Resolving reviewed mod updates" });
+  const selected = new Set(packageIds);
+  const updated = replaceBrowserProfile({
+    ...profile,
+    mods: profile.mods.map((mod) =>
+      selected.has(mod.packageId) && mod.update
+        ? { ...mod, version: mod.update, update: undefined }
+        : mod,
+    ),
+  });
+  onProgress?.({ phase: "finalizing", message: "Saving the reviewed mod update batch" });
+  return updated;
 }
 
 // --------------------------------------------------------------- lobby codes
@@ -834,10 +1041,6 @@ async function decodeBrowserCode(code: string): Promise<BrowserManifest> {
 }
 
 export async function encodeLobbyCode(profile: Profile): Promise<string> {
-  if (inTauri) return invoke<string>("encode_lobby_code", { profile });
-  if (profile.mods.some((mod) => mod.enabled && mod.source === "file")) {
-    throw new Error("Local computer mods cannot be shared. Remove them or disable them before creating a lobby code.");
-  }
   requireCodecApi();
   const levelImposterEnabled = profile.mods.some((mod) =>
     mod.enabled && (mod.packageId.toLowerCase() === "digiworm0/levelimposter"
@@ -846,9 +1049,8 @@ export async function encodeLobbyCode(profile: Profile): Promise<string> {
   const manifest: BrowserManifest = {
     v: 1,
     name: profile.name,
-    gameBuild: profile.gameBuild,
     mods: profile.mods
-      .filter((mod) => mod.enabled)
+      .filter((mod) => mod.enabled && mod.source !== "file")
       .map((mod) => ({ id: mod.repo ?? mod.packageId, v: mod.version, ...(mod.asset ? { a: mod.asset } : {}) })),
     ...(levelImposterEnabled && profile.levelImposterMaps?.length ? { maps: profile.levelImposterMaps } : {}),
   };
@@ -876,6 +1078,7 @@ export async function previewCode(code: string, installed: [string, string][]): 
   const installedVersions = new Map(installed.map(([id, version]) => [id.toLowerCase(), version]));
   return {
     name: manifest.name ?? "Imported lobby",
+    gameBuild: undefined,
     items: manifest.mods.map((requested) => {
       const catalog = browserCatalog.find(
         (item) => item.id.toLowerCase() === requested.id.toLowerCase() || item.repo.toLowerCase() === requested.id.toLowerCase(),
@@ -937,19 +1140,20 @@ export async function applyLobbyCode(
     id: `lobby-${slug}-${body.slice(0, 16).toLowerCase()}`,
     name: manifest.name ?? "Imported lobby",
     crewColor: "#ffd23f",
-    gameBuild: manifest.gameBuild,
+    gameBuild: undefined,
     gameInstanceId,
     mods: manifest.mods.map((requested) => {
       const catalog = browserCatalog.find(
         (item) => item.id.toLowerCase() === requested.id.toLowerCase() || item.repo.toLowerCase() === requested.id.toLowerCase(),
       );
       const versions = fixtureVersions(requested.id);
+      const version = requested.v;
       return {
         packageId: catalog?.id ?? requested.id,
         name: catalog?.name ?? requested.id.split("/").at(-1) ?? requested.id,
         repo: catalog?.repo ?? requested.id,
-        version: requested.v,
-        versions: versions.includes(requested.v) ? versions : [requested.v, ...versions],
+        version,
+        versions: versions.includes(version) ? versions : [version, ...versions],
         enabled: true,
         source: catalog ? "catalog" : "github",
         tags: catalog?.tags ?? [],

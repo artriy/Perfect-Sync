@@ -5,8 +5,10 @@ import { MainPanel } from "./components/MainPanel";
 import { LobbyCodeModal } from "./components/LobbyCodeModal";
 import { AddModPanel } from "./components/AddModPanel";
 import { BatchInstallReview } from "./components/BatchInstallReview";
+import { BatchUpdateReview } from "./components/BatchUpdateReview";
 import { MapBrowserPanel } from "./components/MapBrowserPanel";
 import { SettingsModal } from "./components/SettingsModal";
+import { MaintenancePanel } from "./components/MaintenancePanel";
 import { ReleasePicker } from "./components/ReleasePicker";
 import { ShareModal } from "./components/ShareModal";
 import { SetupModal } from "./components/SetupModal";
@@ -69,7 +71,7 @@ interface TrackedOperation {
 function messageFrom(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (/^HTTP status 403$/i.test(message.trim())) {
-    return "HTTP 403: the remote server refused the request. GitHub commonly returns this when its API limit is exhausted; add a GitHub token in Settings or retry after the rate-limit reset.";
+    return "HTTP 403: GitHub temporarily refused this web request. Normal catalog installs do not use REST API quota; retry shortly and verify that github.com is reachable.";
   }
   return message;
 }
@@ -99,17 +101,20 @@ export function App() {
   const [selectedCatalogIds, setSelectedCatalogIds] = useState<string[]>([]);
   const [batchTargets, setBatchTargets] = useState<CatalogItem[]>([]);
   const [mapsOpen, setMapsOpen] = useState(false);
+  const [updateReviewOpen, setUpdateReviewOpen] = useState(false);
   const [mapsReturnToAdd, setMapsReturnToAdd] = useState(false);
   const [lobbyOpen, setLobbyOpen] = useState(false);
   const [lobbyCode, setLobbyCode] = useState<string | undefined>(undefined);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [maintenanceOpen, setMaintenanceOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [launchWarn, setLaunchWarn] = useState<Profile | null>(null);
   const [pickerTarget, setPickerTarget] = useState<{
     repo: string;
     name: string;
     trust: Trust;
-    personal?: boolean;
+    currentVersion?: string;
+    recommendedVersion?: string;
     returnToAdd?: boolean;
   } | null>(null);
 
@@ -174,6 +179,24 @@ export function App() {
       endOperation();
     }
   };
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const usePointerFocus = () => {
+      root.dataset.inputModality = "pointer";
+    };
+    const useKeyboardFocus = () => {
+      root.dataset.inputModality = "keyboard";
+    };
+    usePointerFocus();
+    window.addEventListener("pointerdown", usePointerFocus, true);
+    window.addEventListener("keydown", useKeyboardFocus, true);
+    return () => {
+      window.removeEventListener("pointerdown", usePointerFocus, true);
+      window.removeEventListener("keydown", useKeyboardFocus, true);
+      delete root.dataset.inputModality;
+    };
+  }, []);
 
   // StrictMode replays effects. The startup promise is created synchronously
   // once, so every replay observes the same reads and persistence work while
@@ -727,73 +750,21 @@ export function App() {
     const mod = active.mods.find((candidate) => candidate.packageId === modId);
     if (mod) {
       const repo = mod.repo ?? mod.packageId;
-      setPickerTarget({ repo, name: mod.name, trust: trustOf(repo) });
-    }
-  };
-
-  const addPersonal = async (repo: string, name: string): Promise<void> => {
-    if (operationRef.current || runningRef.current) throw OPERATION_BUSY;
-    setPickerTarget({ repo, name, trust: trustOf(repo), personal: true });
-  };
-
-  const removePersonal = async (repo: string): Promise<void> => {
-    try {
-      await exclusive(async () => {
-        const normalized = await bridge.saveSettings({
-          ...settings,
-          personalMods: settings.personalMods.filter((personal) => personal.repo !== repo),
-        });
-        setSettings(normalized);
+      setPickerTarget({
+        repo,
+        name: mod.name,
+        trust: trustOf(repo),
+        currentVersion: mod.version,
+        recommendedVersion: mod.update,
       });
-    } catch (error) {
-      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
-      throw error;
     }
   };
 
-  const togglePersonal = async (repo: string, enabled: boolean): Promise<void> => {
-    try {
-      await exclusive(async () => {
-        const normalized = await bridge.saveSettings({
-          ...settings,
-          personalMods: settings.personalMods.map((personal) =>
-            personal.repo === repo ? { ...personal, enabled } : personal,
-          ),
-        });
-        setSettings(normalized);
-      });
-    } catch (error) {
-      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
-      throw error;
-    }
-  };
 
   const pickRelease = async (repo: string, tag: string, assetName: string) => {
     const target = pickerTarget;
     if (!target || target.repo !== repo) return;
     try {
-      if (target.personal) {
-        await exclusive(async () => {
-          const previous = settings.personalMods.find((personal) => personal.repo === target.repo);
-          const normalized = await bridge.saveSettings({
-            ...settings,
-            personalMods: [
-              ...settings.personalMods.filter((personal) => personal.repo !== target.repo),
-              {
-                repo: target.repo,
-                tag,
-                asset: assetName,
-                name: target.name,
-                enabled: previous?.enabled ?? true,
-              },
-            ],
-          });
-          setSettings(normalized);
-          setPickerTarget(null);
-          notify(`${target.name} will be added to every lobby you join`);
-        });
-        return;
-      }
 
       const replacing = active.mods.some(
         (mod) => mod.repo === target.repo || mod.packageId === target.repo,
@@ -970,13 +941,8 @@ export function App() {
     }
   };
 
-  const openLobbyFromSidebar = () => {
+  const openLobby = () => {
     setLobbyCode(undefined);
-    setLobbyOpen(true);
-  };
-
-  const openLobbyFromCode = (code: string) => {
-    setLobbyCode(code);
     setLobbyOpen(true);
   };
 
@@ -986,7 +952,7 @@ export function App() {
         {
           scope: "lobby",
           title: doLaunch ? "Setting up and launching lobby" : "Setting up shared lobby",
-          message: "Reading the shared profile and exact versions",
+          message: "Reading the shared profile, exact versions, assets, and maps",
         },
         async (report) => {
           const instance = activeGame;
@@ -1019,6 +985,34 @@ export function App() {
             const details = [warning, ...warnings].filter(Boolean).join(" ");
             notify(details ? `Lobby profile ready: ${built.name}. ${details}` : `Lobby profile ready: ${built.name}`, details ? "error" : "success");
           }
+        },
+      );
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+    }
+  };
+
+  const applyReviewedUpdates = async (packageIds: string[]) => {
+    try {
+      await trackedExclusive(
+        {
+          scope: "mods",
+          title: "Applying reviewed profile updates",
+          message: "Resolving the selected releases and dependencies",
+        },
+        async (report) => {
+          const instance = activeGame;
+          if (!instance) throw new Error("Choose an Among Us instance before updating mods.");
+          const updated = await bridge.applyModUpdates(active, packageIds, instance.arch, report);
+          patchProfile(updated);
+          setUpdateReviewOpen(false);
+          const loaderWarning = await ensureLoaderInternal(updated);
+          notify(
+            loaderWarning
+              ? `Applied ${packageIds.length} reviewed update${packageIds.length === 1 ? "" : "s"}. ${loaderWarning}`
+              : `Applied ${packageIds.length} reviewed update${packageIds.length === 1 ? "" : "s"}.`,
+            loaderWarning ? "error" : "success",
+          );
         },
       );
     } catch (error) {
@@ -1121,21 +1115,26 @@ export function App() {
     settingsOpen ||
     pickerTarget !== null ||
     shareOpen ||
+    maintenanceOpen ||
     firstRun ||
+    updateReviewOpen ||
     launchWarn !== null;
 
   return (
-    <div className="flex h-[100dvh] flex-col">
+    <div className="flex h-[100dvh] flex-col max-[720px]:h-auto max-[720px]:min-h-[100dvh]">
       <div
-        className="flex min-h-0 flex-1 flex-col"
+        className="flex min-h-0 flex-1 flex-col max-[720px]:overflow-visible"
         inert={topLevelOverlayOpen}
         aria-hidden={topLevelOverlayOpen}
       >
       <TopBar
         onAddMod={openAddPanel}
-        onPasteCode={openLobbyFromCode}
+        onJoinLobby={openLobby}
         onOpenSettings={() => {
           if (!busy) setSettingsOpen(true);
+        }}
+        onOpenMaintenance={() => {
+          if (!busy) setMaintenanceOpen(true);
         }}
       />
 
@@ -1160,15 +1159,14 @@ export function App() {
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1 p-3 pt-2.5">
-        <div className="glass flex min-h-0 flex-1 overflow-hidden rounded-3xl">
+      <div className="flex min-h-0 min-w-0 flex-1 p-3 pt-2.5 max-[720px]:p-2">
+        <div className="glass flex min-h-0 min-w-0 flex-1 overflow-hidden rounded-3xl max-[720px]:w-full max-[720px]:flex-col max-[720px]:overflow-visible max-[720px]:rounded-2xl">
           <Sidebar
             profiles={profiles}
             activeId={active.id}
             busy={busy}
             onSelect={(id) => void selectProfile(id)}
             onNewProfile={() => void newProfile()}
-            onPasteCode={openLobbyFromSidebar}
           />
           <MainPanel
             profile={active}
@@ -1186,6 +1184,9 @@ export function App() {
             onDelete={deleteActiveProfile}
             onLaunch={() => void doLaunchProfile(active)}
             onAddMod={openAddPanel}
+            onReviewUpdates={() => {
+              if (!busy) setUpdateReviewOpen(true);
+            }}
             onBrowseMaps={() => {
               setMapsReturnToAdd(false);
               if (!busy) setMapsOpen(true);
@@ -1288,10 +1289,19 @@ export function App() {
           if (!operationRef.current) setSettingsOpen(false);
         }}
         onSave={saveSettings}
-        onAddPersonal={addPersonal}
-        onRemovePersonal={removePersonal}
-        onTogglePersonal={togglePersonal}
         trustOf={trustOf}
+      />
+      <MaintenancePanel
+        open={maintenanceOpen}
+        profileId={active.id}
+        onClose={() => setMaintenanceOpen(false)}
+      />
+      <BatchUpdateReview
+        open={updateReviewOpen}
+        profile={active}
+        busy={operationBusy}
+        onClose={() => setUpdateReviewOpen(false)}
+        onApply={(packageIds) => void applyReviewedUpdates(packageIds)}
       />
       <ReleasePicker
         open={pickerTarget !== null}
@@ -1299,6 +1309,9 @@ export function App() {
         modName={pickerTarget?.name ?? ""}
         trust={pickerTarget?.trust ?? "flagged"}
         busy={operationBusy}
+        profileId={active.id}
+        currentVersion={pickerTarget?.currentVersion}
+        recommendedVersion={pickerTarget?.recommendedVersion}
         onClose={() => {
           if (!operationRef.current) setPickerTarget(null);
         }}

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { Copy, GearSix, LinkSimple, Minus, Plus, Square, X } from "@phosphor-icons/react";
+import perfectSyncLogo from "../assets/perfect-sync-logo.svg";
+import { Copy, FirstAid, GearSix, LinkSimple, Minus, Plus, Square, X } from "@phosphor-icons/react";
 import {
-  extractLobbyCode,
   onWindowResized,
   winClose,
   winIsMaximized,
@@ -11,13 +11,12 @@ import {
 
 interface TopBarProps {
   onAddMod: () => void;
-  onPasteCode: (code: string) => void;
+  onJoinLobby: () => void;
   onOpenSettings: () => void;
+  onOpenMaintenance: () => void;
 }
 
-export function TopBar({ onAddMod, onPasteCode, onOpenSettings }: TopBarProps) {
-  const [q, setQ] = useState("");
-  const [inputError, setInputError] = useState("");
+export function TopBar({ onAddMod, onJoinLobby, onOpenSettings, onOpenMaintenance }: TopBarProps) {
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
@@ -45,20 +44,6 @@ export function TopBar({ onAddMod, onPasteCode, onOpenSettings }: TopBarProps) {
     };
   }, []);
 
-  const submit = () => {
-    if (!q.trim()) {
-      setInputError("Paste a lobby code to continue.");
-      return;
-    }
-    const code = extractLobbyCode(q);
-    if (!code) {
-      setInputError("That text does not contain a valid PERFECT lobby code.");
-      return;
-    }
-    onPasteCode(code);
-    setQ("");
-    setInputError("");
-  };
 
   const toggleMaximize = async () => {
     await winToggleMaximize();
@@ -66,77 +51,65 @@ export function TopBar({ onAddMod, onPasteCode, onOpenSettings }: TopBarProps) {
   };
 
   return (
-    <header data-tauri-drag-region className="glass-2 flex min-w-0 items-center gap-3 px-4 py-3">
-      <div data-tauri-drag-region className="flex shrink-0 items-baseline gap-1.5 font-semibold tracking-tight">
-        <span data-tauri-drag-region>Perfect-Sync</span>
-        <span data-tauri-drag-region className="font-mono text-[9.5px] font-medium text-ink-faint">v0.1.1</span>
-      </div>
-
-      <div className="relative min-w-[180px] max-w-[460px] flex-1">
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            submit();
-          }}
-          className="glass flex min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-ink-dim focus-within:text-ink focus-within:ring-2 focus-within:ring-[#9b7bff]/70"
-        >
-          <LinkSimple size={16} className="shrink-0 opacity-70" aria-hidden="true" />
-          <input
-            value={q}
-            maxLength={4096}
-            onChange={(event) => {
-              setQ(event.target.value);
-              if (inputError) setInputError("");
-            }}
-            placeholder="Paste a lobby code or link…"
-            className="w-full min-w-0 bg-transparent text-[13.5px] text-ink placeholder:text-ink-faint focus:outline-none"
-            aria-label="Lobby code or link"
-            aria-invalid={inputError ? "true" : undefined}
-            aria-describedby={inputError ? "lobby-code-error" : undefined}
-          />
-          <button
-            type="submit"
-            className="ring-focus shrink-0 rounded-md px-1.5 py-0.5 text-[12px] font-semibold text-accent-2 hover:text-ink"
-          >
-            Apply
-          </button>
-        </form>
-        {inputError && (
-          <p
-            id="lobby-code-error"
-            role="alert"
-            className="glass-strong absolute top-full left-1 z-50 mt-1 max-w-[calc(100vw-2rem)] rounded-lg px-2.5 py-1.5 text-[12px] text-[#ffabab]"
-          >
-            {inputError}
-          </p>
-        )}
+    <header data-tauri-drag-region className="glass-2 flex min-w-0 items-center gap-2 px-4 py-2.5">
+      <div data-tauri-drag-region className="flex shrink-0 items-center gap-2">
+        <img
+          data-tauri-drag-region
+          src={perfectSyncLogo}
+          alt=""
+          aria-hidden="true"
+          className="h-7 w-7 shrink-0 rounded-[6px]"
+        />
+        <div data-tauri-drag-region className="flex items-baseline gap-1.5 font-semibold tracking-tight">
+          <span data-tauri-drag-region>Perfect-Sync</span>
+          <span data-tauri-drag-region className="font-mono text-[11px] font-medium text-ink-faint max-[600px]:hidden">v0.1.3</span>
+        </div>
       </div>
 
       <div data-tauri-drag-region className="min-w-0 flex-1 self-stretch" />
 
       <button
         type="button"
-        onClick={onAddMod}
-        className="ring-focus accent-grad flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-[13px] font-semibold text-[#0d0820] transition-transform active:scale-[0.97]"
+        onClick={onJoinLobby}
+        className="ring-focus glass flex h-10 shrink-0 items-center gap-1.5 rounded-xl px-3.5 text-[13px] font-semibold text-ink-dim transition-colors hover:text-ink active:scale-[0.97] max-[600px]:w-10 max-[600px]:justify-center max-[600px]:px-0"
       >
-        <Plus size={15} weight="bold" /> Add mod
+        <LinkSimple size={16} weight="bold" aria-hidden="true" />
+        <span className="max-[600px]:sr-only">Join lobby</span>
+      </button>
+
+      <button
+        type="button"
+        onClick={onAddMod}
+        className="ring-focus glass flex h-10 shrink-0 items-center gap-1.5 rounded-xl px-3.5 text-[13px] font-semibold text-ink transition-colors hover:bg-white/[0.08] active:scale-[0.97] max-[600px]:w-10 max-[600px]:justify-center max-[600px]:px-0"
+      >
+        <Plus size={15} weight="bold" className="text-accent-2" aria-hidden="true" />
+        <span className="max-[600px]:sr-only">Add mod</span>
+      </button>
+
+      <button
+        type="button"
+        aria-label="Health and maintenance"
+        onClick={onOpenMaintenance}
+        className="ring-focus glass grid h-10 w-10 shrink-0 place-items-center rounded-xl text-ink-dim transition-colors hover:text-crew-cyan"
+      >
+        <FirstAid size={18} />
       </button>
 
       <button
         type="button"
         aria-label="Settings"
         onClick={onOpenSettings}
-        className="ring-focus glass grid h-[34px] w-[34px] place-items-center rounded-[10px] text-ink-dim transition-colors hover:text-ink"
+        className="ring-focus glass grid h-10 w-10 shrink-0 place-items-center rounded-xl text-ink-dim transition-colors hover:text-ink"
       >
         <GearSix size={17} />
       </button>
 
-      <div className="ml-1 flex items-center gap-1">
+      <div className="ml-1 flex shrink-0 items-center gap-1 max-[520px]:ml-0">
         <button
           type="button"
           aria-label="Minimize"
           onClick={() => winMinimize()}
-          className="ring-focus grid h-[34px] w-[34px] place-items-center rounded-[10px] text-ink-dim transition-colors hover:bg-white/10 hover:text-ink"
+          className="ring-focus grid h-10 w-10 place-items-center rounded-xl text-ink-dim transition-colors hover:bg-white/10 hover:text-ink max-[520px]:h-9 max-[520px]:w-9"
         >
           <Minus size={15} weight="bold" />
         </button>
@@ -145,7 +118,7 @@ export function TopBar({ onAddMod, onPasteCode, onOpenSettings }: TopBarProps) {
           aria-label={isMaximized ? "Restore" : "Maximize"}
           title={isMaximized ? "Restore" : "Maximize"}
           onClick={() => void toggleMaximize().catch(() => {})}
-          className="ring-focus grid h-[34px] w-[34px] place-items-center rounded-[10px] text-ink-dim transition-colors hover:bg-white/10 hover:text-ink"
+          className="ring-focus grid h-10 w-10 place-items-center rounded-xl text-ink-dim transition-colors hover:bg-white/10 hover:text-ink max-[520px]:h-9 max-[520px]:w-9"
         >
           {isMaximized ? <Copy size={13} weight="bold" /> : <Square size={13} weight="bold" />}
         </button>
@@ -153,7 +126,7 @@ export function TopBar({ onAddMod, onPasteCode, onOpenSettings }: TopBarProps) {
           type="button"
           aria-label="Close"
           onClick={() => winClose()}
-          className="ring-focus grid h-[34px] w-[34px] place-items-center rounded-[10px] text-ink-dim transition-colors hover:bg-[#e23b3b] hover:text-white"
+          className="ring-focus grid h-10 w-10 place-items-center rounded-xl text-ink-dim transition-colors hover:bg-[#e23b3b] hover:text-white max-[520px]:h-9 max-[520px]:w-9"
         >
           <X size={16} weight="bold" />
         </button>

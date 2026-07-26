@@ -35,6 +35,17 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
     cmp(candidate, current) == Some(Ordering::Greater)
 }
 
+/// Match a release tag against every validated semver requirement.
+pub fn satisfies_all(tag: &str, requirements: &[String]) -> bool {
+    let Some(Version::SemVer(version)) = parse(tag) else {
+        return false;
+    };
+    requirements.iter().all(|requirement| {
+        semver::VersionReq::parse(requirement.trim())
+            .is_ok_and(|requirement| requirement.matches(&version))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +90,14 @@ mod tests {
     fn bare_be_markers_order_numerically() {
         assert!(is_newer("be.770", "be.764"));
         assert_eq!(cmp("be.764", "be.764"), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn matches_combined_dependency_requirements() {
+        let requirements = vec![">=2.0.0".into(), "<=2.4.0".into()];
+        assert!(satisfies_all("v2.4.0", &requirements));
+        assert!(!satisfies_all("2.5.0", &requirements));
+        assert!(!satisfies_all("release-next", &requirements));
     }
 
     #[test]

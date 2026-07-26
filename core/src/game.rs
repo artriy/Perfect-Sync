@@ -25,11 +25,14 @@ struct SteamRoot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GameInstall {
     pub path: PathBuf,
     pub store: Store,
     pub arch: Arch,
     pub runtime: Runtime,
+    pub build: Option<String>,
+    pub writable: bool,
 }
 
 /// Architecture a store's Among Us build uses (Steam/Epic/itch = x86, MS Store = x64).
@@ -62,16 +65,70 @@ pub fn exe_arch(exe: &Path) -> Option<Arch> {
     }
 }
 
+/// Read the Unity player version embedded in `globalgamemanagers`. Among Us
+/// publishes calendar-style versions (for example `2026.3.31`), while the same
+/// file also contains the older Unity engine version. Selecting the greatest
+/// valid date tuple reliably distinguishes the game build without launching it.
+pub fn detect_build(game_dir: &Path) -> Option<String> {
+    use std::io::Read;
+
+    const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+    let path = game_dir.join("Among Us_Data").join("globalgamemanagers");
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(MAX_METADATA_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let pattern = regex::Regex::new(r"\b(20\d{2})\.(\d{1,2})\.(\d{1,2})(?:\.[0-9A-Za-z-]+)?\b")
+        .expect("static build regex");
+    pattern
+        .captures_iter(&text)
+        .filter_map(|capture| {
+            let year = capture[1].parse::<u16>().ok()?;
+            let month = capture[2].parse::<u8>().ok()?;
+            let day = capture[3].parse::<u8>().ok()?;
+            if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+                return None;
+            }
+            Some(((year, month, day), capture[0].to_string()))
+        })
+        .max_by_key(|(date, _)| *date)
+        .map(|(_, version)| version)
+}
+
+/// Verify actual directory write access instead of trusting a read-only bit,
+/// which does not reflect WindowsApps/Game Pass ACLs.
+pub fn is_writable_game_dir(game_dir: &Path) -> bool {
+    let probe = game_dir.join(format!(".perfectsync-write-test-{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            fs::remove_file(probe).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 /// Build a GameInstall, reading the real exe's bitness when present and falling
 /// back to the store's known arch.
 fn make_install(path: PathBuf, store: Store, runtime: Runtime) -> GameInstall {
     let arch =
         exe_arch(&path.join(crate::process::GAME_EXE)).unwrap_or_else(|| arch_for_store(store));
+    let build = detect_build(&path);
+    let writable = is_writable_game_dir(&path);
     GameInstall {
         path,
         store,
         arch,
         runtime,
+        build,
+        writable,
     }
 }
 
@@ -197,6 +254,54 @@ pub fn locate_epic(manifests_dir: &Path) -> Option<GameInstall> {
         }
     }
     None
+}
+
+/// Extract Gaming Services `InstallLocation` values from `reg query` output.
+/// This parser is deliberately indifferent to localized key names and spacing.
+pub fn parse_msstore_install_locations(output: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for line in output.lines() {
+        let Some((_, value)) = line.split_once("REG_SZ") else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        push_unique_path(&mut paths, PathBuf::from(value));
+    }
+    paths
+}
+
+#[cfg(windows)]
+fn locate_msstore_all() -> Vec<GameInstall> {
+    const ROOT: &str = r"HKLM\SOFTWARE\Microsoft\GamingServices\PackageRepository\Root";
+    let Ok(output) = crate::process::command("reg")
+        .args(["query", ROOT, "/s", "/v", "InstallLocation"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut found = Vec::new();
+    for registered in parse_msstore_install_locations(&text) {
+        let Some(game_dir) = find_exe_dir(&registered, 3) else {
+            continue;
+        };
+        push_unique_install(
+            &mut found,
+            make_install(game_dir, Store::Msstore, Runtime::Native),
+        );
+    }
+    found
+}
+
+#[cfg(not(windows))]
+fn locate_msstore_all() -> Vec<GameInstall> {
+    Vec::new()
 }
 
 /// Candidate Steam roots for the current host, retaining whether each belongs
@@ -369,6 +474,8 @@ fn store_for_path(path: &Path, fallback: Store) -> Store {
         Store::Steam
     } else if path.join(".egstore").is_dir() || p.contains("/epic games/") {
         Store::Epic
+    } else if p.contains("/windowsapps/") || p.contains("/xboxgames/") {
+        Store::Msstore
     } else {
         fallback
     }
@@ -502,6 +609,9 @@ fn locate_other() -> Vec<GameInstall> {
                 push_unique_install(&mut found, game);
             }
         }
+        for game in locate_msstore_all() {
+            push_unique_install(&mut found, game);
+        }
         return found;
     }
     let explicit_prefix = std::env::var_os("WINEPREFIX").map(PathBuf::from);
@@ -606,6 +716,47 @@ mod tests {
             Some(PathBuf::from(r"C:\Games\AmongUs"))
         );
         assert_eq!(parse_epic_manifest(no), None);
+    }
+
+    #[test]
+    fn parses_msstore_registry_locations() {
+        let output = r#"
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\GamingServices\PackageRepository\Root\one
+    InstallLocation    REG_SZ    D:\XboxGames\Among Us\Content
+
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\GamingServices\PackageRepository\Root\two
+    InstallLocation    REG_SZ    C:\Program Files\WindowsApps\Innersloth.AmongUs
+"#;
+        assert_eq!(
+            parse_msstore_install_locations(output),
+            vec![
+                PathBuf::from(r"D:\XboxGames\Among Us\Content"),
+                PathBuf::from(r"C:\Program Files\WindowsApps\Innersloth.AmongUs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_calendar_game_build_over_unity_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Among Us_Data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(
+            data.join("globalgamemanagers"),
+            b"\0Unity 2022.3.44\0Among Us 2026.3.31\0fallback 2022.3.44",
+        )
+        .unwrap();
+        assert_eq!(detect_build(temp.path()).as_deref(), Some("2026.3.31"));
+    }
+
+    #[test]
+    fn write_probe_cleans_up_after_itself() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(is_writable_game_dir(temp.path()));
+        assert!(!temp
+            .path()
+            .join(format!(".perfectsync-write-test-{}", std::process::id()))
+            .exists());
     }
 
     #[test]

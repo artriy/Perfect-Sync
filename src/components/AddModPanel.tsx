@@ -176,7 +176,7 @@ export function AddModPanel({
                 <FileArrowUp size={16} />
                 {pending === "local" ? "Adding local DLL…" : "Choose a .dll from this computer"}
               </button>
-              <p className="mt-1.5 px-1 text-[11px] leading-snug text-ink-faint">Local DLLs stay on this profile and cannot be included in lobby codes.</p>
+              <p className="mt-1.5 px-1 text-[12.5px] leading-snug text-ink-faint">Local DLLs stay on this profile and cannot be included in lobby codes.</p>
             </div>
 
             {actionError && <p className="mx-5 mb-3 rounded-xl bg-[rgba(226,59,59,0.12)] px-3 py-2 text-[12.5px] break-words text-[#ff8a8a]" role="alert">Could not add mod: {actionError}</p>}
@@ -228,7 +228,7 @@ export function AddModPanel({
                     </div>
                     <p className="mt-1.5 line-clamp-3 text-[12.5px] leading-snug break-words text-ink-dim" title={item.summary || item.repo}>{item.summary || item.repo}</p>
                     <div className="mt-3 flex min-w-0 items-center justify-between gap-2">
-                      <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-ink-faint" title={item.repo} aria-label={`Repository ${item.repo}`}>{item.repo}</span>
+                      <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink-faint" title={item.repo} aria-label={`Repository ${item.repo}`}>{item.repo}</span>
                       {manage ? (
                         <div className="flex shrink-0 items-center gap-1">
                           <button

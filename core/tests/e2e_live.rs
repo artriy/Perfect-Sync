@@ -1,16 +1,17 @@
 //! End-to-end LIVE integration test for the full mod pipeline.
 //!
-//! Hits the real GitHub API + CDN, so it is `#[ignore]`d by default. Run with:
+//! Hits real release pages and CDNs, so it is `#[ignore]`d by default. Run with:
 //!   cargo test -p perfect-sync-core --test e2e_live -- --ignored --nocapture
 //!
 //! It resolves Reactor's latest release, downloads the actual asset, installs it
 //! into a temp profile's BepInEx/plugins, and builds the Doorstop launch spec.
 
 use perfect_sync_core::resolver::Http;
-use perfect_sync_core::{catalog, loader, profile, resolver};
+use perfect_sync_core::{catalog, loader, profile, resolver, tou_cosmetics};
 use std::path::Path;
 
 const CATALOG: &str = include_str!("../fixtures/catalog.sample.json");
+const BUNDLED_CATALOG: &str = include_str!("../../catalog/catalog.json");
 
 /// LIVE: resolve + download the BepInEx IL2CPP pack from GitHub (no Thunderstore)
 /// and install the Doorstop bootstrap + framework into a temp game + profile.
@@ -58,20 +59,42 @@ fn live_install_latest_bepinex_from_build_server() {
 
 #[test]
 #[ignore]
-fn live_resolve_town_of_us_to_bare_dll() {
+fn live_town_of_us_release_includes_version_matched_cosmetics() {
     let cat = catalog::parse(CATALOG).unwrap();
     let rules = &cat.get("AU-Avengers/TOU-Mira").unwrap().asset_rules;
     let http = resolver::UreqHttp::new(None);
 
-    let resolved = resolver::resolve_latest(&http, "AU-Avengers/TOU-Mira", rules, "x64")
-        .expect("resolve Town of Us - Mira latest");
+    let selected_version = std::env::var("TOU_VERSION").ok();
+    let plugin = match selected_version.as_deref() {
+        Some(version) => {
+            resolver::resolve_tag(&http, "AU-Avengers/TOU-Mira", version, rules, "x86")
+        }
+        None => resolver::resolve_latest(&http, "AU-Avengers/TOU-Mira", rules, "x86"),
+    }
+    .expect("resolve selected Town of Us - Mira version");
+    assert_eq!(plugin.asset_name, "TownOfUsMira.dll");
 
+    let release = resolver::fetch_release_by_tag(&http, tou_cosmetics::PACKAGE_ID, &plugin.version)
+        .expect("resolve the exact selected Town of Us release");
+    let pack =
+        tou_cosmetics::select_release_pack(&release, "x86", perfect_sync_core::types::Store::Steam)
+            .expect("select the matching Steam cosmetics pack");
+    assert_eq!(pack.version, plugin.version);
+    assert!(pack.asset_name.to_ascii_lowercase().contains("x86"));
+    assert!(pack.asset_name.to_ascii_lowercase().contains("steam"));
+
+    let bytes = resolver::download_resolved(&http, &pack).expect("download verified release pack");
+    let cosmetics = tou_cosmetics::extract_release_pack(&bytes, &plugin.version, &pack.asset_name)
+        .expect("extract Town of Us cosmetics");
+    assert!(cosmetics.bundle.starts_with(b"UnityFS\0"));
+    assert!(cosmetics.catalog.starts_with(b"{"));
     println!(
-        "resolved: {} {} ({} bytes) -> {}",
-        resolved.asset_name, resolved.version, resolved.size, resolved.url
+        "{} -> {} (bundle {} bytes, catalog {} bytes)",
+        plugin.version,
+        pack.asset_name,
+        cosmetics.bundle.len(),
+        cosmetics.catalog.len()
     );
-    assert_eq!(resolved.asset_name, "TownOfUsMira.dll");
-    assert!(resolved.url.ends_with("/TownOfUsMira.dll"));
 }
 
 #[test]
@@ -142,4 +165,46 @@ fn live_end_to_end_reactor_install() {
     );
     assert!(spec.program.ends_with("Among Us.exe"));
     println!("launch: {:?}", spec.program);
+}
+
+#[test]
+#[ignore]
+fn live_end_to_end_catalog_zip_install() {
+    let catalog = catalog::parse(BUNDLED_CATALOG).unwrap();
+    let entry = catalog
+        .get("TheOtherRolesAU/TheOtherRoles")
+        .expect("The Other Roles catalog entry");
+    let mut archive_rules = entry.asset_rules.clone();
+    archive_rules.dll_name = None;
+    let http = resolver::UreqHttp::new(None);
+    let resolved = resolver::resolve_latest(
+        &http,
+        entry.repo.as_deref().unwrap_or(&entry.id),
+        &archive_rules,
+        "x86",
+    )
+    .expect("resolve latest catalog ZIP");
+    assert!(resolved.asset_name.to_ascii_lowercase().ends_with(".zip"));
+
+    let bytes = resolver::download_resolved(&http, &resolved).expect("download verified ZIP");
+    let temporary = tempfile::tempdir().unwrap();
+    let dll_name = entry
+        .asset_rules
+        .dll_name
+        .as_deref()
+        .expect("declared plugin DLL");
+    let installed =
+        profile::install_plugin_zip_bytes(temporary.path(), "archive", dll_name, &bytes)
+            .expect("extract only the declared plugin DLL");
+    assert_eq!(
+        installed.file_name().and_then(|name| name.to_str()),
+        Some(dll_name)
+    );
+    assert!(std::fs::metadata(&installed).unwrap().len() > 0);
+    println!(
+        "resolved {} {} and installed {}",
+        resolved.asset_name,
+        resolved.version,
+        installed.display()
+    );
 }

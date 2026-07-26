@@ -35,6 +35,15 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonalLocalMod {
+    pub path: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameInstance {
@@ -44,6 +53,10 @@ pub struct GameInstance {
     pub arch: Arch,
     pub store: Store,
     pub runtime: Runtime,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub build: Option<String>,
+    #[serde(default = "default_true")]
+    pub writable: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -53,6 +66,8 @@ pub struct Settings {
     pub game_instances: Vec<GameInstance>,
     #[serde(default)]
     pub personal_mods: Vec<PersonalMod>,
+    #[serde(default)]
+    pub personal_local_mods: Vec<PersonalLocalMod>,
     #[serde(default)]
     pub setup_complete: bool,
     #[serde(default)]
@@ -196,6 +211,8 @@ fn migrate_legacy_game(text: &str) -> Option<GameInstance> {
         arch,
         store,
         runtime,
+        build: None,
+        writable: true,
     })
 }
 

@@ -1,8 +1,14 @@
 mod commands;
+mod console_monitor;
 mod settings;
 
 use tauri::Manager;
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
+
+#[doc(hidden)]
+pub fn run_console_monitor_if_requested() -> bool {
+    console_monitor::run_if_requested()
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -53,6 +59,7 @@ pub fn run() {
             commands::preview_code,
             commands::detect_games,
             commands::inspect_game,
+            commands::create_managed_game_copy,
             commands::get_settings,
             commands::save_settings,
             commands::game_running,
@@ -64,6 +71,11 @@ pub fn run() {
             commands::ensure_loader,
             commands::reinstall_loader,
             commands::loader_status,
+            commands::collect_diagnostics,
+            commands::export_support_bundle,
+            commands::backup_save_data,
+            commands::list_save_backups,
+            commands::restore_save_data,
             commands::list_profiles,
             commands::save_profile,
             commands::delete_profile,
@@ -86,6 +98,7 @@ pub fn run() {
             commands::launch_profile,
             commands::launch_vanilla,
             commands::check_mod_updates,
+            commands::apply_mod_updates,
             commands::check_update,
             commands::open_url,
             commands::sync_profile

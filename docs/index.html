@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="color-scheme" content="dark" />
 <title>Open in Perfect-Sync</title>
+<link rel="icon" type="image/svg+xml" href="assets/logo-mark.svg" />
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -18,8 +19,8 @@
     background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.1);
     box-shadow: 0 24px 70px rgba(0,0,0,0.45);
   }
-  .logo { width: 12px; height: 12px; border-radius: 4px; display: inline-block;
-    background: linear-gradient(135deg,#9b7bff,#7b96ff); vertical-align: middle; margin-right: 8px; }
+  .logo { width: 28px; height: 28px; display: inline-block; object-fit: contain;
+    vertical-align: middle; margin-right: 8px; }
   h1 { font-size: 21px; margin: 0 0 4px; font-weight: 700; }
   p { color: #b9b4d0; font-size: 14px; line-height: 1.5; margin: 10px 0; }
   .lobby { color: #fff; font-weight: 700; }
@@ -37,7 +38,7 @@
 </head>
 <body>
   <div class="card">
-    <h1><span class="logo"></span>Opening Perfect-Sync…</h1>
+    <h1><img class="logo" src="assets/logo-mark.svg" alt="" aria-hidden="true" />Opening Perfect-Sync…</h1>
     <p id="for"></p>
     <p>If your app didn't open automatically, click below.</p>
     <a class="btn" id="open" href="#">Open Perfect-Sync</a>

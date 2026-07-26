@@ -1,10 +1,24 @@
 # Changelog
 
+## v0.1.3 (experimental)
+
+This release includes the complete v0.1.1 and v0.1.0 change sets documented
+below, plus:
+
+- Adopt the Twin Relay logo across the app, browser favicon, documentation,
+  platform icon bundles, executable, and Windows installers.
+- Brand the NSIS installer with an explicit Twin Relay executable icon, custom
+  welcome/sidebar and header artwork, and timeless publisher text.
+- Embed the selected logo directly in the standard versioned setup executable;
+  the v0.1.3 filename also avoids stale Windows Explorer cache entries from
+  earlier installer builds.
+
 ## v0.1.1 (experimental)
 
 - Launch EpicGamesStarter with interactive input and an isolated Legendary token
   store on Windows, Linux, and macOS, preventing Among Us's incompatible
-  `EGSAuth.json` from crashing the first-time Epic login.
+  `EGSAuth.json` from crashing first-time Epic login while automatically closing
+  the helper's final success prompt after the game starts.
 - Keep a modal, stage-aware progress surface visible while applying lobby codes,
   installing mod batches, changing releases, and downloading LevelImposter maps.
 - Create and synchronize managed maps at
@@ -16,6 +30,10 @@
 
 - Default Town of Us - Mira to `TownOfUsMira.dll`, ignore stale cached ZIP rules,
   and expose every direct DLL from the chosen release in the install review.
+- Provision and verify `touhats.bundle` and `touhats.catalog` from the exact
+  selected Town of Us - Mira release pack before launch, replacing them when
+  the selected mod version changes and using a conventional Win32 working path
+  so Epic's Addressables runtime resolves the `touhats` catalog key.
 - Retry LevelImposter banners through a bounded native image proxy when WebView loading
   fails, and keep Windows verbatim path prefixes out of every user-facing label.
 - Display the application version in the title bar so corrected builds are identifiable.
@@ -24,7 +42,34 @@
 - Allow exact release changes for installed managed dependencies and reset release
   picker state after each completed install so another version can be chosen immediately.
 - Close Add Mod, Settings, and release dialogs by clicking their shaded backdrop.
-- Explain GitHub API-limit HTTP 403 responses with token and retry guidance.
+- Resolve GitHub releases through API-free release pages, Atom feeds, and expanded
+  asset metadata, eliminating normal catalog use of the 60-request REST quota.
+- Install catalog-selected ZIP packages by extracting exactly one declared plugin
+  DLL with traversal, duplicate, symlink, entry-count, and expanded-size checks.
+- Enforce semver requirements for shared dependencies while leaving top-level mod
+  combinations under user control, selecting the newest release that satisfies every root.
+- Prioritize the catalog-recommended DLL for installed-mod updates while keeping
+  exact repository, release, and asset confirmation plus advanced version selection.
+- Save or discard instance, token, and lobby-default mod changes as one Settings
+  draft, including personal-mod asset selection through the shared release picker.
+- Reflow the desktop shell at the supported minimum size and high zoom, consolidate
+  lobby joining into one entry point, and quiet glass, glow, and metadata hierarchy.
+- Detect Microsoft Store and Game Pass installations, create bounded transactional
+  writable x64 managed copies, and launch those copies through the store-aware path.
+- Expand the built-in catalog to 30 maintained mods with verified repository identities
+  and explicit release-asset rules where upstream projects publish stable DLL names.
+- Add Health & Maintenance diagnostics, redacted support bundles, and transactional
+  Innersloth save-data backups with safety backups before restore.
+- Review all available mod updates as one batch and apply the confirmed set in one
+  profile transaction.
+- Persist local DLL defaults alongside personal GitHub defaults, merge both into new
+  lobby profiles, and keep every local file out of shared lobby codes.
+- Let users disable or remove automatically added dependencies. Explicit installs add
+  dependencies once; lobby application follows only the exact contents of its code.
+- Preserve exact mod versions, selected release assets, and LevelImposter map IDs in
+  lobby codes while keeping local DLLs and game-build restrictions device-local.
+- Remove pointer-triggered persistent focus rings while preserving keyboard focus
+  visibility, and make add-mod selection state explicit with a stable checkmark.
 
 ## v0.1.0 (experimental)
 

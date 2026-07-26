@@ -63,34 +63,38 @@ and apply a shared lobby mod set.
 </table>
 
 Plus architecture detection (x86 or x64 from the game executable), a global list of
-named Among Us instances with one assigned independently to each profile, and personal
-mods that can be reconciled with the dependencies in an applied lobby.
+named Among Us instances with one assigned independently to each profile, and persistent
+personal GitHub or local-DLL defaults merged into every applied lobby profile. Local DLLs
+remain device-only and are never serialized into lobby codes.
 
 > [!TIP]
 > **The app-data profile is the source of truth for Perfect-Sync-managed plugin DLLs.**
 > At setup or launch, Perfect-Sync publishes that profile into the writable game copy.
 > It deliberately replaces or removes DLLs recorded as Perfect-Sync-owned when the
 > profile changes. DLLs it does not own are preserved, and a managed DLL is not allowed
-> to overwrite an unmanaged file with the same name. Microsoft Store / Game Pass copies
-> in the protected `WindowsApps` tree must first be copied to a normal writable folder.
+> to overwrite an unmanaged file with the same name. Microsoft Store / Game Pass installs
+> in the protected `WindowsApps` tree use Settings' managed-copy flow to create a normal,
+> writable x64 game copy before setup or launch.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
 ## How it works
 
-1. **Set up.** On first run the wizard detects supported Steam or Epic locations, or
-   you select a writable folder containing `Among Us.exe`. Add and name other game
-   copies later in Settings. Native Game Pass files under `WindowsApps` must be copied
-   elsewhere first.
+1. **Set up.** On first run the wizard detects supported Steam, Epic, Microsoft Store,
+   or Game Pass locations, or you select a folder containing `Among Us.exe`. Add and
+   name other game copies later in Settings. Protected Store installations can be copied
+   transactionally into a writable managed location from the same screen.
 2. **Add mods.** Browse the catalog or enter an exact HTTPS GitHub repository URL.
 3. **Pick a version.** Choose a release asset. Unknown repositories and assets require
    an explicit confirmation before native code is installed.
 4. **Manage.** Toggle mods, change versions, create or switch profiles, and assign a
    game instance to each profile. The profile and its managed DLLs live under the
    host's application-data directory, not in the selected game folder.
-5. **Share or apply.** Export a `PERFECT-` code, or preview a per-mod diff and trust
-   classification before applying a friend's code. Unknown lobby mods require an
-   explicit confirmation.
+5. **Share or apply.** Export a `PERFECT-` code containing every enabled shareable
+   mod's exact repository identity, release version, selected asset, and the exact
+   LevelImposter map IDs. Preview the resulting per-mod changes and trust classification
+   before applying it. Local DLLs and game-build restrictions remain device-local.
+   Unknown lobby repositories still require explicit confirmation.
 6. **Launch.** Perfect-Sync reconciles dependencies, transactionally publishes the
    profile's owned DLLs, verifies BepInEx, and starts the Windows game. On Linux and
    macOS the native Perfect-Sync app launches the Windows game through a configured

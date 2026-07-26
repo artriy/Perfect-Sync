@@ -4,9 +4,11 @@
 //! HTTP is behind the `Http` trait so resolution is unit-testable with a mock.
 
 use crate::catalog::{self, AssetRules};
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
+use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt;
 use std::io::Read;
 use std::time::Duration;
@@ -185,9 +187,34 @@ pub struct ResolvedDownload {
     pub size: AssetSize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextResponse {
+    pub body: String,
+    pub final_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadResponse {
+    pub final_url: String,
+    pub content_length: Option<u64>,
+}
+
 /// Abstracts raw HTTP so callers and resolver tests can use controlled sources.
 pub trait Http {
     fn get_text(&self, url: &str) -> Result<String, ResolveError>;
+
+    fn get_text_with_url(&self, url: &str) -> Result<TextResponse, ResolveError> {
+        Ok(TextResponse {
+            body: self.get_text(url)?,
+            final_url: url.to_string(),
+        })
+    }
+
+    fn head(&self, _url: &str) -> Result<HeadResponse, ResolveError> {
+        Err(ResolveError::Http(
+            "this HTTP client does not support HEAD requests".into(),
+        ))
+    }
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ResolveError>;
 
     fn get_bytes_with_progress(
@@ -255,9 +282,12 @@ impl UreqHttp {
         }
     }
 
-    fn req(&self, url: &str) -> Result<ureq::Request, ResolveError> {
+    fn request(&self, method: &str, url: &str) -> Result<ureq::Request, ResolveError> {
         parsed_https_url(url)?;
-        let mut request = self.agent.get(url).set("User-Agent", "perfect-sync");
+        let mut request = self
+            .agent
+            .request(method, url)
+            .set("User-Agent", "perfect-sync");
         if is_github_host(url) {
             if let Some(authorization) = &self.authorization {
                 request = request.set("Authorization", authorization);
@@ -266,18 +296,35 @@ impl UreqHttp {
         Ok(request)
     }
 
+    #[cfg(test)]
+    fn req(&self, url: &str) -> Result<ureq::Request, ResolveError> {
+        self.request("GET", url)
+    }
+
+    fn call_method(&self, method: &str, url: &str) -> Result<ureq::Response, ResolveError> {
+        self.request(method, url)?
+            .call()
+            .map_err(|error| match error {
+                ureq::Error::Status(status, _) => ResolveError::HttpStatus(status),
+                ureq::Error::Transport(error) => ResolveError::Http(error.to_string()),
+            })
+    }
+
     fn call(&self, url: &str) -> Result<ureq::Response, ResolveError> {
-        self.req(url)?.call().map_err(|error| match error {
-            ureq::Error::Status(status, _) => ResolveError::HttpStatus(status),
-            ureq::Error::Transport(error) => ResolveError::Http(error.to_string()),
-        })
+        self.call_method("GET", url)
     }
 }
 
 impl Http for UreqHttp {
     fn get_text(&self, url: &str) -> Result<String, ResolveError> {
+        Ok(self.get_text_with_url(url)?.body)
+    }
+
+    fn get_text_with_url(&self, url: &str) -> Result<TextResponse, ResolveError> {
+        let response = self.call(url)?;
+        let final_url = response.get_url().to_string();
         let mut bytes = Vec::new();
-        self.call(url)?
+        response
             .into_reader()
             .take(MAX_TEXT_RESPONSE + 1)
             .read_to_end(&mut bytes)
@@ -285,7 +332,21 @@ impl Http for UreqHttp {
         if bytes.len() as u64 > MAX_TEXT_RESPONSE {
             return Err(ResolveError::Http("text response too large".into()));
         }
-        String::from_utf8(bytes).map_err(|error| ResolveError::Parse(error.to_string()))
+        let body =
+            String::from_utf8(bytes).map_err(|error| ResolveError::Parse(error.to_string()))?;
+        Ok(TextResponse { body, final_url })
+    }
+
+    fn head(&self, url: &str) -> Result<HeadResponse, ResolveError> {
+        let response = self.call_method("HEAD", url)?;
+        let final_url = response.get_url().to_string();
+        let content_length = response
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok());
+        Ok(HeadResponse {
+            final_url,
+            content_length,
+        })
     }
 
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ResolveError> {
@@ -409,12 +470,7 @@ pub fn pick_asset<'a>(rel: &'a Release, rules: &AssetRules, arch: &str) -> Optio
             return Some(asset);
         }
     }
-    let names: Vec<String> = rel
-        .assets
-        .iter()
-        .filter(|asset| asset.name.to_ascii_lowercase().ends_with(".dll"))
-        .map(|asset| asset.name.clone())
-        .collect();
+    let names: Vec<String> = rel.assets.iter().map(|asset| asset.name.clone()).collect();
     if let Some(name) = catalog::select_asset(rules, arch, &names) {
         return rel.assets.iter().find(|asset| asset.name == *name);
     }
@@ -433,36 +489,154 @@ fn canonical_repo(repo: &str) -> Result<String, ResolveError> {
     parse_repo(repo).ok_or_else(|| ResolveError::InvalidRepo(repo.to_string()))
 }
 
-fn ensure_not_draft(repo: &str, release: Release) -> Result<Release, ResolveError> {
-    if release.draft {
-        Err(ResolveError::NoRelease(format!(
-            "{repo} release {} is a draft",
-            release.tag
-        )))
+fn validate_tag(tag: &str) -> Result<(), ResolveError> {
+    if tag.is_empty() || tag.len() > 255 || tag.chars().any(char::is_control) {
+        Err(ResolveError::Parse(
+            "release tag must be 1..=255 non-control bytes".into(),
+        ))
     } else {
-        Ok(release)
+        Ok(())
     }
 }
 
+fn decoded_segment(segment: &str) -> Result<String, ResolveError> {
+    percent_decode_str(segment)
+        .decode_utf8()
+        .map(String::from)
+        .map_err(|error| ResolveError::Parse(error.to_string()))
+}
+
+fn release_tag_from_url(repo: &str, value: &str) -> Option<String> {
+    let parsed = url::Url::parse(value).ok()?;
+    if parsed.scheme() != "https" || !parsed.host_str()?.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let segments: Vec<&str> = parsed.path_segments()?.collect();
+    let (owner, name) = repo.split_once('/')?;
+    if segments.len() != 5
+        || !segments[0].eq_ignore_ascii_case(owner)
+        || !segments[1].eq_ignore_ascii_case(name)
+        || segments[2] != "releases"
+        || segments[3] != "tag"
+    {
+        return None;
+    }
+    decoded_segment(segments[4]).ok()
+}
+
+fn release_tag_from_response(repo: &str, response: &TextResponse) -> Option<String> {
+    release_tag_from_url(repo, &response.final_url).or_else(|| {
+        let marker = format!("/{repo}/releases/tag/");
+        response.body.split(&marker).nth(1).and_then(|suffix| {
+            let encoded = suffix
+                .split(['"', '\'', '?', '#', '<'])
+                .next()
+                .unwrap_or_default();
+            decoded_segment(encoded).ok()
+        })
+    })
+}
+
+fn parse_expanded_assets(repo: &str, tag: &str, html: &str) -> Result<Vec<Asset>, ResolveError> {
+    let link_pattern = Regex::new(r#"href="([^"]*/releases/download/[^"]+)""#)
+        .map_err(|error| ResolveError::Parse(error.to_string()))?;
+    let digest_pattern = Regex::new(r"sha256:[0-9a-fA-F]{64}")
+        .map_err(|error| ResolveError::Parse(error.to_string()))?;
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| ResolveError::InvalidRepo(repo.to_string()))?;
+    let mut seen = HashSet::new();
+    let mut assets = Vec::new();
+
+    for capture in link_pattern.captures_iter(html) {
+        let href = capture[1].replace("&amp;", "&");
+        let absolute = if href.starts_with("https://") {
+            href
+        } else {
+            format!("https://github.com{href}")
+        };
+        let parsed = parsed_https_url(&absolute)?;
+        if !parsed
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        {
+            continue;
+        }
+        let segments: Vec<&str> = parsed
+            .path_segments()
+            .ok_or_else(|| ResolveError::Parse("release asset URL has no path".into()))?
+            .collect();
+        if segments.len() != 6
+            || !segments[0].eq_ignore_ascii_case(owner)
+            || !segments[1].eq_ignore_ascii_case(name)
+            || segments[2] != "releases"
+            || segments[3] != "download"
+            || !decoded_segment(segments[4])?.eq_ignore_ascii_case(tag)
+        {
+            continue;
+        }
+        let asset_name = decoded_segment(segments[5])?;
+        if asset_name.is_empty() || !seen.insert(asset_name.to_ascii_lowercase()) {
+            continue;
+        }
+        let match_start = capture.get(0).map_or(0, |matched| matched.start());
+        let block_start = html[..match_start].rfind("<li").unwrap_or(match_start);
+        let block_end = html[match_start..]
+            .find("</li>")
+            .map_or(html.len(), |offset| match_start + offset);
+        let sha256 = digest_pattern
+            .find(&html[block_start..block_end])
+            .and_then(|matched| parse_sha256(matched.as_str()));
+        assets.push(Asset {
+            name: asset_name,
+            url: absolute,
+            size: AssetSize { bytes: 0, sha256 },
+        });
+    }
+    Ok(assets)
+}
+
+fn fetch_expanded_release(http: &dyn Http, repo: &str, tag: &str) -> Result<Release, ResolveError> {
+    validate_tag(tag)?;
+    let encoded = utf8_percent_encode(tag, NON_ALPHANUMERIC);
+    let url = format!("https://github.com/{repo}/releases/expanded_assets/{encoded}");
+    let assets = parse_expanded_assets(repo, tag, &http.get_text(&url)?)?;
+    Ok(Release {
+        tag: tag.to_string(),
+        assets,
+        draft: false,
+        prerelease: false,
+    })
+}
+
+/// Resolve GitHub's stable "latest" redirect without consuming REST API quota.
+/// If that route is unavailable, the repository's Atom feed supplies the newest release.
 pub fn fetch_latest_release(http: &dyn Http, repo: &str) -> Result<Release, ResolveError> {
     let repo = canonical_repo(repo)?;
-    let latest = format!("https://api.github.com/repos/{repo}/releases/latest");
-    match http.get_text(&latest) {
-        Ok(text) => return ensure_not_draft(&repo, parse_release(&text)?),
-        Err(ResolveError::HttpStatus(404)) => {}
-        Err(error) => return Err(error),
+    let latest = format!("https://github.com/{repo}/releases/latest");
+    match http.get_text_with_url(&latest) {
+        Ok(response) => {
+            let tag = release_tag_from_response(&repo, &response).ok_or_else(|| {
+                ResolveError::Parse(format!(
+                    "GitHub's latest release page did not identify a tag for {repo}"
+                ))
+            })?;
+            fetch_expanded_release(http, &repo, &tag)
+        }
+        Err(primary_error) => {
+            let no_stable_release = matches!(primary_error, ResolveError::HttpStatus(404));
+            match fetch_releases(http, &repo, 1) {
+                Ok(mut releases) => {
+                    let mut release = releases.pop().ok_or_else(|| {
+                        ResolveError::NoRelease(format!("no releases for {repo}"))
+                    })?;
+                    release.prerelease = no_stable_release;
+                    Ok(release)
+                }
+                Err(_) => Err(primary_error),
+            }
+        }
     }
-
-    // GitHub's latest endpoint returns 404 when a repository has no stable
-    // release. Only that condition permits falling back to prereleases.
-    let list = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
-    let text = http.get_text(&list)?;
-    let releases: Vec<Release> =
-        serde_json::from_str(&text).map_err(|error| ResolveError::Parse(error.to_string()))?;
-    releases
-        .into_iter()
-        .find(|release| !release.draft)
-        .ok_or_else(|| ResolveError::NoRelease(format!("no non-draft releases for {repo}")))
 }
 
 pub fn fetch_release_by_tag(
@@ -470,22 +644,30 @@ pub fn fetch_release_by_tag(
     repo: &str,
     tag: &str,
 ) -> Result<Release, ResolveError> {
-    if tag.is_empty() || tag.len() > 255 || tag.chars().any(char::is_control) {
-        return Err(ResolveError::Parse(
-            "release tag must be 1..=255 non-control bytes".into(),
-        ));
-    }
     let repo = canonical_repo(repo)?;
-    let tag = utf8_percent_encode(tag, NON_ALPHANUMERIC);
-    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-    ensure_not_draft(&repo, parse_release(&http.get_text(&url)?)?)
+    fetch_expanded_release(http, &repo, tag)
 }
 
-fn resolved(rel: &Release, asset: &Asset) -> Result<ResolvedDownload, ResolveError> {
+pub fn resolved_asset(
+    http: &dyn Http,
+    rel: &Release,
+    asset: &Asset,
+) -> Result<ResolvedDownload, ResolveError> {
     parsed_https_url(&asset.url)?;
-    if asset.size.bytes > MAX_DOWNLOAD {
+    let mut size = asset.size;
+    if size.bytes == 0 {
+        let metadata = http.head(&asset.url)?;
+        parsed_https_url(&metadata.final_url)?;
+        size.bytes = metadata.content_length.ok_or_else(|| {
+            ResolveError::NoAsset(format!(
+                "GitHub did not report a byte length for release asset {}",
+                asset.name
+            ))
+        })?;
+    }
+    if size.bytes == 0 || size.bytes > MAX_DOWNLOAD {
         return Err(ResolveError::NoAsset(format!(
-            "release asset {} exceeds the maximum download size",
+            "release asset {} has an invalid download size",
             asset.name
         )));
     }
@@ -493,8 +675,24 @@ fn resolved(rel: &Release, asset: &Asset) -> Result<ResolvedDownload, ResolveErr
         url: asset.url.clone(),
         asset_name: asset.name.clone(),
         version: rel.tag.clone(),
-        size: asset.size,
+        size,
     })
+}
+
+pub fn hydrate_release_assets(
+    http: &dyn Http,
+    mut release: Release,
+) -> Result<Release, ResolveError> {
+    let metadata_release = Release {
+        tag: release.tag.clone(),
+        assets: Vec::new(),
+        draft: release.draft,
+        prerelease: release.prerelease,
+    };
+    for asset in &mut release.assets {
+        asset.size = resolved_asset(http, &metadata_release, asset)?.size;
+    }
+    Ok(release)
 }
 
 /// Resolve an exact release `tag` to a concrete download for `arch`.
@@ -508,7 +706,7 @@ pub fn resolve_tag(
     let canonical = canonical_repo(repo)?;
     let rel = fetch_release_by_tag(http, &canonical, tag)?;
     let asset = pick_asset(&rel, rules, arch).ok_or_else(|| no_asset_err(&canonical, &rel))?;
-    resolved(&rel, asset)
+    resolved_asset(http, &rel, asset)
 }
 
 /// Resolve the latest release of `repo` to a concrete download for `arch`.
@@ -521,7 +719,7 @@ pub fn resolve_latest(
     let canonical = canonical_repo(repo)?;
     let rel = fetch_latest_release(http, &canonical)?;
     let asset = pick_asset(&rel, rules, arch).ok_or_else(|| no_asset_err(&canonical, &rel))?;
-    resolved(&rel, asset)
+    resolved_asset(http, &rel, asset)
 }
 
 fn no_asset_err(repo: &str, rel: &Release) -> ResolveError {
@@ -540,7 +738,7 @@ fn no_asset_err(repo: &str, rel: &Release) -> ResolveError {
     }
 }
 
-/// List a repo's recent non-draft releases (for the manual picker).
+/// List a repo's recent releases from its API-free Atom feed.
 pub fn fetch_releases(
     http: &dyn Http,
     repo: &str,
@@ -552,13 +750,30 @@ pub fn fetch_releases(
         ));
     }
     let repo = canonical_repo(repo)?;
-    let url = format!("https://api.github.com/repos/{repo}/releases?per_page={per_page}");
-    let releases: Vec<Release> = serde_json::from_str(&http.get_text(&url)?)
-        .map_err(|error| ResolveError::Parse(error.to_string()))?;
-    Ok(releases
-        .into_iter()
-        .filter(|release| !release.draft)
-        .collect())
+    let feed_url = format!("https://github.com/{repo}/releases.atom");
+    let feed = http.get_text(&feed_url)?;
+    let href_pattern =
+        Regex::new(r#"href="([^"]+)""#).map_err(|error| ResolveError::Parse(error.to_string()))?;
+    let mut seen = HashSet::new();
+    let mut tags = Vec::new();
+    for capture in href_pattern.captures_iter(&feed) {
+        if let Some(tag) = release_tag_from_url(&repo, &capture[1]) {
+            if seen.insert(tag.to_ascii_lowercase()) {
+                tags.push(tag);
+                if tags.len() == per_page as usize {
+                    break;
+                }
+            }
+        }
+    }
+    if tags.is_empty() {
+        return Err(ResolveError::NoRelease(format!(
+            "GitHub's release feed contains no releases for {repo}"
+        )));
+    }
+    tags.into_iter()
+        .map(|tag| fetch_expanded_release(http, &repo, &tag))
+        .collect()
 }
 
 #[cfg(test)]
@@ -697,10 +912,32 @@ mod tests {
             "a.dll"
         );
         assert!(pick_asset(&release(vec![asset("bundle.zip")]), &empty_rules, "x64").is_none());
+
+        let archive_rules = AssetRules {
+            per_arch: std::collections::HashMap::from([(
+                "x86".into(),
+                crate::catalog::AssetArchRule {
+                    pat: r"(?i)^package\.zip$".into(),
+                    prefer: Some("zip".into()),
+                },
+            )]),
+            dll_name: Some("Mod.dll".into()),
+            bundles_loader: false,
+        };
+        assert_eq!(
+            pick_asset(
+                &release(vec![asset("package.zip"), asset("source.zip")]),
+                &archive_rules,
+                "x86"
+            )
+            .unwrap()
+            .name,
+            "package.zip"
+        );
     }
 
     #[test]
-    fn latest_falls_back_only_for_no_stable_release_and_skips_drafts() {
+    fn latest_uses_atom_fallback_and_preserves_primary_errors() {
         for status in [429, 500] {
             let http = RecordingHttp {
                 status,
@@ -710,7 +947,7 @@ mod tests {
             assert!(
                 matches!(fetch_latest_release(&http, "A/Repo"), Err(ResolveError::HttpStatus(code)) if code == status)
             );
-            assert_eq!(http.urls.borrow().len(), 1);
+            assert_eq!(http.urls.borrow().len(), 2);
         }
 
         struct Fallback(RefCell<Vec<String>>);
@@ -719,8 +956,10 @@ mod tests {
                 self.0.borrow_mut().push(url.into());
                 if url.ends_with("/latest") {
                     Err(ResolveError::HttpStatus(404))
+                } else if url.ends_with("releases.atom") {
+                    Ok(r#"<feed><entry><link href="https://github.com/A/Repo/releases/tag/beta"/></entry></feed>"#.into())
                 } else {
-                    Ok(r#"[{"tag_name":"draft","draft":true,"prerelease":false,"assets":[]},{"tag_name":"beta","draft":false,"prerelease":true,"assets":[]}]"#.into())
+                    Ok(String::new())
                 }
             }
             fn get_bytes(&self, _: &str) -> Result<Vec<u8>, ResolveError> {
@@ -741,7 +980,7 @@ mod tests {
             urls: RefCell::new(Vec::new()),
         };
         fetch_release_by_tag(&http, "A/Repo", "a/b").unwrap();
-        assert!(http.urls.borrow()[0].ends_with("/tags/a%2Fb"));
+        assert!(http.urls.borrow()[0].ends_with("/expanded_assets/a%2Fb"));
     }
 
     #[test]
@@ -752,7 +991,14 @@ mod tests {
             r#"{{"tag_name":"1","assets":[{{"name":"a.dll","browser_download_url":"https://x/a","size":4,"digest":"{digest}"}}]}}"#
         );
         let release = parse_release(&json).unwrap();
-        let resolved = resolved(&release, &release.assets[0]).unwrap();
+        let resolved = resolved_asset(
+            &MockHttp {
+                body: String::new(),
+            },
+            &release,
+            &release.assets[0],
+        )
+        .unwrap();
 
         let short = MockHttp { body: "bad".into() };
         assert!(matches!(
@@ -795,14 +1041,58 @@ mod tests {
     }
 
     #[test]
-    fn resolve_latest_via_mock() {
+    fn resolves_latest_from_redirect_and_expanded_assets_without_api() {
+        struct WebHttp {
+            urls: RefCell<Vec<String>>,
+        }
+        impl Http for WebHttp {
+            fn get_text(&self, url: &str) -> Result<String, ResolveError> {
+                self.urls.borrow_mut().push(url.into());
+                Ok(r#"
+                    <li>
+                      <a href="/AU-Avengers/TOU-Mira/releases/download/1.6.3/TownOfUsMira.dll">
+                        TownOfUsMira.dll
+                      </a>
+                      <span>sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef</span>
+                    </li>
+                "#.into())
+            }
+
+            fn get_text_with_url(&self, url: &str) -> Result<TextResponse, ResolveError> {
+                self.urls.borrow_mut().push(url.into());
+                Ok(TextResponse {
+                    body: String::new(),
+                    final_url: "https://github.com/AU-Avengers/TOU-Mira/releases/tag/1.6.3".into(),
+                })
+            }
+
+            fn head(&self, url: &str) -> Result<HeadResponse, ResolveError> {
+                self.urls.borrow_mut().push(url.into());
+                Ok(HeadResponse {
+                    final_url: url.into(),
+                    content_length: Some(50),
+                })
+            }
+
+            fn get_bytes(&self, _: &str) -> Result<Vec<u8>, ResolveError> {
+                unreachable!()
+            }
+        }
+
         let cat = parse(CATALOG).unwrap();
         let rules = &cat.get("AU-Avengers/TOU-Mira").unwrap().asset_rules;
-        let http = MockHttp {
-            body: RELEASE_JSON.to_string(),
+        let http = WebHttp {
+            urls: RefCell::new(Vec::new()),
         };
         let result = resolve_latest(&http, "AU-Avengers/TOU-Mira", rules, "x86").unwrap();
         assert_eq!(result.version, "1.6.3");
         assert_eq!(result.asset_name, "TownOfUsMira.dll");
+        assert_eq!(result.size.bytes(), 50);
+        assert!(result.size.sha256.is_some());
+        assert!(http
+            .urls
+            .borrow()
+            .iter()
+            .all(|url| !url.contains("api.github.com")));
     }
 }
