@@ -62,7 +62,7 @@ export function TopBar({ onAddMod, onJoinLobby, onOpenSettings, onOpenMaintenanc
         />
         <div data-tauri-drag-region className="flex items-baseline gap-1.5 font-semibold tracking-tight">
           <span data-tauri-drag-region>Perfect-Sync</span>
-          <span data-tauri-drag-region className="font-mono text-[11px] font-medium text-ink-faint max-[600px]:hidden">v0.1.3</span>
+          <span data-tauri-drag-region className="font-mono text-[11px] font-medium text-ink-faint max-[600px]:hidden">v0.1.2</span>
         </div>
       </div>
 

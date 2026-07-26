@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.3 (experimental)
+## v0.1.2 (experimental)
 
 This release includes the complete v0.1.1 and v0.1.0 change sets documented
 below, plus:
@@ -10,7 +10,7 @@ below, plus:
 - Brand the NSIS installer with an explicit Twin Relay executable icon, custom
   welcome/sidebar and header artwork, and timeless publisher text.
 - Embed the selected logo directly in the standard versioned setup executable;
-  the v0.1.3 filename also avoids stale Windows Explorer cache entries from
+  the v0.1.2 filename also avoids stale Windows Explorer cache entries from
   earlier installer builds.
 
 ## v0.1.1 (experimental)

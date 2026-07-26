@@ -681,7 +681,7 @@ export async function collectDiagnostics(profileId?: string): Promise<Diagnostic
   ) ?? browserSettings.gameInstances[0];
   return {
     generatedAt: Date.now(),
-    appVersion: "0.1.3",
+    appVersion: "0.1.2",
     profileName: profile?.name,
     game: instance
       ? {

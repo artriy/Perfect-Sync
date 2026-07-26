@@ -898,7 +898,7 @@ mod tests {
         assert_eq!(manifest.mods.len(), 1);
         assert_eq!(manifest.mods[0].id, "AU-Avengers/TOU-Mira");
         assert_eq!(manifest.mods[0].v, "1.6.3");
-        assert_eq!(manifest.mods[0].asset, None);
+        assert_eq!(manifest.mods[0].asset.as_deref(), Some("TownOfUsMira.zip"));
         assert!(manifest.game_build.is_none());
         // survives a codec round-trip
         let code = crate::codec::encode(&manifest).unwrap();
