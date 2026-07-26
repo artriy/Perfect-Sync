@@ -347,6 +347,10 @@ export function SettingsModal({
 
   const removeInstance = (id: string) => {
     if (hasPendingWork) return;
+    if (id === profileGameInstanceId) {
+      setDraftError("This profile uses that instance. Select it and use Change to move the profile to another folder.");
+      return;
+    }
     const next = instances.filter((instance) => instance.id !== id);
     setInstances(next);
     if (selectedId === id) setSelectedId(next[0]?.id ?? null);
@@ -581,6 +585,7 @@ export function SettingsModal({
               <div className="flex flex-col gap-1.5">
                 {instances.map((instance) => {
                   const active = instance.id === selectedId;
+                  const inUse = instance.id === profileGameInstanceId;
                   return (
                     <div
                       key={instance.id}
@@ -613,8 +618,13 @@ export function SettingsModal({
                       <button
                         type="button"
                         onClick={() => removeInstance(instance.id)}
-                        disabled={hasPendingWork}
-                        aria-label={`Remove ${instance.name || "unnamed instance"}`}
+                        disabled={hasPendingWork || inUse}
+                        aria-label={
+                          inUse
+                            ? `${instance.name || "Unnamed instance"} is used by this profile; use Change to move it`
+                            : `Remove ${instance.name || "unnamed instance"}`
+                        }
+                        title={inUse ? "Used by this profile. Select it and use Change to move it." : undefined}
                         className="ring-focus mr-2 grid h-7 w-7 shrink-0 place-items-center rounded-md text-ink-faint hover:bg-white/10 hover:text-[#ff8a8a] disabled:opacity-40"
                       >
                         <TrashSimple size={14} />
@@ -671,6 +681,11 @@ export function SettingsModal({
                       Change
                     </button>
                   </div>
+                  {selected.id === profileGameInstanceId && (
+                    <p className="px-1 text-[11.5px] leading-relaxed text-ink-faint">
+                      This profile uses this instance. To move it to a different folder, use Change so the profile stays connected.
+                    </p>
+                  )}
                   {selected.store === "msstore" && selected.writable === false && (
                     <div className="rounded-xl border border-[#ffd23f]/25 bg-[#ffd23f]/8 px-3.5 py-3">
                       <div className="flex items-start gap-3">

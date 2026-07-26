@@ -47,6 +47,12 @@ type RequestIdentity = { session: number; path: string; profileId: string };
 
 const LABEL = "mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase";
 
+function sameGamePath(left: string, right: string): boolean {
+  const normalize = (value: string) =>
+    value.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
+  return normalize(left) === normalize(right);
+}
+
 /** First-run onboarding: pick the Among Us folder (detected or browsed), then optionally install the loader. */
 export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onInstallLoader }: SetupModalProps) {
   const reduce = useReducedMotion();
@@ -80,8 +86,8 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
   const touOptionsRequestRef = useRef(0);
 
   const selectedInstall =
-    detected.find((game) => game.path === chosen) ??
-    (inspected?.path === chosen ? inspected : null);
+    detected.find((game) => !!chosen && sameGamePath(game.path, chosen)) ??
+    (inspected && chosen && sameGamePath(inspected.path, chosen) ? inspected : null);
   const selectedInstallRef = useRef<GameInstall | null>(selectedInstall);
 
   openRef.current = open;
@@ -130,6 +136,29 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
     }
     wasOpenRef.current = open;
   }, [open]);
+
+  useEffect(() => {
+    if (
+      !open ||
+      !chosen ||
+      installingRef.current ||
+      browsingRef.current ||
+      (inspected && sameGamePath(inspected.path, chosen)) ||
+      detected.some((game) => sameGamePath(game.path, chosen))
+    ) {
+      return;
+    }
+    statusRequestRef.current += 1;
+    const replacement = detected.length === 1 ? detected[0] : null;
+    setChosen(replacement?.path ?? null);
+    setInspected(null);
+    setStatus({ kind: "idle" });
+    setMessage(
+      replacement
+        ? ""
+        : "The selected folder is no longer available. Choose the current Among Us folder.",
+    );
+  }, [chosen, detected, inspected, open]);
 
   useEffect(() => {
     const path = chosen ?? "";
@@ -422,7 +451,7 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
                             type="button"
                             disabled={browsing}
                             onClick={() => {
-                              setInspected(game);
+                              setInspected(null);
                               setChosen(game.path);
                               setMessage("");
                             }}

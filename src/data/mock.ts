@@ -164,6 +164,9 @@ export const CATALOG: CatalogItem[] = bundledCatalog.mods
     tags: item.tags as CatalogItem["tags"],
     latest: "latest",
     dependencies: item.dependencies,
+    dependencyVersions: "dependencyVersions" in item ? item.dependencyVersions : undefined,
+    recommendedDependencies:
+      "recommendedDependencies" in item ? item.recommendedDependencies : undefined,
     included:
       item.id === "AU-Avengers/TOU-Mira"
         ? ["MiraAPI", "Reactor", "Mini.RegionInstall with the Town of Us server config", "Town of Us cosmetics"]

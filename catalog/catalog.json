@@ -131,7 +131,8 @@
       "summary": "Community add-on roles for Town of Us - Mira.",
       "repo": "DivaniNL/TownOfUsMiraDivaniModsAddOn",
       "tags": ["role", "all-client"],
-      "dependencies": ["AU-Avengers/TOU-Mira"],
+      "dependencies": [],
+      "recommendedDependencies": ["AU-Avengers/TOU-Mira"],
       "assetRules": {},
       "trust": "community"
     },
@@ -141,7 +142,8 @@
       "summary": "Community role mod adding extra Town of Us roles.",
       "repo": "Mehzxzz/TownOfExtra",
       "tags": ["role", "all-client"],
-      "dependencies": ["AU-Avengers/TOU-Mira"],
+      "dependencies": [],
+      "recommendedDependencies": ["AU-Avengers/TOU-Mira"],
       "assetRules": {},
       "trust": "community"
     },
@@ -161,7 +163,8 @@
       "summary": "Community add-on roles and modifiers for Town of Us - Mira.",
       "repo": "rewalo/TownOfUsMiraRolesExtension",
       "tags": ["role", "all-client"],
-      "dependencies": ["AU-Avengers/TOU-Mira"],
+      "dependencies": [],
+      "recommendedDependencies": ["AU-Avengers/TOU-Mira"],
       "assetRules": {},
       "trust": "community"
     },
@@ -171,7 +174,8 @@
       "summary": "Adds a full role draft where players pick their own role. Built for TOU-Mira.",
       "repo": "idkimneil/DraftMode-TOUM",
       "tags": ["role", "all-client"],
-      "dependencies": ["AU-Avengers/TOU-Mira"],
+      "dependencies": [],
+      "recommendedDependencies": ["AU-Avengers/TOU-Mira"],
       "assetRules": {},
       "trust": "community"
     },

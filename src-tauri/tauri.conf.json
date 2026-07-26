@@ -46,6 +46,7 @@
         "headerImage": "installer/header.bmp",
         "sidebarImage": "installer/sidebar.bmp",
         "uninstallerHeaderImage": "installer/header.bmp",
+        "installerHooks": "installer/hooks.nsh",
         "installMode": "currentUser"
       }
     },

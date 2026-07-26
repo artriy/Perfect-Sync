@@ -1141,6 +1141,7 @@ fn apply_bundled_install_policy(active: &mut Catalog) {
             entry.asset_rules = authoritative.asset_rules.clone();
             entry.dependencies = authoritative.dependencies.clone();
             entry.dependency_versions = authoritative.dependency_versions.clone();
+            entry.recommended_dependencies = authoritative.recommended_dependencies.clone();
         }
     }
 }
@@ -1150,6 +1151,8 @@ fn apply_bundled_display_policy(list: &mut [CatalogListItem]) {
     for item in list {
         if let Some(authoritative) = bundled.get(&item.id) {
             item.dependencies = authoritative.dependencies.clone();
+            item.dependency_versions = authoritative.dependency_versions.clone();
+            item.recommended_dependencies = authoritative.recommended_dependencies.clone();
             item.included = catalog_item(authoritative.clone()).included;
         }
     }
@@ -2151,6 +2154,18 @@ pub struct CatalogListItem {
     pub latest: String,
     #[serde(default)]
     pub dependencies: Vec<String>,
+    #[serde(
+        rename = "dependencyVersions",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub dependency_versions: HashMap<String, String>,
+    #[serde(
+        rename = "recommendedDependencies",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub recommended_dependencies: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub included: Vec<String>,
     #[serde(default)]
@@ -2177,6 +2192,8 @@ fn catalog_item(entry: perfect_sync_core::catalog::CatalogEntry) -> CatalogListI
         summary: entry.summary,
         tags: entry.tags,
         dependencies: entry.dependencies,
+        dependency_versions: entry.dependency_versions,
+        recommended_dependencies: entry.recommended_dependencies,
         included,
         latest: String::new(),
         trust: Trust::Flagged,
@@ -2333,6 +2350,8 @@ fn ensure_display_catalog_state(
         tags,
         latest: String::new(),
         dependencies: Vec::new(),
+        dependency_versions: HashMap::new(),
+        recommended_dependencies: Vec::new(),
         included: Vec::new(),
         trust: Trust::Flagged,
         extra: HashMap::new(),
@@ -7455,6 +7474,8 @@ mod tests {
                 summary: String::new(),
                 tags: Vec::new(),
                 dependencies: Vec::new(),
+                dependency_versions: HashMap::new(),
+                recommended_dependencies: Vec::new(),
                 included: Vec::new(),
                 latest: String::new(),
                 trust: Trust::Flagged,
@@ -7495,6 +7516,8 @@ mod tests {
             summary: String::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            dependency_versions: HashMap::new(),
+            recommended_dependencies: Vec::new(),
             included: Vec::new(),
             latest: String::new(),
             trust: Trust::Flagged,
@@ -7507,6 +7530,8 @@ mod tests {
             summary: String::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            dependency_versions: HashMap::new(),
+            recommended_dependencies: Vec::new(),
             included: Vec::new(),
             latest: String::new(),
             trust: Trust::Flagged,
@@ -7542,6 +7567,8 @@ mod tests {
             summary: String::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            dependency_versions: HashMap::new(),
+            recommended_dependencies: Vec::new(),
             included: Vec::new(),
             latest: String::new(),
             trust: Trust::Flagged,
@@ -7821,15 +7848,18 @@ mod tests {
     }
 
     #[test]
-    fn town_of_us_extensions_declare_town_of_us_as_their_dependency() {
+    fn town_of_us_extensions_recommend_town_of_us_without_auto_installing_it() {
         let catalog = bundled_catalog();
         for id in [
             "DivaniNL/TownOfUsMiraDivaniModsAddOn",
             "Mehzxzz/TownOfExtra",
             "rewalo/TownOfUsMiraRolesExtension",
+            "idkimneil/DraftMode-TOUM",
         ] {
+            let entry = catalog.get(id).unwrap();
+            assert!(entry.dependencies.is_empty(), "{id}");
             assert_eq!(
-                catalog.get(id).unwrap().dependencies,
+                entry.recommended_dependencies,
                 vec![TOU_MIRA_ID.to_string()],
                 "{id}"
             );

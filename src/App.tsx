@@ -1080,6 +1080,7 @@ export function App() {
       await exclusive(async () => {
         const normalized = await bridge.saveSettings(draft, tokenAction);
         setSettings(normalized);
+        setGames(normalized.gameInstances);
         setSettingsOpen(false);
         notify("Settings saved");
       });
@@ -1167,6 +1168,7 @@ export function App() {
             gameInstances: instances,
           });
           setSettings(provisional);
+          setGames(provisional.gameInstances);
           let savedProfile = await bridge.saveProfile({ ...active, gameInstanceId });
           patchProfile(savedProfile);
           if (selection?.kind === "tou" && selectedInstance) {
@@ -1386,6 +1388,7 @@ export function App() {
         profileName={active.name}
         items={batchTargets}
         catalog={catalog}
+        installedMods={active.mods}
         busy={operationBusy}
         onBack={() => {
           if (!operationRef.current) {

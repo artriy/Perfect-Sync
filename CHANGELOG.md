@@ -29,6 +29,17 @@
 - Warn before installs, Town of Us setup, or shared-lobby application would
   combine known main mods, and require explicit incompatibility acknowledgment
   before continuing. Final Suspect is included in this safeguard.
+- Reuse enabled, version-compatible profile dependencies during install review
+  instead of forcing users to select and reinstall the same library.
+- Treat Town of Us - Mira as optional for Divani's add-on, Town Of Extra,
+  TOU-Mira Roles Extension, and Draft Mode: warn when it is absent, but never
+  select or install that main mod automatically.
+- Apply folder changes from Settings to the live setup flow immediately, replace
+  stale setup selections, and keep profile-bound instances on the safe **Change**
+  path when an old game folder was deleted.
+- Make a full Windows uninstall remove Perfect-Sync profiles, settings, caches,
+  logs, its saved GitHub credential, protocol registration, and per-install
+  compatibility records while preserving user state during in-place updates.
 
 ## v0.1.2 (experimental)
 

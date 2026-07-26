@@ -31,6 +31,12 @@ pub struct CatalogEntry {
     pub dependencies: Vec<String>,
     #[serde(rename = "dependencyVersions", default)]
     pub dependency_versions: HashMap<String, String>,
+    #[serde(
+        rename = "recommendedDependencies",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub recommended_dependencies: Vec<String>,
     #[serde(rename = "assetRules")]
     pub asset_rules: AssetRules,
     #[serde(default)]
@@ -201,6 +207,25 @@ fn validate(mut catalog: Catalog) -> Result<Catalog, CatalogError> {
             };
             let canonical = catalog.mods[target].id.clone();
             catalog.mods[entry_index].dependencies[dependency_index] = canonical;
+        }
+    }
+
+    for entry_index in 0..catalog.mods.len() {
+        let owner = catalog.mods[entry_index].id.clone();
+        for dependency_index in 0..catalog.mods[entry_index].recommended_dependencies.len() {
+            let requested =
+                catalog.mods[entry_index].recommended_dependencies[dependency_index].clone();
+            if !valid_repo_slug(&requested) {
+                return Err(CatalogError::Identity(requested));
+            }
+            let Some(&target) = ids.get(&requested.to_ascii_lowercase()) else {
+                return Err(CatalogError::MissingDependency {
+                    id: owner,
+                    dependency: requested,
+                });
+            };
+            let canonical = catalog.mods[target].id.clone();
+            catalog.mods[entry_index].recommended_dependencies[dependency_index] = canonical;
         }
     }
 
@@ -501,6 +526,25 @@ mod tests {
         assert!(matches!(
             parse(&invalid),
             Err(CatalogError::DependencyVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn validates_and_canonicalizes_recommended_dependencies() {
+        let document = r#"{"schema":1,"mods":[
+            {"id":"A/AddOn","name":"Add-on","summary":"s","repo":null,"tags":[],"dependencies":[],"recommendedDependencies":["b/main"],"assetRules":{}},
+            {"id":"B/Main","name":"Main","summary":"s","repo":null,"tags":[],"dependencies":[],"assetRules":{}}
+        ]}"#;
+        let catalog = parse(document).unwrap();
+        assert_eq!(
+            catalog.get("A/AddOn").unwrap().recommended_dependencies,
+            vec!["B/Main"]
+        );
+
+        let missing = document.replace("\"b/main\"", "\"C/Missing\"");
+        assert!(matches!(
+            parse(&missing),
+            Err(CatalogError::MissingDependency { .. })
         ));
     }
 }

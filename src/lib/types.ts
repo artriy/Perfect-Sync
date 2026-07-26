@@ -61,6 +61,10 @@ export interface CatalogItem {
   latest: string;
   /** catalog package ids installed automatically unless excluded during review */
   dependencies?: string[];
+  /** semver requirements keyed by direct dependency id */
+  dependencyVersions?: Record<string, string>;
+  /** related packages that should warn when absent, but are never installed automatically */
+  recommendedDependencies?: string[];
   /** package components supplied by the selected release bundle, not separate downloads */
   included?: string[];
   /** vetting tier: trusted (curated) | community (listed) | flagged (unknown) */
