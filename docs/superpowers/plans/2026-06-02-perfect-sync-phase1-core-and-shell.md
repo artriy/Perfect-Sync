@@ -1,4 +1,4 @@
-# Perfect-Sync Phase 1: Tauri Shell + Core Logic Implementation Plan
+# Perfect Sync Phase 1: Tauri Shell + Core Logic Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -89,7 +89,7 @@ Expected: both appear in `package.json`.
 
 Run (single line):
 ```bash
-pnpm tauri init --app-name "Perfect-Sync" --window-title "Perfect-Sync" --frontend-dist ../dist --dev-url http://localhost:1420 --before-dev-command "pnpm dev" --before-build-command "pnpm build"
+pnpm tauri init --app-name "Perfect Sync" --window-title "Perfect Sync" --frontend-dist ../dist --dev-url http://localhost:1420 --before-dev-command "pnpm dev" --before-build-command "pnpm build"
 ```
 Expected: a `src-tauri/` directory is created containing `Cargo.toml`, `tauri.conf.json`, `build.rs`, `src/main.rs`, `src/lib.rs`, `capabilities/default.json`, and `icons/`.
 

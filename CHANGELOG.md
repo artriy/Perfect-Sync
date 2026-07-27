@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.5 (experimental)
+
+- Let catalog bundles declare the dependency packages they provide, so install review,
+  batch installs, direct installs, lobby imports, and update checks reuse the bundle
+  instead of downloading a second owner for the same plugin files.
+- Add AleLuduMod and Mira Submerged to the community catalog, and add AUnlocker as a
+  trusted catalog mod.
+- Present the product as **Perfect Sync** throughout the app, installers, release
+  packages, and public documentation while retaining the `Perfect-Sync` repository
+  identity and existing profile storage path.
+
 ## v0.1.4 (experimental)
 
 - Make the selected profile authoritative by detecting every unmanaged DLL that BepInEx
@@ -49,7 +60,7 @@
 - Apply folder changes from Settings to the live setup flow immediately, replace
   stale setup selections, and keep profile-bound instances on the safe **Change**
   path when an old game folder was deleted.
-- Make a full Windows uninstall remove Perfect-Sync profiles, settings, caches,
+- Make a full Windows uninstall remove Perfect Sync profiles, settings, caches,
   logs, its saved GitHub credential, protocol registration, and per-install
   compatibility records while preserving user state during in-place updates.
 
@@ -133,13 +144,13 @@ versions, stores, and compatibility runtimes.
 ### What's in it
 
 - Windows 10/11 x64 is the primary target. Native Linux x86_64 and macOS Intel/Apple
-  Silicon Perfect-Sync builds can launch the Windows game through supported Proton,
+  Silicon Perfect Sync builds can launch the Windows game through supported Proton,
   Wine, Bottles, CrossOver, or Whisky configurations.
 - Detect native and Flatpak Steam, Epic, Wine/Proton, CrossOver, Whisky, and Bottles
   locations, with writable manually selected game copies as a fallback. Persist the
   selected runtime and classify compatibility paths before generic Steam paths.
 - Keep profiles and their managed DLLs under host application data. Transactionally
-  publish only Perfect-Sync-owned plugin DLLs into a game copy, preserve unmanaged
+  publish only Perfect Sync-owned plugin DLLs into a game copy, preserve unmanaged
   files, reject unmanaged name collisions, and deliberately replace stale owned DLLs
   when a profile or version changes.
 - Atomically persist settings, profiles, catalogs, plugin files, compatibility registry
@@ -151,7 +162,7 @@ versions, stores, and compatibility runtimes.
   available when refresh fails.
 - Resolve and reconcile catalog dependency graphs for installs, updates, removals,
   personal mods, and lobby application rather than leaving partial dependency state.
-- Disable Perfect-Sync's owned Doorstop entry point for vanilla launch, restore it if
+- Disable Perfect Sync's owned Doorstop entry point for vanilla launch, restore it if
   that launch fails, and restore mod loading before the next managed setup or launch.
 - Provide named profiles, per-profile game-instance assignment, multiple role mods,
   release selection, lobby/share codes, per-mod diffs, and explicit confirmation for
@@ -165,7 +176,7 @@ versions, stores, and compatibility runtimes.
 - Trust LevelImposter v0.21.2-beta as a catalog map loader. Open its map browser from
   either the catalog or the installed mod, search the live community index, view map
   banners, download multiple arbitrary `.lim2` maps, and synchronize profile-owned
-  maps while preserving maps installed outside Perfect-Sync.
+  maps while preserving maps installed outside Perfect Sync.
 - Include each profile's exact LevelImposter map selection in lobby codes, show the map
   count during preview, and download the shared selection when applying the code.
 - Adopt byte-identical unmanaged game DLLs during profile synchronization; retain and
@@ -198,10 +209,10 @@ versions, stores, and compatibility runtimes.
   Linux/macOS launch integrations remain experimental until representative hardware,
   store clients, game versions, and compatibility runtimes are exercised end to end.
 - Native Microsoft Store / Game Pass files live under protected `WindowsApps` ACLs and
-  must be copied to a normal writable folder before Perfect-Sync can manage that copy.
+  must be copied to a normal writable folder before Perfect Sync can manage that copy.
 - Mod HTTPS, size, SHA-256-when-supplied, and archive checks detect integrity failures,
   not publisher identity. Mod assets are not cryptographically signed by their
-  publishers through Perfect-Sync.
+  publishers through Perfect Sync.
 - Windows Authenticode signing, macOS Developer ID signing/notarization, and a signed
   automatic updater are not available in v0.1.0; updates are notifications followed by
   a manual release-page download.

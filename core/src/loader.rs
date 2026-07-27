@@ -98,7 +98,7 @@ pub fn has_doorstop_patch(game_dir: &Path, version: &str, arch: &str) -> bool {
         .is_some_and(|record| record.trim() == expected)
 }
 
-/// Remove only Perfect-Sync's patch marker after an unchecked full reinstall.
+/// Remove only Perfect Sync's patch marker after an unchecked full reinstall.
 pub fn clear_doorstop_patch_marker(game_dir: &Path) -> io::Result<()> {
     let bepinex = game_dir.join("BepInEx");
     let marker = bepinex.join(DOORSTOP_PATCH_MARKER);
@@ -1538,7 +1538,7 @@ pub fn install_windows_doorstop_patch(
     if !has_loader(game_dir) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "BepInEx must be installed by Perfect-Sync before applying the Doorstop patch",
+            "BepInEx must be installed by Perfect Sync before applying the Doorstop patch",
         ));
     }
 
@@ -2380,7 +2380,7 @@ fn unmanaged_plugins_unlocked(
     Ok(unmanaged)
 }
 
-/// List every loadable DLL that is not owned by Perfect-Sync or identical to
+/// List every loadable DLL that is not owned by Perfect Sync or identical to
 /// the selected profile's copy.
 pub fn unmanaged_plugins(
     profiles_root: &Path,
@@ -2631,7 +2631,7 @@ fn copy_bounded_profile_dll(
     Ok(())
 }
 
-/// Synchronize only Perfect-Sync-managed DLLs while preserving unmanaged plugins.
+/// Synchronize only Perfect Sync-managed DLLs while preserving unmanaged plugins.
 pub fn sync_profile_plugins(
     profiles_root: &Path,
     profile_id: &str,
@@ -2786,7 +2786,7 @@ pub fn sync_profile_plugins_shadowing(
                         return Err(io::Error::new(
                             io::ErrorKind::AlreadyExists,
                             format!(
-                                "{name} already exists outside Perfect-Sync and differs from the selected profile version. Remove it from the game's BepInEx/plugins folder, or exclude that dependency in Review selection."
+                                "{name} already exists outside Perfect Sync and differs from the selected profile version. Remove it from the game's BepInEx/plugins folder, or exclude that dependency in Review selection."
                             ),
                         ));
                     }
@@ -3016,7 +3016,7 @@ fn copy_bounded_levelimposter_map(
 }
 
 /// Synchronize profile-owned LevelImposter `.lim2` maps while preserving maps
-/// added outside Perfect-Sync. The caller includes this in the game artifact
+/// added outside Perfect Sync. The caller includes this in the game artifact
 /// transaction so any filesystem failure restores the prior map set.
 pub fn sync_levelimposter_maps(
     profiles_root: &Path,

@@ -80,7 +80,7 @@ export function ShareModal({ open, profile, onClose }: ShareModalProps) {
         {
           key: "code",
           label: "Code",
-          hint: "Paste into Perfect-Sync's lobby box.",
+          hint: "Paste into Perfect Sync's lobby box.",
           value: currentState.code,
           icon: <LinkSimple size={14} />,
         },

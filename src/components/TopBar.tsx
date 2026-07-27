@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import perfectSyncLogo from "../assets/perfect-sync-logo.svg";
+import packageInfo from "../../package.json";
 import { Copy, GearSix, LinkSimple, Minus, Plus, Square, X } from "@phosphor-icons/react";
 import {
   onWindowResized,
@@ -60,8 +61,8 @@ export function TopBar({ onAddMod, onJoinLobby, onOpenSettings }: TopBarProps) {
           className="h-7 w-7 shrink-0 rounded-[6px]"
         />
         <div data-tauri-drag-region className="flex items-baseline gap-1.5 font-semibold tracking-tight">
-          <span data-tauri-drag-region>Perfect-Sync</span>
-          <span data-tauri-drag-region className="font-mono text-[11px] font-medium text-ink-faint max-[600px]:hidden">v0.1.3</span>
+          <span data-tauri-drag-region>Perfect Sync</span>
+          <span data-tauri-drag-region className="font-mono text-[11px] font-medium text-ink-faint max-[600px]:hidden">v{packageInfo.version}</span>
         </div>
       </div>
 

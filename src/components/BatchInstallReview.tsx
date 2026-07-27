@@ -84,6 +84,22 @@ function buildReviewRows(
   installedMods: readonly ProfileMod[],
 ): ReviewRow[] {
   const byId = new Map(catalog.map((item) => [item.id.toLowerCase(), item]));
+  const byIdentity = new Map<string, CatalogItem>();
+  for (const item of catalog) {
+    byIdentity.set(item.id.toLowerCase(), item);
+    byIdentity.set(item.repo.toLowerCase(), item);
+  }
+  const provided = new Set<string>();
+  for (const provider of roots) {
+    for (const dependency of provider.provides ?? []) provided.add(dependency.toLowerCase());
+  }
+  for (const mod of installedMods) {
+    if (!mod.enabled) continue;
+    const provider =
+      byIdentity.get(mod.packageId.toLowerCase()) ??
+      (mod.repo ? byIdentity.get(mod.repo.toLowerCase()) : undefined);
+    for (const dependency of provider?.provides ?? []) provided.add(dependency.toLowerCase());
+  }
   const rootIds = new Set(roots.map((item) => item.id.toLowerCase()));
   const installed = buildInstalledIndex(installedMods);
   const dependencyRows = new Map<string, ReviewRow>();
@@ -104,7 +120,7 @@ function buildReviewRows(
       !!current &&
       current.enabled &&
       (!requirement || satisfiesRequirement(current.version, requirement));
-    if (!rootIds.has(folded) && !satisfied) {
+    if (!rootIds.has(folded) && !provided.has(folded) && !satisfied) {
       let row = dependencyRows.get(folded);
       if (!row) {
         row = { item: dependency, managed: true, rootName, depth, requirements: [] };
@@ -325,7 +341,7 @@ export function BatchInstallReview({
                     <p key={item.id} className="mt-1 text-[12px] leading-relaxed text-ink-dim">
                       <span className="font-semibold text-ink">{item.name}</span> is recommended for{" "}
                       {requiredBy.join(", ")}, but it is not installed or selected. Go back to add it,
-                      or continue without it; Perfect-Sync will not add it automatically.
+                      or continue without it; Perfect Sync will not add it automatically.
                     </p>
                   ))}
                 </div>

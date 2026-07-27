@@ -185,7 +185,7 @@ export function OperationProgressModal({ activity }: OperationProgressModalProps
 
             <p id="operation-progress-safety" className="mt-6 flex items-start gap-2 border-t border-white/10 pt-4 text-[12.5px] leading-5 text-ink-faint">
               <ShieldCheck size={16} weight="fill" className="mt-0.5 shrink-0 text-[#79e6bd]" aria-hidden="true" />
-              Changes stay staged until every download is verified. Perfect-Sync replaces live files only when the whole operation is ready.
+              Changes stay staged until every download is verified. Perfect Sync replaces live files only when the whole operation is ready.
             </p>
           </motion.section>
         </motion.div>

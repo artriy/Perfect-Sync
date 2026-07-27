@@ -472,7 +472,7 @@ export function App() {
   if (!loaded) {
     return (
       <div className="grid h-[100dvh] place-items-center">
-        <p className="subtitle text-ink-dim">Loading Perfect-Sync…</p>
+        <p className="subtitle text-ink-dim">Loading Perfect Sync…</p>
       </div>
     );
   }
@@ -481,7 +481,7 @@ export function App() {
     return (
       <div className="grid h-[100dvh] place-items-center px-8 text-center">
         <div>
-          <p className="text-[15px] font-semibold text-ink">Perfect-Sync couldn't start</p>
+          <p className="text-[15px] font-semibold text-ink">Perfect Sync couldn't start</p>
           <p className="mt-1 max-w-[420px] text-[13px] text-ink-dim">
             {startupError ?? "Failed to load your profiles."}
           </p>
@@ -1460,7 +1460,7 @@ export function App() {
 
       {update && !updateDismissed && (
         <div className="mx-3 mt-2 flex items-center gap-3 rounded-xl border border-[rgba(123,150,255,0.35)] bg-[rgba(123,150,255,0.12)] px-4 py-2 text-[13px] text-[#cbd8ff]">
-          <span className="flex-1">Perfect-Sync {update.version} is available.</span>
+          <span className="flex-1">Perfect Sync {update.version} is available.</span>
           <button
             type="button"
             onClick={() => void openUpdate()}

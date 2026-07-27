@@ -29,6 +29,10 @@ pub struct CatalogEntry {
     pub repo: Option<String>,
     pub tags: Vec<ModTag>,
     pub dependencies: Vec<String>,
+    /// Catalog packages supplied by this release bundle. Provided packages
+    /// satisfy dependency edges without a second download or file owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provides: Vec<String>,
     #[serde(rename = "dependencyVersions", default)]
     pub dependency_versions: HashMap<String, String>,
     #[serde(
@@ -86,6 +90,12 @@ pub enum CatalogError {
     AssetRule { id: String, reason: String },
     #[error("catalog dependency {dependency:?} required by {id:?} is missing")]
     MissingDependency { id: String, dependency: String },
+    #[error("invalid provided dependency for {id} -> {dependency}: {reason}")]
+    ProvidedDependency {
+        id: String,
+        dependency: String,
+        reason: String,
+    },
     #[error("invalid dependency version requirement for {id} -> {dependency}: {reason}")]
     DependencyVersion {
         id: String,
@@ -207,6 +217,44 @@ fn validate(mut catalog: Catalog) -> Result<Catalog, CatalogError> {
             };
             let canonical = catalog.mods[target].id.clone();
             catalog.mods[entry_index].dependencies[dependency_index] = canonical;
+        }
+    }
+    for entry_index in 0..catalog.mods.len() {
+        let owner = catalog.mods[entry_index].id.clone();
+        let mut provided = HashSet::with_capacity(catalog.mods[entry_index].provides.len());
+        for provided_index in 0..catalog.mods[entry_index].provides.len() {
+            let requested = catalog.mods[entry_index].provides[provided_index].clone();
+            if !valid_repo_slug(&requested) {
+                return Err(CatalogError::Identity(requested));
+            }
+            let Some(&target) = ids.get(&requested.to_ascii_lowercase()) else {
+                return Err(CatalogError::MissingDependency {
+                    id: owner.clone(),
+                    dependency: requested,
+                });
+            };
+            let canonical = catalog.mods[target].id.clone();
+            let reason = if canonical.eq_ignore_ascii_case(&owner) {
+                Some("a package cannot provide itself")
+            } else if catalog.mods[entry_index]
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.eq_ignore_ascii_case(&canonical))
+            {
+                Some("a package cannot both depend on and provide the same package")
+            } else if !provided.insert(canonical.to_ascii_lowercase()) {
+                Some("duplicate provided package")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(CatalogError::ProvidedDependency {
+                    id: owner.clone(),
+                    dependency: canonical,
+                    reason: reason.into(),
+                });
+            }
+            catalog.mods[entry_index].provides[provided_index] = canonical;
         }
     }
 
@@ -526,6 +574,30 @@ mod tests {
         assert!(matches!(
             parse(&invalid),
             Err(CatalogError::DependencyVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn validates_and_canonicalizes_provided_dependencies() {
+        let document = r#"{"schema":1,"mods":[
+            {"id":"A/Bundle","name":"Bundle","summary":"s","repo":null,"tags":[],"dependencies":[],"provides":["b/library"],"assetRules":{}},
+            {"id":"B/Library","name":"Library","summary":"s","repo":null,"tags":[],"dependencies":[],"assetRules":{}}
+        ]}"#;
+        let catalog = parse(document).unwrap();
+        assert_eq!(catalog.get("A/Bundle").unwrap().provides, vec!["B/Library"]);
+
+        let duplicate = document.replace(
+            r#""provides":["b/library"]"#,
+            r#""provides":["b/library","B/Library"]"#,
+        );
+        assert!(matches!(
+            parse(&duplicate),
+            Err(CatalogError::ProvidedDependency { .. })
+        ));
+        let own_identity = document.replace(r#""b/library""#, r#""A/Bundle""#);
+        assert!(matches!(
+            parse(&own_identity),
+            Err(CatalogError::ProvidedDependency { .. })
         ));
     }
 

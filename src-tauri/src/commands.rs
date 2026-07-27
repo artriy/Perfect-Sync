@@ -517,7 +517,7 @@ fn app_loader_owned(game_dir: &Path) -> Result<bool, String> {
     let marker = game_dir.join("BepInEx").join(APP_LOADER_MARKER);
     match fs::symlink_metadata(marker) {
         Ok(metadata) if !is_reparse(&metadata) && metadata.is_file() => Ok(true),
-        Ok(_) => Err("Perfect-Sync loader ownership marker is not a regular file".into()),
+        Ok(_) => Err("Perfect Sync loader ownership marker is not a regular file".into()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.to_string()),
     }
@@ -535,11 +535,11 @@ fn restore_doorstop(game_dir: &Path) -> Result<(), String> {
         return Err("disabled Doorstop entry point is not a regular file".into());
     }
     if !app_loader_owned(game_dir)? {
-        return Err("disabled Doorstop entry point has no Perfect-Sync ownership marker".into());
+        return Err("disabled Doorstop entry point has no Perfect Sync ownership marker".into());
     }
     if destination.exists() {
         return Err(
-            "Cannot restore the Perfect-Sync Doorstop entry point because winhttp.dll already exists."
+            "Cannot restore the Perfect Sync Doorstop entry point because winhttp.dll already exists."
                 .into(),
         );
     }
@@ -553,7 +553,7 @@ fn disable_doorstop(game_dir: &Path) -> Result<bool, String> {
     if disabled.exists() {
         if source.exists() {
             return Err(
-                "Both active and disabled Perfect-Sync Doorstop entry points exist.".into(),
+                "Both active and disabled Perfect Sync Doorstop entry points exist.".into(),
             );
         }
         let metadata = fs::symlink_metadata(&disabled).map_err(|error| error.to_string())?;
@@ -562,7 +562,7 @@ fn disable_doorstop(game_dir: &Path) -> Result<bool, String> {
         }
         if !owned {
             return Err(
-                "disabled Doorstop entry point has no Perfect-Sync ownership marker".into(),
+                "disabled Doorstop entry point has no Perfect Sync ownership marker".into(),
             );
         }
         return Ok(false);
@@ -575,7 +575,7 @@ fn disable_doorstop(game_dir: &Path) -> Result<bool, String> {
     }
     let metadata = fs::symlink_metadata(&source).map_err(|error| error.to_string())?;
     if is_reparse(&metadata) || !metadata.is_file() {
-        return Err("Perfect-Sync Doorstop entry point is not a regular file".into());
+        return Err("Perfect Sync Doorstop entry point is not a regular file".into());
     }
     fs::rename(&source, &disabled).map_err(|error| error.to_string())?;
     Ok(true)
@@ -1141,6 +1141,7 @@ fn apply_bundled_install_policy(active: &mut Catalog) {
         if let Some(authoritative) = bundled.get(&entry.id) {
             entry.asset_rules = authoritative.asset_rules.clone();
             entry.dependencies = authoritative.dependencies.clone();
+            entry.provides = authoritative.provides.clone();
             entry.dependency_versions = authoritative.dependency_versions.clone();
             entry.recommended_dependencies = authoritative.recommended_dependencies.clone();
         }
@@ -1152,6 +1153,7 @@ fn apply_bundled_display_policy(list: &mut [CatalogListItem]) {
     for item in list {
         if let Some(authoritative) = bundled.get(&item.id) {
             item.dependencies = authoritative.dependencies.clone();
+            item.provides = authoritative.provides.clone();
             item.dependency_versions = authoritative.dependency_versions.clone();
             item.recommended_dependencies = authoritative.recommended_dependencies.clone();
             item.included = catalog_item(authoritative.clone()).included;
@@ -1420,13 +1422,13 @@ fn validate_game_dir(game_dir: &Path) -> Result<(), String> {
         .open(&probe)
         .map_err(|e| {
             format!(
-                "Perfect-Sync cannot modify the Among Us folder {}: {e}",
+                "Perfect Sync cannot modify the Among Us folder {}: {e}",
                 game_dir.display()
             )
         })?;
     fs::remove_file(&probe).map_err(|e| {
         format!(
-            "Perfect-Sync could not clean up its write probe {}: {e}",
+            "Perfect Sync could not clean up its write probe {}: {e}",
             probe.display()
         )
     })
@@ -2293,6 +2295,8 @@ pub struct CatalogListItem {
     pub latest: String,
     #[serde(default)]
     pub dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provides: Vec<String>,
     #[serde(
         rename = "dependencyVersions",
         default,
@@ -2331,6 +2335,7 @@ fn catalog_item(entry: perfect_sync_core::catalog::CatalogEntry) -> CatalogListI
         summary: entry.summary,
         tags: entry.tags,
         dependencies: entry.dependencies,
+        provides: entry.provides,
         dependency_versions: entry.dependency_versions,
         recommended_dependencies: entry.recommended_dependencies,
         included,
@@ -2489,6 +2494,7 @@ fn ensure_display_catalog_state(
         tags,
         latest: String::new(),
         dependencies: Vec::new(),
+        provides: Vec::new(),
         dependency_versions: HashMap::new(),
         recommended_dependencies: Vec::new(),
         included: Vec::new(),
@@ -3240,6 +3246,56 @@ fn catalog_entry_for<'a>(
         })
     })
 }
+fn installed_dependency_provider<'a>(
+    record: &'a ProfileRecord,
+    catalog: &Catalog,
+    dependency_id: &str,
+) -> Option<&'a InstalledMod> {
+    record
+        .mods
+        .iter()
+        .filter(|installed| installed.enabled)
+        .find(|installed| {
+            catalog_entry_for(catalog, &installed.package_id)
+                .or_else(|| {
+                    installed
+                        .repo
+                        .as_deref()
+                        .and_then(|repo| catalog_entry_for(catalog, repo))
+                })
+                .is_some_and(|entry| {
+                    entry
+                        .provides
+                        .iter()
+                        .any(|provided| provided.eq_ignore_ascii_case(dependency_id))
+                })
+        })
+}
+fn provided_dependency_ids(record: &ProfileRecord, catalog: &Catalog) -> HashSet<String> {
+    record
+        .mods
+        .iter()
+        .filter(|installed| installed.enabled)
+        .filter_map(|installed| {
+            catalog_entry_for(catalog, &installed.package_id).or_else(|| {
+                installed
+                    .repo
+                    .as_deref()
+                    .and_then(|repo| catalog_entry_for(catalog, repo))
+            })
+        })
+        .flat_map(|entry| entry.provides.iter())
+        .map(|provided| provided.to_ascii_lowercase())
+        .collect()
+}
+fn catalog_provided_dependency_ids(catalog: &Catalog, identities: &[String]) -> HashSet<String> {
+    identities
+        .iter()
+        .filter_map(|identity| catalog_entry_for(catalog, identity))
+        .flat_map(|entry| entry.provides.iter())
+        .map(|provided| provided.to_ascii_lowercase())
+        .collect()
+}
 
 fn is_managed_dependency(root_id: &str, candidate_id: &str) -> bool {
     !root_id.eq_ignore_ascii_case(candidate_id)
@@ -3377,10 +3433,15 @@ fn mod_position(record: &ProfileRecord, package_id: &str) -> Result<usize, Strin
         .ok_or_else(|| "mod not found".to_string())
 }
 
-fn validate_mod_toggle(record: &ProfileRecord, package_id: &str) -> Result<usize, String> {
-    if tou_bundle_dependency(package_id) && profile_has_tou_mira(record) {
+fn validate_mod_toggle(
+    record: &ProfileRecord,
+    catalog: &Catalog,
+    package_id: &str,
+) -> Result<usize, String> {
+    if let Some(provider) = installed_dependency_provider(record, catalog, package_id) {
         return Err(format!(
-            "{package_id} is included in the Town of Us package and cannot be toggled separately."
+            "{package_id} is supplied by the enabled {} bundle and cannot be toggled separately.",
+            provider.name
         ));
     }
     mod_position(record, package_id)
@@ -3393,9 +3454,10 @@ fn remove_mod_from_record(
     catalog: &Catalog,
     package_id: &str,
 ) -> Result<(), String> {
-    if tou_bundle_dependency(package_id) && profile_has_tou_mira(record) {
+    if let Some(provider) = installed_dependency_provider(record, catalog, package_id) {
         return Err(format!(
-            "{package_id} is included in the Town of Us package and cannot be removed separately."
+            "{package_id} is supplied by the enabled {} bundle and cannot be removed separately.",
+            provider.name
         ));
     }
     let position = mod_position(record, package_id)?;
@@ -3546,6 +3608,9 @@ fn reuse_installed_dependency(
     id: &str,
     requirements: &[String],
 ) -> Result<bool, String> {
+    if installed_dependency_provider(record, context.catalog, id).is_some() {
+        return Ok(true);
+    }
     let Some(position) = record
         .mods
         .iter()
@@ -3710,10 +3775,12 @@ fn install_record(
     if is_tou_mira(&request.package_id) {
         return install_tou_record(context, record, request);
     }
-    if tou_bundle_dependency(&request.package_id) && profile_has_tou_mira(record) {
+    if let Some(provider) =
+        installed_dependency_provider(record, context.catalog, &request.package_id)
+    {
         return Err(format!(
-            "{} is auto-included at the release-matched version by Town of Us - Mira",
-            request.name
+            "{} is supplied by the installed {} bundle and must not be installed separately",
+            request.name, provider.name
         ));
     }
     let InstallRequest {
@@ -4137,6 +4204,7 @@ fn install_assets_impl(
         .iter()
         .map(|id| id.to_ascii_lowercase())
         .collect();
+    let selected_provided_ids = catalog_provided_dependency_ids(&catalog, &selected_catalog_roots);
     let allowed_ids: HashSet<String> = ordered.iter().map(|id| id.to_ascii_lowercase()).collect();
     let selected_catalog_ids: HashSet<String> = prepared
         .iter()
@@ -4152,22 +4220,6 @@ fn install_assets_impl(
                     entry.as_ref().unwrap().name
                 ));
             }
-        }
-    }
-    for (selection, _, entry) in &prepared {
-        let Some(entry) = entry else {
-            continue;
-        };
-        let Some(requirements) = plan.requirements.get(&entry.id) else {
-            continue;
-        };
-        if !perfect_sync_core::version::satisfies_all(&selection.tag, requirements) {
-            return Err(format!(
-                "{} {} does not satisfy required version {}.",
-                entry.name,
-                selection.tag,
-                requirements.join(", ")
-            ));
         }
     }
     let omitted_dependencies: Vec<String> = ordered
@@ -4235,15 +4287,27 @@ fn install_assets_impl(
             runtime,
         };
         for (selection, repo, catalog_entry) in &prepared {
+            let requirements = catalog_entry
+                .as_ref()
+                .and_then(|entry| plan.requirements.get(&entry.id))
+                .map_or(&[][..], Vec::as_slice);
             if selection.managed {
                 let entry = catalog_entry.as_ref().unwrap();
-                let requirements = plan
-                    .requirements
-                    .get(&entry.id)
-                    .map_or(&[][..], Vec::as_slice);
-                if reuse_installed_dependency(&install, &mut record, &entry.id, requirements)? {
+                if selected_provided_ids.contains(&entry.id.to_ascii_lowercase())
+                    || reuse_installed_dependency(&install, &mut record, &entry.id, requirements)?
+                {
                     continue;
                 }
+            }
+            if !requirements.is_empty()
+                && !perfect_sync_core::version::satisfies_all(&selection.tag, requirements)
+            {
+                return Err(format!(
+                    "{} {} does not satisfy required version {}.",
+                    catalog_entry.as_ref().unwrap().name,
+                    selection.tag,
+                    requirements.join(", ")
+                ));
             }
             let resolved = selected_release_asset(
                 &http,
@@ -4818,12 +4882,13 @@ pub async fn set_mod_enabled(
         let _guard = lock_mutations()?;
         validate_profile_id(&profile_id)?;
         let root = settings::profiles_root();
+        let catalog = catalog()?;
         profile_transaction(&root, &profile_id, |stage_root, stage_store| {
             let mut record = stage_store
                 .load(&profile_id)
                 .map_err(|error| error.to_string())?
                 .ok_or("profile not found")?;
-            let position = validate_mod_toggle(&record, &package_id)?;
+            let position = validate_mod_toggle(&record, &catalog, &package_id)?;
             if let Some(file) = record.mods[position].file.as_deref() {
                 profile::set_plugin_enabled(stage_root, &profile_id, file, enabled)
                     .map_err(|error| error.to_string())?;
@@ -4958,9 +5023,14 @@ pub async fn check_mod_updates(profile_id: String, arch: String) -> Result<Profi
                 .map_err(|error| error.to_string())?
                 .ok_or("profile not found")?;
             let http = http()?;
-            let has_tou_mira = profile_has_tou_mira(&record);
+            let provided = provided_dependency_ids(&record, &catalog);
             for installed in &mut record.mods {
-                if has_tou_mira && tou_bundle_dependency(&installed.package_id) {
+                if provided.contains(&installed.package_id.to_ascii_lowercase())
+                    || installed
+                        .repo
+                        .as_deref()
+                        .is_some_and(|repo| provided.contains(&repo.to_ascii_lowercase()))
+                {
                     installed.update = None;
                     continue;
                 }
@@ -5209,6 +5279,7 @@ fn apply_lobby_code_impl(
             catalog_entry_for(&catalog, &manifest_mod.id).map(|entry| entry.id.clone())
         })
         .collect();
+    let selected_provided_ids = catalog_provided_dependency_ids(&catalog, &selected);
     validate_authoritative_dependencies(&catalog, &selected)?;
     let included_dependencies = selected_dependencies(&catalog, &selected)?;
     let http = ProgressHttp::new(http()?, reporter.clone());
@@ -5262,6 +5333,11 @@ fn apply_lobby_code_impl(
         };
         for manifest_mod in &manifest.mods {
             let entry = catalog_entry_for(&catalog, &manifest_mod.id);
+            if entry
+                .is_some_and(|entry| selected_provided_ids.contains(&entry.id.to_ascii_lowercase()))
+            {
+                continue;
+            }
             let repo = entry
                 .and_then(|entry| entry.repo.clone())
                 .or_else(|| resolver::parse_repo(&manifest_mod.id))
@@ -5652,7 +5728,7 @@ pub async fn loader_status(game_path: String, profile_id: String) -> Result<Load
 fn protected_install_hint(game_dir: &Path) -> Option<String> {
     let path = game_dir.to_string_lossy().replace('\\', "/").to_lowercase();
     if path.contains("/windowsapps/") || path.ends_with("/windowsapps") {
-        Some("This Among Us copy is in the protected WindowsApps folder (Microsoft Store / Game Pass), which apps can't modify. Copy the \"Among Us\" folder to a normal location (e.g. your Documents), then point Perfect-Sync at that copy.".to_string())
+        Some("This Among Us copy is in the protected WindowsApps folder (Microsoft Store / Game Pass), which apps can't modify. Copy the \"Among Us\" folder to a normal location (e.g. your Documents), then point Perfect Sync at that copy.".to_string())
     } else {
         None
     }
@@ -7139,7 +7215,7 @@ mod tests {
     #[test]
     fn bundled_catalog_exposes_the_expanded_verified_mod_set() {
         let catalog = bundled_catalog();
-        assert_eq!(catalog.mods.len(), 30);
+        assert_eq!(catalog.mods.len(), 33);
         for id in [
             "D1GQ/BetterAmongUs",
             "xChipseq/VanillaEnhancements",
@@ -7152,6 +7228,15 @@ mod tests {
             let entry = catalog.get(id).unwrap_or_else(|| panic!("missing {id}"));
             assert!(entry.repo.is_some());
             assert!(entry.asset_rules.dll_name.is_some());
+        }
+        for (id, name, trust) in [
+            ("raspberrygitq/AleLuduMod", "AleLuduMod", Trust::Community),
+            ("astra1dev/AUnlocker", "AUnlocker", Trust::Trusted),
+            ("TwistAU/Submerged", "Mira Submerged", Trust::Community),
+        ] {
+            let entry = catalog.get(id).unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(entry.name, name);
+            assert_eq!(entry.trust, trust);
         }
     }
 
@@ -7762,6 +7847,7 @@ mod tests {
                 summary: String::new(),
                 tags: Vec::new(),
                 dependencies: Vec::new(),
+                provides: Vec::new(),
                 dependency_versions: HashMap::new(),
                 recommended_dependencies: Vec::new(),
                 included: Vec::new(),
@@ -7804,6 +7890,7 @@ mod tests {
             summary: String::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            provides: Vec::new(),
             dependency_versions: HashMap::new(),
             recommended_dependencies: Vec::new(),
             included: Vec::new(),
@@ -7818,6 +7905,7 @@ mod tests {
             summary: String::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            provides: Vec::new(),
             dependency_versions: HashMap::new(),
             recommended_dependencies: Vec::new(),
             included: Vec::new(),
@@ -7855,6 +7943,7 @@ mod tests {
             summary: String::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            provides: Vec::new(),
             dependency_versions: HashMap::new(),
             recommended_dependencies: Vec::new(),
             included: Vec::new(),
@@ -8115,7 +8204,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_installed_town_of_us_dependency_skips_network_resolution() {
+    fn installed_bundle_provider_skips_separate_dependency_downloads() {
         struct NoNetwork;
 
         impl Http for NoNetwork {
@@ -8123,14 +8212,14 @@ mod tests {
                 &self,
                 _url: &str,
             ) -> Result<String, perfect_sync_core::resolver::ResolveError> {
-                panic!("a complete installed dependency must not fetch release metadata")
+                panic!("an installed bundle provider must not fetch release metadata")
             }
 
             fn get_bytes(
                 &self,
                 _url: &str,
             ) -> Result<Vec<u8>, perfect_sync_core::resolver::ResolveError> {
-                panic!("a complete installed dependency must not be downloaded again")
+                panic!("an installed bundle provider must not download a dependency")
             }
         }
 
@@ -8180,9 +8269,65 @@ mod tests {
         };
 
         install_catalog_latest(&context, &mut record, TOU_MIRA_ID, true, &[]).unwrap();
+        install_catalog_latest(&context, &mut record, "NuclearPowered/Reactor", true, &[]).unwrap();
 
         assert_eq!(record.mods.len(), 1);
         assert!(!record.mods[0].managed);
+        assert_eq!(
+            catalog
+                .get(TOU_MIRA_ID)
+                .unwrap()
+                .provides
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            TOU_BUNDLED_DEPENDENCY_IDS
+        );
+    }
+    #[test]
+    fn provider_resolution_is_catalog_driven_and_requires_an_enabled_bundle() {
+        let catalog = parse(
+            r#"{"schema":1,"mods":[
+                {"id":"Owner/Bundle","name":"Complete Bundle","summary":"","repo":"Owner/Bundle","tags":[],"trust":"trusted","dependencies":[],"provides":["Shared/Api"],"assetRules":{}},
+                {"id":"Shared/Api","name":"Shared API","summary":"","repo":"Shared/Api","tags":[],"trust":"trusted","dependencies":[],"assetRules":{}}
+            ]}"#,
+        )
+        .unwrap();
+        let mut record = ProfileRecord {
+            id: "generic-provider".into(),
+            name: "Generic provider".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            game_instance_id: None,
+            mods: vec![InstalledMod {
+                package_id: "Owner/Bundle".into(),
+                name: "Complete Bundle".into(),
+                repo: Some("Owner/Bundle".into()),
+                version: "v1".into(),
+                versions: vec!["v1".into()],
+                enabled: true,
+                source: ModSource::Github,
+                tags: Vec::new(),
+                managed: false,
+                update: None,
+                file: Some("Bundle.dll".into()),
+                asset: Some("Bundle.zip".into()),
+            }],
+            levelimposter_maps: Vec::new(),
+        };
+        let context = InstallContext {
+            stage_root: Path::new("."),
+            profile_id: "generic-provider",
+            http: &DownloadHttp(b""),
+            catalog: &catalog,
+            arch: "x86",
+            store: Store::Steam,
+            runtime: Runtime::Native,
+        };
+
+        assert!(reuse_installed_dependency(&context, &mut record, "Shared/Api", &[]).unwrap());
+        record.mods[0].enabled = false;
+        assert!(!reuse_installed_dependency(&context, &mut record, "Shared/Api", &[]).unwrap());
     }
 
     #[test]
@@ -8272,7 +8417,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("included in the Town of Us package"));
+        assert!(error.contains("supplied by the enabled AU-Avengers/TOU-Mira bundle"));
         assert!(record
             .mods
             .iter()

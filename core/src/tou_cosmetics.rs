@@ -1,5 +1,5 @@
 //! Town of Us - Mira ships its custom hats as two files beside the plugin DLL.
-//! Perfect-Sync installs the release's bare DLL, so launch preparation extracts
+//! Perfect Sync installs the release's bare DLL, so launch preparation extracts
 //! the matching `touhats.bundle` and `touhats.catalog` from the official full
 //! release pack and tracks their exact content in the game plugins directory.
 
@@ -320,7 +320,7 @@ pub fn installation_is_current(plugins: &Path, version: &str) -> io::Result<bool
     )?)
 }
 
-/// Remove only files whose content still matches Perfect-Sync's ownership
+/// Remove only files whose content still matches Perfect Sync's ownership
 /// marker. Modified or untracked cosmetics are preserved.
 pub fn remove_managed_files(plugins: &Path) -> io::Result<()> {
     let marker_path = plugins.join(MARKER_NAME);

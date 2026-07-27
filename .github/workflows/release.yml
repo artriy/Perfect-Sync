@@ -137,7 +137,7 @@ jobs:
               --verify-tag \
               --draft \
               --prerelease \
-              --title "Perfect-Sync $RELEASE_TAG" \
+              --title "Perfect Sync $RELEASE_TAG" \
               --notes-file - <<'NOTES'
           Experimental release, nothing official or stable yet. Expect rough edges
           and breaking changes, and behavior may differ across Among Us versions and

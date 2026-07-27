@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Perfect-Sync",
-  "version": "0.1.4",
+  "productName": "Perfect Sync",
+  "version": "0.1.5",
   "identifier": "com.artriy.perfectsync",
   "build": {
     "frontendDist": "../dist",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Perfect-Sync",
+        "title": "Perfect Sync",
         "width": 1120,
         "height": 720,
         "minWidth": 940,

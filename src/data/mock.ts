@@ -25,17 +25,6 @@ const reactor = {
   tags: ["library" as const],
   managed: true,
 };
-const miraApi = {
-  packageId: "All-Of-Us-Mods/MiraAPI",
-  name: "MiraAPI",
-  repo: "All-Of-Us-Mods/MiraAPI",
-  version: "0.3.9",
-  versions: ["0.4.0", "0.3.9", "0.3.8"],
-  enabled: true,
-  source: "catalog" as const,
-  tags: ["library" as const],
-  managed: true,
-};
 
 export const PROFILES: Profile[] = [
   {
@@ -65,8 +54,6 @@ export const PROFILES: Profile[] = [
         source: "github",
         tags: ["map"],
       },
-      miraApi,
-      reactor,
       bepinex,
     ],
   },
@@ -164,6 +151,7 @@ export const CATALOG: CatalogItem[] = bundledCatalog.mods
     tags: item.tags as CatalogItem["tags"],
     latest: "latest",
     dependencies: item.dependencies,
+    provides: "provides" in item ? item.provides : undefined,
     dependencyVersions: "dependencyVersions" in item ? item.dependencyVersions : undefined,
     recommendedDependencies:
       "recommendedDependencies" in item ? item.recommendedDependencies : undefined,

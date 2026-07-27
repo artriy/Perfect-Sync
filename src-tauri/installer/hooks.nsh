@@ -1,7 +1,7 @@
 !macro NSIS_HOOK_POSTUNINSTALL
   ; Preserve profiles and settings during in-place updates, but make a real
-  ; uninstall a clean reset. Perfect-Sync intentionally stores its authoritative
-  ; data under the product name rather than Tauri's bundle identifier.
+  ; uninstall a clean reset. Perfect Sync keeps its historical Perfect-Sync
+  ; storage directory for profile compatibility across in-place updates.
   ${If} $UpdateMode <> 1
     SetShellVarContext current
     RmDir /r "$APPDATA\Perfect-Sync"
@@ -21,12 +21,15 @@
     ; Remove Windows compatibility records that point at this installation.
     DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store" "$INSTDIR\${MAINBINARYNAME}.exe"
     DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store" "$INSTDIR\Perfect-Sync.exe"
+    DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store" "$INSTDIR\Perfect Sync.exe"
     DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store" "$INSTDIR\uninstall.exe"
     DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Persisted" "$INSTDIR\${MAINBINARYNAME}.exe"
     DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Persisted" "$INSTDIR\Perfect-Sync.exe"
+    DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Persisted" "$INSTDIR\Perfect Sync.exe"
     DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Persisted" "$INSTDIR\uninstall.exe"
     DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" "$INSTDIR\${MAINBINARYNAME}.exe"
     DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" "$INSTDIR\Perfect-Sync.exe"
+    DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" "$INSTDIR\Perfect Sync.exe"
     DeleteRegValue HKCU "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" "$INSTDIR\uninstall.exe"
   ${EndIf}
 !macroend

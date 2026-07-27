@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-07-26",
+  "updated": "2026-07-27",
   "loader": {
     "buildsUrl": "https://builds.bepinex.dev/projects/bepinex_be",
     "thunderstoreApi": "https://thunderstore.io/api/experimental/package/BepInEx/BepInExPack_AmongUs/"
@@ -33,6 +33,7 @@
       "repo": "AU-Avengers/TOU-Mira",
       "tags": ["role", "all-client"],
       "dependencies": [],
+      "provides": ["All-Of-Us-Mods/MiraAPI", "NuclearPowered/Reactor", "miniduikboot/Mini.RegionInstall"],
       "assetRules": {
         "perArch": {
           "x86": { "match": "(?i)TouMira.*x86-steam-itch\\.zip$", "prefer": "zip" },
@@ -150,7 +151,7 @@
     {
       "id": "artriy/Perfect-Comms",
       "name": "Perfect-Comms",
-      "summary": "Companion communications mod by the Perfect-Sync author.",
+      "summary": "Companion communications mod by the Perfect Sync author.",
       "repo": "artriy/Perfect-Comms",
       "tags": ["all-client"],
       "dependencies": [],
@@ -361,6 +362,38 @@
       "tags": ["host-only"],
       "dependencies": [],
       "assetRules": { "perArch": {}, "dllName": "MinimumLevel.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "raspberrygitq/AleLuduMod",
+      "name": "AleLuduMod",
+      "summary": "Expands meeting, vitals, and shapeshifter interfaces for lobbies with more than 15 players.",
+      "repo": "raspberrygitq/AleLuduMod",
+      "tags": ["all-client"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "assetRules": { "perArch": {}, "dllName": "AleLuduMod.dll" },
+      "trust": "community"
+    },
+    {
+      "id": "astra1dev/AUnlocker",
+      "name": "AUnlocker",
+      "summary": "Client-side cosmetic, account, chat, framerate, and quality-of-life unlocks.",
+      "repo": "astra1dev/AUnlocker",
+      "tags": ["cosmetic"],
+      "dependencies": [],
+      "assetRules": {},
+      "trust": "trusted"
+    },
+    {
+      "id": "TwistAU/Submerged",
+      "name": "Mira Submerged",
+      "summary": "The Submerged underwater map patched for compatibility with Town of Us - Mira.",
+      "repo": "TwistAU/Submerged",
+      "tags": ["map"],
+      "dependencies": ["NuclearPowered/Reactor"],
+      "dependencyVersions": { "NuclearPowered/Reactor": ">=2.5.0" },
+      "recommendedDependencies": ["AU-Avengers/TOU-Mira"],
+      "assetRules": {},
       "trust": "community"
     }
   ]

@@ -1,9 +1,9 @@
 [package]
 name = "perfect-sync-core"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version.workspace = true
-description = "Core logic for Perfect-Sync (catalog, lobby codec, resolver, loader)"
+description = "Core logic for Perfect Sync (catalog, lobby codec, resolver, loader)"
 license = "MIT"
 repository = "https://github.com/artriy/Perfect-Sync"
 

@@ -543,7 +543,7 @@ export async function createManagedGameCopy(
     throw new Error("Choose the source game and a destination folder.");
   }
   return {
-    path: `${destinationParent.replace(/[\\/]+$/u, "")}/Perfect-Sync Among Us`,
+    path: `${destinationParent.replace(/[\\/]+$/u, "")}/Among Us - Perfect Sync`,
     store: "msstore",
     arch: "x64",
     runtime: "native",
@@ -756,11 +756,11 @@ export async function collectDiagnostics(profileId?: string): Promise<Diagnostic
 export async function exportSupportBundle(profileId?: string): Promise<string | null> {
   if (!inTauri) {
     await collectDiagnostics(profileId);
-    return "Perfect-Sync-support.zip";
+    return "Perfect Sync support.zip";
   }
   const destination = await saveDialog({
-    title: "Export Perfect-Sync support bundle",
-    defaultPath: "Perfect-Sync-support.zip",
+    title: "Export Perfect Sync support bundle",
+    defaultPath: "Perfect Sync support.zip",
     filters: [{ name: "ZIP archive", extensions: ["zip"] }],
   });
   if (typeof destination !== "string") return null;
@@ -1434,7 +1434,7 @@ export async function openUrl(url: string): Promise<void> {
 /** Custom URI scheme the Tauri shell registers for one-click lobby links. */
 export const LOBBY_SCHEME = "perfectsync";
 
-/** A clickable deep link that opens Perfect-Sync straight onto this lobby. */
+/** A clickable deep link that opens Perfect Sync straight onto this lobby. */
 export function lobbyDeepLink(code: string): string {
   return `${LOBBY_SCHEME}://lobby/${code}`;
 }

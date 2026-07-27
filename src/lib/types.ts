@@ -61,6 +61,8 @@ export interface CatalogItem {
   latest: string;
   /** catalog package ids installed automatically unless excluded during review */
   dependencies?: string[];
+  /** dependency package ids already supplied by this release bundle */
+  provides?: string[];
   /** semver requirements keyed by direct dependency id */
   dependencyVersions?: Record<string, string>;
   /** related packages that should warn when absent, but are never installed automatically */
@@ -131,7 +133,7 @@ export interface GameInstall {
   runtime?: Runtime;
   /** detected Among Us build/version when readable */
   build?: string;
-  /** whether Perfect-Sync can safely modify this folder */
+  /** whether Perfect Sync can safely modify this folder */
   writable?: boolean;
 }
 

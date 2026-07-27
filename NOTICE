@@ -1,11 +1,11 @@
 # Third-Party Notices
 
-Perfect-Sync uses and credits the following third-party components.
+Perfect Sync uses and credits the following third-party components.
 
 ## BepInEx
 - License: LGPL-2.1
 - Source: https://github.com/BepInEx/BepInEx
-- Perfect-Sync downloads the BepInEx loader at runtime from its official
+- Perfect Sync downloads the BepInEx loader at runtime from its official
   releases. BepInEx is not redistributed as part of this project.
 
 ## JetBrains Mono (font)
@@ -18,5 +18,5 @@ Perfect-Sync uses and credits the following third-party components.
 
 ## Community mods
 Mods are downloaded at runtime from their original GitHub repositories and
-remain under their own respective licenses. Perfect-Sync does not redistribute
+remain under their own respective licenses. Perfect Sync does not redistribute
 them and claims no ownership over them.

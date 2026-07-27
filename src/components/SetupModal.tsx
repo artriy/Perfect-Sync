@@ -424,7 +424,7 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
             ref={modalRef}
             role="dialog"
             aria-modal="true"
-            aria-label="Set up Perfect-Sync"
+            aria-label="Set up Perfect Sync"
             aria-busy={installing || browsing || visibleStatus.kind === "loading"}
             tabIndex={-1}
             initial={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.96, y: 12 }}
@@ -433,7 +433,7 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
             className="glass-strong relative flex max-h-[90vh] w-[560px] max-w-full flex-col rounded-3xl p-6 max-[600px]:h-[100dvh] max-[600px]:max-h-none max-[600px]:w-full max-[600px]:rounded-none max-[600px]:p-4"
           >
-            <h2 className="text-[20px] font-semibold text-ink">Welcome to Perfect-Sync</h2>
+            <h2 className="text-[20px] font-semibold text-ink">Welcome to Perfect Sync</h2>
             <p className="mt-0.5 text-[13px] text-ink-dim">
               {chosen ? "Step 2 of 2: choose your mod setup." : "Step 1 of 2: find your Among Us install."}
             </p>

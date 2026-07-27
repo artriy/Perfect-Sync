@@ -1,4 +1,4 @@
-# Build Perfect-Sync into a testable Windows app.
+# Build Perfect Sync into a testable Windows app.
 # Usage:  ./scripts/build.ps1
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot

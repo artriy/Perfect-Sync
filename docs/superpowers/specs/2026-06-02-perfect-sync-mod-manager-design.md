@@ -1,4 +1,4 @@
-# Perfect-Sync — Design Spec
+# Perfect Sync — Design Spec
 
 **Date:** 2026-06-02
 **Status:** Approved (brainstorming) — ready for implementation planning

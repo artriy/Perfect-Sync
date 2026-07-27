@@ -1,4 +1,4 @@
-# Building and releasing Perfect-Sync
+# Building and releasing Perfect Sync
 
 Development mode uses Vite hot reload. A packaged build embeds the frontend in a
 native Tauri application; end users do not need Node.js or Rust.
@@ -41,7 +41,7 @@ pnpm run build:exe
 | Local Windows output | Purpose |
 | --- | --- |
 | `target/release/app.exe` | Uninstalled local smoke-test executable; release automation does not upload this loose file |
-| `target/release/bundle/nsis/Perfect-Sync_0.1.0_x64-setup.exe` | NSIS installer |
+| `target/release/bundle/nsis/Perfect Sync_<version>_x64-setup.exe` | NSIS installer |
 
 For a package native to the current host, use Tauri's build command. The release
 workflow makes target selection explicit:
@@ -68,16 +68,16 @@ the packaging command.
 | Release job | Uploaded packages | Game launch expectation |
 | --- | --- | --- |
 | Windows x64 | MSI and NSIS installers | Primary target; launches the Windows game natively |
-| Linux x64 | DEB, RPM, and AppImage | Experimental; native Perfect-Sync app launches the Windows game through Proton, Wine, or Bottles |
-| macOS x64 | DMG | Experimental; native Perfect-Sync app launches the Windows game through CrossOver, Whisky, or Wine |
-| macOS arm64 | DMG | Experimental; native Perfect-Sync app launches the Windows game through CrossOver, Whisky, or Wine |
+| Linux x64 | DEB, RPM, and AppImage | Experimental; native Perfect Sync app launches the Windows game through Proton, Wine, or Bottles |
+| macOS x64 | DMG | Experimental; native Perfect Sync app launches the Windows game through CrossOver, Whisky, or Wine |
+| macOS arm64 | DMG | Experimental; native Perfect Sync app launches the Windows game through CrossOver, Whisky, or Wine |
 
 These packages compiling, passing tests, and having valid container/file structure in
 CI is **build validation**, not proof of correct behavior on real hardware or with a
 particular game version, store client, prefix, bottle, or compatibility runtime.
 Linux/macOS game integration still requires representative real-host end-to-end
 validation. A protected native Microsoft Store / Game Pass copy under `WindowsApps`
-must be copied to a normal writable folder before Perfect-Sync can manage that copy.
+must be copied to a normal writable folder before Perfect Sync can manage that copy.
 
 ## Release workflow
 
@@ -121,7 +121,7 @@ stale/moved-tag failure leaves the release non-public.
   it, a user may need:
 
   ```sh
-  xattr -dr com.apple.quarantine "/Applications/Perfect-Sync.app"
+  xattr -dr com.apple.quarantine "/Applications/Perfect Sync.app"
   ```
 
 - **BepInEx:** setup downloads a bounded loader package at runtime, caches it per build

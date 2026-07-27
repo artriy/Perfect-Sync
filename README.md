@@ -1,22 +1,22 @@
 <div align="center">
 
-<img src="docs/assets/banner.svg" alt="Perfect-Sync" width="100%">
+<img src="docs/assets/banner.svg" alt="Perfect Sync" width="100%">
 
 <br>
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-9b7bff?style=flat-square)](#platform-support)
-[![Version](https://img.shields.io/badge/version-0.1.0%20experimental-7a5bff?style=flat-square)](https://github.com/artriy/Perfect-Sync/releases)
+[![Version](https://img.shields.io/badge/version-0.1.5%20experimental-7a5bff?style=flat-square)](https://github.com/artriy/Perfect-Sync/releases)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-5bc0ff?style=flat-square)](https://tauri.app)
 [![License](https://img.shields.io/badge/license-MIT-5bc0ff?style=flat-square)](LICENSE)
 
 **An experimental desktop mod manager and launcher for modded Among Us.** It installs
-BepInEx, keeps Perfect-Sync-managed mods in named profiles, and lets friends preview
+BepInEx, keeps Perfect Sync-managed mods in named profiles, and lets friends preview
 and apply a shared lobby mod set.
 
 </div>
 
 > [!NOTE]
-> **Disclaimer.** Perfect-Sync is an unofficial, fan-made tool. It is not affiliated with,
+> **Disclaimer.** Perfect Sync is an unofficial, fan-made tool. It is not affiliated with,
 > endorsed by, or sponsored by Innersloth LLC. Among Us is a trademark of Innersloth LLC.
 > Use modded clients only in private and modded lobbies. Do not use mods to disrupt public
 > or vanilla games. See the [Among Us mod policy](https://www.innersloth.com/among-us-mod-policy/).
@@ -69,11 +69,11 @@ remain device-only and are never serialized into lobby codes.
 
 > [!TIP]
 > **The app-data profile is the source of truth for the complete modded runtime.**
-> Before setup or launch, Perfect-Sync recursively checks `BepInEx/plugins` for DLLs
+> Before setup or launch, Perfect Sync recursively checks `BepInEx/plugins` for DLLs
 > outside the selected profile. It shows every extra DLL and blocks publication until
 > each one is resolved. You can select any subset, import safe root-level DLLs into the
 > profile, move files to the instance's checksummed `.perfectsync-quarantine`, or
-> explicitly delete them after confirmation. Perfect-Sync otherwise replaces or removes
+> explicitly delete them after confirmation. Perfect Sync otherwise replaces or removes
 > only files it owns. Microsoft Store / Game Pass installs in the protected `WindowsApps`
 > tree use Settings' managed-copy flow to create a normal, writable x64 game copy.
 
@@ -96,9 +96,9 @@ remain device-only and are never serialized into lobby codes.
    LevelImposter map IDs. Preview the resulting per-mod changes and trust classification
    before applying it. Local DLLs and game-build restrictions remain device-local.
    Unknown lobby repositories still require explicit confirmation.
-6. **Launch.** Perfect-Sync reconciles dependencies, transactionally publishes the
+6. **Launch.** Perfect Sync reconciles dependencies, transactionally publishes the
    profile's owned DLLs, verifies BepInEx, and starts the Windows game. On Linux and
-   macOS the native Perfect-Sync app launches the Windows game through a configured
+   macOS the native Perfect Sync app launches the Windows game through a configured
    supported compatibility runtime. **Set up mods** performs publication without launch.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
@@ -107,7 +107,7 @@ remain device-only and are never serialized into lobby codes.
 
 | Tier | Meaning |
 | --- | --- |
-| **Trusted** | Metadata curated in Perfect-Sync's trusted catalog. This is not a publisher signature or a verification of the downloaded native code. |
+| **Trusted** | Metadata curated in Perfect Sync's trusted catalog. This is not a publisher signature or a verification of the downloaded native code. |
 | **Community** | Catalog-listed metadata that is not in the curated trusted tier. |
 | **Flagged / Unverified** | An unknown direct repository, asset, or lobby mod. Explicit confirmation is required; install only if you trust the source. |
 
@@ -118,7 +118,7 @@ Download the bundle for your host from
 where the in-app update notification sends you: v0.1.0 does not download or install
 application updates automatically.
 
-| Perfect-Sync host | Package and first-run restriction |
+| Perfect Sync host | Package and first-run restriction |
 | --- | --- |
 | Windows 10/11 x64 | Windows installer; unsigned, so SmartScreen can require **More info → Run anyway**. |
 | Linux x86_64 | Native Linux bundle; the Windows game still runs through a supported Proton, Wine, or Bottles setup. |
@@ -130,11 +130,11 @@ does not establish a trusted developer identity. If you trust the download and
 Gatekeeper quarantines it, you may remove that quarantine:
 
 ```sh
-xattr -dr com.apple.quarantine "/Applications/Perfect-Sync.app"
+xattr -dr com.apple.quarantine "/Applications/Perfect Sync.app"
 ```
 
 Running the Windows `app.exe` itself under Wine/Proton is not supported; use the native
-Perfect-Sync build for the host.
+Perfect Sync build for the host.
 
 ## Build from source
 
@@ -152,13 +152,13 @@ Stack: Tauri 2, React 19, TypeScript, Vite, Tailwind v4, with a Rust core crate.
 
 ## Platform support
 
-| Perfect-Sync host | Windows Among Us runtime | Status |
+| Perfect Sync host | Windows Among Us runtime | Status |
 | --- | --- | --- |
 | Windows 10/11 x64 | Native Steam, Epic, or writable manual copy | **Primary supported target** |
 | Windows 10/11 x64 | Microsoft Store / Game Pass | Protected native folder is not writable; copy the game to a normal folder and select that copy |
 | Linux x86_64 / Steam Deck | Steam/Flatpak Steam + Proton, Wine, or Bottles | **Experimental**; native app build and CI coverage exist, but each real host/runtime/store combination still needs validation |
 | macOS Intel or Apple Silicon | CrossOver, Whisky, or Wine | **Experimental**; native app build and CI coverage exist, but each real host/runtime/store combination still needs validation |
-| Windows Perfect-Sync executable under Wine/Proton | Any | **Unsupported** — use the native host build |
+| Windows Perfect Sync executable under Wine/Proton | Any | **Unsupported** — use the native host build |
 | Android, iOS, BSD, ChromeOS, Linux ARM64, Windows ARM64 | Any | **Unsupported** |
 
 Release CI builds Windows x64, Linux x86_64, macOS Intel, and macOS Apple Silicon
@@ -170,7 +170,7 @@ particular store client, or through every compatibility frontend.
 
 ## Security and ownership
 
-Mods are native code loaded inside the game. Perfect-Sync requires HTTPS. Within one
+Mods are native code loaded inside the game. Perfect Sync requires HTTPS. Within one
 install operation it checks the downloaded asset against the size and any SHA-256
 digest supplied by the release metadata fetched for that operation, and ZIP extraction
 enforces strict entry, path, per-file, and expanded-size limits. These controls detect
@@ -181,7 +181,7 @@ both. Only the **Trusted** catalog metadata tier is curated. Unknown direct
 repositories/assets and lobby mods require explicit confirmation; trust the source and
 the person sharing a lobby code.
 
-The Epic launch helper is a special case: Perfect-Sync pins the HTTPS archive's size and
+The Epic launch helper is a special case: Perfect Sync pins the HTTPS archive's size and
 SHA-256, requires an exact one-file ZIP shape, and verifies the extracted executable's
 size and SHA-256 before publishing or reusing it.
 
@@ -191,7 +191,7 @@ GitHub HTTPS hosts, and never returned to the frontend. A legacy token found in
 `settings.json` is migrated to the OS keyring and scrubbed from the settings file.
 
 During synchronization, an ownership marker limits replacement/removal to
-Perfect-Sync-managed plugin DLLs. Unmanaged DLLs are detected recursively before
+Perfect Sync-managed plugin DLLs. Unmanaged DLLs are detected recursively before
 publication and must be imported into the selected profile, moved transactionally to
 `BepInEx/.perfectsync-quarantine`, or explicitly deleted after confirmation. They are
 never removed silently. Name collisions fail instead of overwriting user files.
