@@ -102,6 +102,7 @@ export function App() {
   const launchSession = useRef(0);
   const startupPromiseRef = useRef<Promise<StartupResult> | null>(null);
   const operationActivityId = useRef(0);
+  const automaticUpdateRef = useRef(false);
   const mainModWarningResolver = useRef<((confirmed: boolean) => void) | null>(null);
   const unmanagedPluginResolver = useRef<((resolved: boolean) => void) | null>(null);
 
@@ -223,6 +224,23 @@ export function App() {
     } finally {
       setOperationActivity((current) => current?.id === id ? null : current);
       endOperation();
+    }
+  };
+
+  const installApplicationUpdate = async (available: bridge.UpdateInfo): Promise<void> => {
+    automaticUpdateRef.current = true;
+    try {
+      await trackedExclusive(
+        {
+          scope: "release",
+          title: `Updating Perfect Sync to ${available.version}`,
+          message: "Preparing the signed application update",
+        },
+        (report) => bridge.installUpdate(report),
+      );
+    } catch (error) {
+      automaticUpdateRef.current = false;
+      throw error;
     }
   };
 
@@ -358,14 +376,22 @@ export function App() {
 
   useEffect(() => {
     let current = true;
-    bridge
-      .checkUpdate()
-      .then((available) => {
-        if (current) setUpdate(available);
-      })
-      .catch((error) => {
+    void (async () => {
+      try {
+        const available = await bridge.checkUpdate();
+        if (!current || !available || automaticUpdateRef.current) return;
+        try {
+          await installApplicationUpdate(available);
+        } catch (error) {
+          if (!current) return;
+          setUpdate(available);
+          setUpdateDismissed(false);
+          notify(`Automatic update failed: ${messageFrom(error)}`, "error");
+        }
+      } catch (error) {
         if (current) notify(`Update check failed: ${messageFrom(error)}`, "error");
-      });
+      }
+    })();
     return () => {
       current = false;
     };
@@ -1420,11 +1446,11 @@ export function App() {
   };
 
   const openUpdate = async () => {
-    if (!update) return;
+    if (!update || busy) return;
     try {
-      await bridge.openUrl(update.url);
+      await installApplicationUpdate(update);
     } catch (error) {
-      notify(`Could not open the download page: ${messageFrom(error)}`, "error");
+      if (error !== OPERATION_BUSY) notify(`Application update failed: ${messageFrom(error)}`, "error");
     }
   };
 
@@ -1460,13 +1486,14 @@ export function App() {
 
       {update && !updateDismissed && (
         <div className="mx-3 mt-2 flex items-center gap-3 rounded-xl border border-[rgba(123,150,255,0.35)] bg-[rgba(123,150,255,0.12)] px-4 py-2 text-[13px] text-[#cbd8ff]">
-          <span className="flex-1">Perfect Sync {update.version} is available.</span>
+          <span className="flex-1">Automatic update to Perfect Sync {update.version} needs another attempt.</span>
           <button
             type="button"
             onClick={() => void openUpdate()}
-            className="ring-focus accent-grad rounded-lg px-3 py-1.5 text-[12.5px] font-semibold text-[#0d0820]"
+            disabled={busy}
+            className="ring-focus accent-grad rounded-lg px-3 py-1.5 text-[12.5px] font-semibold text-[#0d0820] disabled:cursor-not-allowed disabled:opacity-45"
           >
-            Download
+            Retry & restart
           </button>
           <button
             type="button"

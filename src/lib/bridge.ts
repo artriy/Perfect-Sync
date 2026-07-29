@@ -2,6 +2,8 @@ import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrent as getCurrentDeepLinks, onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check as checkForAppUpdate, type Update } from "@tauri-apps/plugin-updater";
 import type {
   CatalogItem,
   DiffItem,
@@ -1411,23 +1413,85 @@ export async function syncProfile(gamePath: string, profileId: string): Promise<
 
 export interface UpdateInfo {
   version: string;
-  url: string;
+  notes?: string;
 }
 
-/** Check GitHub Releases for a newer version (null if up to date). */
+let pendingAppUpdate: Update | null = null;
+let pendingAppUpdateCheck: Promise<Update | null> | null = null;
+
+async function getPendingAppUpdate(): Promise<Update | null> {
+  if (!pendingAppUpdateCheck) {
+    pendingAppUpdateCheck = (async () => {
+      if (pendingAppUpdate) {
+        await pendingAppUpdate.close();
+        pendingAppUpdate = null;
+      }
+      pendingAppUpdate = await checkForAppUpdate({ timeout: 30_000 });
+      return pendingAppUpdate;
+    })();
+  }
+  const check = pendingAppUpdateCheck;
+  try {
+    return await check;
+  } finally {
+    if (pendingAppUpdateCheck === check) pendingAppUpdateCheck = null;
+  }
+}
+
+/** Check the signed GitHub Releases update channel (null if up to date). */
 export async function checkUpdate(): Promise<UpdateInfo | null> {
   if (!inTauri) return null;
-  return invoke<UpdateInfo | null>("check_update");
+  const update = await getPendingAppUpdate();
+  if (!update) return null;
+  return {
+    version: update.version,
+    notes: update.body?.trim() || undefined,
+  };
 }
 
-/** Open an https URL in the user's default browser. */
-export async function openUrl(url: string): Promise<void> {
-  if (inTauri) {
-    await invoke<void>("open_url", { url });
-    return;
+/** Download, verify, install, and restart into the pending application update. */
+export async function installUpdate(
+  onProgress?: (progress: OperationProgress) => void,
+): Promise<void> {
+  if (!inTauri) throw new Error("Application updates require the installed desktop app.");
+  const update = pendingAppUpdate ?? await checkForAppUpdate({ timeout: 30_000 });
+  if (!update) throw new Error("Perfect Sync is already up to date.");
+  pendingAppUpdate = update;
+  let bytesReceived = 0;
+  let bytesTotal: number | undefined;
+  try {
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        bytesTotal = event.data.contentLength;
+        onProgress?.({
+          phase: "downloading",
+          message: `Downloading Perfect Sync ${update.version}`,
+          bytesReceived,
+          bytesTotal,
+        });
+      } else if (event.event === "Progress") {
+        bytesReceived += event.data.chunkLength;
+        onProgress?.({
+          phase: "downloading",
+          message: `Downloading Perfect Sync ${update.version}`,
+          bytesReceived,
+          bytesTotal,
+        });
+      } else {
+        onProgress?.({
+          phase: "finalizing",
+          message: "Installing the verified application update",
+        });
+      }
+    });
+  } catch (error) {
+    pendingAppUpdate = null;
+    await update.close().catch(() => undefined);
+    throw error;
   }
-  const opened = window.open(url, "_blank", "noopener,noreferrer");
-  if (!opened) throw new Error("The browser blocked the download page. Allow pop-ups and try again.");
+  pendingAppUpdate = null;
+  await update.close().catch(() => undefined);
+  await relaunch();
 }
 
 // ----------------------------------------------------------- lobby sharing

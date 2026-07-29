@@ -21,6 +21,7 @@ pub fn run() {
                 let _ = w.set_focus();
             }
         }));
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }
     let log_builder = tauri_plugin_log::Builder::new()
         .level(if cfg!(debug_assertions) {
@@ -38,6 +39,7 @@ pub fn run() {
     #[cfg(debug_assertions)]
     let log_builder = log_builder.target(Target::new(TargetKind::Stdout));
     builder = builder.plugin(log_builder.build());
+    builder = builder.plugin(tauri_plugin_process::init());
     builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -104,8 +106,6 @@ pub fn run() {
             commands::launch_vanilla,
             commands::check_mod_updates,
             commands::apply_mod_updates,
-            commands::check_update,
-            commands::open_url,
             commands::sync_profile
         ])
         .run(tauri::generate_context!())

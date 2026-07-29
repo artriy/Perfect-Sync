@@ -30,6 +30,7 @@ jobs:
       checks: write
     outputs:
       release_commit: ${{ steps.release_identity.outputs.commit }}
+      release_id: ${{ steps.release.outputs.id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -124,19 +125,29 @@ jobs:
       - name: Test Rust workspace
         run: cargo test --workspace --all-targets --all-features --locked
 
-      - name: Create draft prerelease
+      - name: Verify updater signing secrets
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          test -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+
+      - name: Create draft release
+        id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft --prerelease
-            test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft --prerelease=false
+            test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease --jq '[.isDraft, .isPrerelease] | @tsv')" = $'true\tfalse'
           else
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
-              --prerelease \
               --title "Perfect Sync $RELEASE_TAG" \
               --notes-file - <<'NOTES'
           Experimental release, nothing official or stable yet. Expect rough edges
@@ -153,6 +164,7 @@ jobs:
                 gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
               fi
             done
+          echo "id=$release_id" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.name }}
@@ -167,27 +179,18 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: windows
-            upload: |
-              target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
-              target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
           - name: Linux x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             bundles: linux
-            upload: |
-              target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
-              target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
-              target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
           - name: macOS x64
             os: macos-14
             target: x86_64-apple-darwin
             bundles: macos
-            upload: target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
           - name: macOS arm64
             os: macos-14
             target: aarch64-apple-darwin
             bundles: macos
-            upload: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -225,8 +228,22 @@ jobs:
       - name: Test Rust workspace on build host
         run: cargo test --workspace --all-targets --all-features --locked
 
-      - name: Build bundles
-        run: pnpm tauri build --target "${{ matrix.target }}" -- --locked
+      - name: Build and upload signed bundles
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.validate.outputs.release_id }}
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          updaterJsonPreferNsis: true
+          retryAttempts: 3
+          args: --target ${{ matrix.target }} -- --locked
 
       - name: Validate Windows bundles
         if: matrix.bundles == 'windows'
@@ -306,17 +323,8 @@ jobs:
             shasum -a 256 "$dmg"
           done
 
-      - name: Upload validated bundles to draft release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          draft: true
-          prerelease: true
-          fail_on_unmatched_files: true
-          files: ${{ matrix.upload }}
-
   publish:
-    name: Publish prerelease
+    name: Publish release
     needs:
       - validate
       - build
@@ -330,7 +338,7 @@ jobs:
           ref: ${{ needs.validate.outputs.release_commit }}
           fetch-depth: 0
 
-      - name: Verify release assets and publish prerelease
+      - name: Verify release and updater assets, then publish
         env:
           EXPECTED_COMMIT: ${{ needs.validate.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -340,19 +348,46 @@ jobs:
           release_id="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)"
           release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
           test "$(jq -r .draft <<<"$release_json")" = true
-          test "$(jq -r .prerelease <<<"$release_json")" = true
+          test "$(jq -r .prerelease <<<"$release_json")" = false
 
           assets="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100")"
+          release_assets="$(jq 'add' <<<"$assets")"
           jq -e '
-            add |
-            length == 7 and
             ([.[] | .name | select(test("\\.msi$"))] | length == 1) and
             ([.[] | .name | select(test("-setup\\.exe$"))] | length == 1) and
             ([.[] | .name | select(test("\\.deb$"))] | length == 1) and
             ([.[] | .name | select(test("\\.rpm$"))] | length == 1) and
             ([.[] | .name | select(test("\\.AppImage$"))] | length == 1) and
-            ([.[] | .name | select(test("\\.dmg$"))] | length == 2)
-          ' <<<"$assets"
+            ([.[] | .name | select(test("\\.dmg$"))] | length == 2) and
+            ([.[] | .name | select(test("-setup\\.exe\\.sig$"))] | length == 1) and
+            ([.[] | .name | select(test("\\.AppImage\\.sig$"))] | length == 1) and
+            ([.[] | .name | select(test("\\.app\\.tar\\.gz$"))] | length == 2) and
+            ([.[] | .name | select(test("\\.app\\.tar\\.gz\\.sig$"))] | length == 2) and
+            ([.[] | .name | select(test("\\.sig$"))] | length >= 4) and
+            ([.[] | .name | select(. == "latest.json")] | length == 1)
+          ' <<<"$release_assets"
+
+          manifest_dir="$RUNNER_TEMP/perfect-sync-updater"
+          mkdir -p "$manifest_dir"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir "$manifest_dir"
+          expected_version="${RELEASE_TAG#v}"
+          jq -e \
+            --arg version "$expected_version" \
+            --arg url_prefix "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/" \
+            --argjson release_assets "$release_assets" '
+            .version == $version and
+            (.platforms as $platforms |
+              ["windows-x86_64", "linux-x86_64", "darwin-x86_64", "darwin-aarch64"] as $required |
+              all($platforms[$required[]];
+                (.signature | type == "string" and length > 0) and
+                (.url | type == "string" and startswith($url_prefix))
+              ) and
+              ([ $platforms[$required[]].url
+                | capture("/releases/assets/(?<id>[0-9]+)$").id
+                | tonumber
+              ] | all(. as $id | any($release_assets[]; .id == $id)))
+            )
+          ' "$manifest_dir/latest.json"
 
           git fetch --force --no-tags origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           current_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
@@ -361,4 +396,4 @@ jobs:
           gh release edit "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false \
-            --prerelease
+            --prerelease=false

@@ -12,6 +12,8 @@
     "core:window:allow-start-dragging",
     "core:window:allow-close",
     "dialog:default",
-    "deep-link:allow-get-current"
+    "deep-link:allow-get-current",
+    "updater:default",
+    "process:allow-restart"
   ]
 }
