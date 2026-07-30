@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
@@ -83,7 +83,8 @@ const MAX_RECURSIVE_COPY_FILES: usize = 200_000;
 const MAX_RECURSIVE_COPY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_ERROR_LOG_BYTES: u64 = 256 * 1024 * 1024;
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
-static LAUNCH_PENDING: AtomicBool = AtomicBool::new(false);
+static LAUNCH_PENDING: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static INSPECTED_GAMES: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -109,40 +110,140 @@ fn validate_profile_id(id: &str) -> Result<(), String> {
     profile::validate_profile_id(id).map_err(|error| error.to_string())
 }
 
-fn game_is_stopped() -> Result<(), String> {
+fn smoke_allows_running() -> bool {
     #[cfg(test)]
     if std::env::var_os("PERFECT_SYNC_SMOKE_ALLOW_RUNNING").as_deref()
         == Some(std::ffi::OsStr::new("1"))
     {
+        return true;
+    }
+    false
+}
+
+fn launch_pending(workspace_id: &str) -> Result<bool, String> {
+    LAUNCH_PENDING
+        .lock()
+        .map(|pending| pending.contains(workspace_id))
+        .map_err(|_| "launch-session lock is poisoned".to_string())
+}
+
+fn workspace_is_stopped(workspace_id: &str) -> Result<(), String> {
+    validate_profile_id(workspace_id)?;
+    if smoke_allows_running() {
         return Ok(());
     }
-    if LAUNCH_PENDING.load(Ordering::Acquire) {
+    if launch_pending(workspace_id)? {
         return Err(
-            "Among Us is still launching. Wait for startup to finish before changing files.".into(),
+            "This profile is still launching. Wait for startup to finish before changing its workspace."
+                .into(),
         );
     }
-    match process::try_is_running() {
+    let game_dir = managed_instance::workspace_game_dir(workspace_id)?;
+    match process::try_is_game_dir_running(&game_dir) {
         Ok(false) => Ok(()),
-        Ok(true) => Err("Among Us is running. Close it first.".into()),
+        Ok(true) => Err(
+            "This profile is running. Close its Among Us instance before changing its workspace."
+                .into(),
+        ),
         Err(error) => Err(format!(
-            "Could not verify whether Among Us is running; refusing to modify game files: {error}"
+            "Could not verify whether this profile is running; refusing to modify its workspace: {error}"
         )),
     }
 }
 
-fn spawn_launch(operation: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
-    LAUNCH_PENDING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| "Among Us is already launching.".to_string())?;
+fn game_path_is_stopped(game_dir: &Path) -> Result<(), String> {
+    if smoke_allows_running() {
+        return Ok(());
+    }
+    match process::try_is_game_dir_running(game_dir) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err("This Among Us instance is running. Close it first.".into()),
+        Err(error) => Err(format!(
+            "Could not verify whether this Among Us instance is running; refusing to modify it: {error}"
+        )),
+    }
+}
+
+fn all_games_are_stopped() -> Result<(), String> {
+    if smoke_allows_running() {
+        return Ok(());
+    }
+    if !LAUNCH_PENDING
+        .lock()
+        .map_err(|_| "launch-session lock is poisoned".to_string())?
+        .is_empty()
+    {
+        return Err("Among Us is still launching. Wait for startup to finish.".into());
+    }
+    match process::try_is_running() {
+        Ok(false) => Ok(()),
+        Ok(true) => Err("Among Us is running. Close every instance first.".into()),
+        Err(error) => Err(format!(
+            "Could not verify whether Among Us is running; refusing to modify shared save data: {error}"
+        )),
+    }
+}
+
+fn managed_workspaces_are_stopped() -> Result<(), String> {
+    if smoke_allows_running() {
+        return Ok(());
+    }
+    if !LAUNCH_PENDING
+        .lock()
+        .map_err(|_| "launch-session lock is poisoned".to_string())?
+        .is_empty()
+    {
+        return Err("A managed profile is still launching. Wait for startup to finish.".into());
+    }
+    for workspace_id in managed_instance::workspace_ids()? {
+        let game_dir = managed_instance::workspace_game_dir(&workspace_id)?;
+        match process::try_is_game_dir_running(&game_dir) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(format!(
+                    "{workspace_id} is running. Close it before moving Perfect Sync storage."
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not verify whether managed profile {workspace_id} is running; refusing to move storage: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn spawn_launch(
+    workspace_id: &str,
+    operation: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    validate_profile_id(workspace_id)?;
+    let game_dir = managed_instance::workspace_game_dir(workspace_id)?;
+    {
+        let mut pending = LAUNCH_PENDING
+            .lock()
+            .map_err(|_| "launch-session lock is poisoned".to_string())?;
+        if !pending.insert(workspace_id.to_string()) {
+            return Err("This profile is already launching.".into());
+        }
+    }
     if let Err(error) = operation() {
-        LAUNCH_PENDING.store(false, Ordering::Release);
+        if let Ok(mut pending) = LAUNCH_PENDING.lock() {
+            pending.remove(workspace_id);
+        }
         return Err(error);
     }
-    std::thread::spawn(|| {
+    let workspace_id = workspace_id.to_string();
+    std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if matches!(process::try_is_running(), Ok(true)) || Instant::now() >= deadline {
-                LAUNCH_PENDING.store(false, Ordering::Release);
+            if matches!(process::try_is_game_dir_running(&game_dir), Ok(true))
+                || Instant::now() >= deadline
+            {
+                if let Ok(mut pending) = LAUNCH_PENDING.lock() {
+                    pending.remove(&workspace_id);
+                }
                 break;
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -1964,7 +2065,7 @@ pub async fn move_storage(
 ) -> Result<SettingsView, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        game_is_stopped()?;
+        managed_workspaces_are_stopped()?;
         let reporter = ProgressReporter::new(on_progress);
         reporter.stage("preparing", "Validating the new storage location");
 
@@ -2066,8 +2167,9 @@ fn copy_error_log(source: &Path, destination: &Path, expected: u64) -> Result<()
 }
 
 #[tauri::command]
-pub async fn export_error_log(destination: String) -> Result<String, String> {
+pub async fn export_error_log(destination: String, profile_id: String) -> Result<String, String> {
     blocking(move || {
+        validate_profile_id(&profile_id)?;
         let destination_path = PathBuf::from(&destination);
         if !destination_path.is_absolute()
             || destination_path
@@ -2092,7 +2194,7 @@ pub async fn export_error_log(destination: String) -> Result<String, String> {
         }
 
         let _guard = lock_mutations()?;
-        let source = managed_instance::active_game_dir()
+        let source = managed_instance::workspace_game_dir(&profile_id)?
             .join("BepInEx")
             .join("LogOutput.log");
         let metadata = fs::symlink_metadata(&source).map_err(|error| {
@@ -2123,13 +2225,14 @@ pub async fn export_error_log(destination: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn game_running() -> Result<bool, String> {
-    blocking(|| {
-        if LAUNCH_PENDING.load(Ordering::Acquire) {
-            Ok(true)
-        } else {
-            process::try_is_running().map_err(|error| error.to_string())
+pub async fn game_running(profile_id: String) -> Result<bool, String> {
+    blocking(move || {
+        validate_profile_id(&profile_id)?;
+        if launch_pending(&profile_id)? {
+            return Ok(true);
         }
+        let game_dir = managed_instance::workspace_game_dir(&profile_id)?;
+        process::try_is_game_dir_running(&game_dir).map_err(|error| error.to_string())
     })
     .await
 }
@@ -2632,6 +2735,7 @@ pub async fn delete_profile(id: String) -> Result<(), String> {
     blocking(move || {
         let _guard = lock_mutations()?;
         validate_profile_id(&id)?;
+        workspace_is_stopped(&id)?;
         let mut saved = settings::load().map_err(|error| error.to_string())?;
         let original = saved.clone();
         let clears_active = saved
@@ -5327,7 +5431,7 @@ pub async fn list_unmanaged_plugins(
     blocking(move || {
         let _guard = lock_mutations()?;
         validate_profile_id(&profile_id)?;
-        if managed_instance::active_marker()?.is_some() {
+        if managed_instance::active_marker(&profile_id)?.is_some() {
             return Ok(Vec::new());
         }
         let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
@@ -5347,9 +5451,9 @@ pub async fn quarantine_unmanaged_plugins(
 ) -> Result<Vec<loader::UnmanagedPlugin>, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        game_is_stopped()?;
         validate_profile_id(&profile_id)?;
         let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
+        game_path_is_stopped(&game_dir)?;
         with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
             game_artifact_transaction(&game_dir, || {
                 loader::quarantine_unmanaged_plugins(
@@ -5373,9 +5477,9 @@ pub async fn delete_unmanaged_plugins(
 ) -> Result<Vec<loader::UnmanagedPlugin>, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        game_is_stopped()?;
         validate_profile_id(&profile_id)?;
         let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
+        game_path_is_stopped(&game_dir)?;
         with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
             game_artifact_transaction(&game_dir, || {
                 loader::delete_unmanaged_plugins(
@@ -5399,7 +5503,6 @@ pub async fn import_unmanaged_plugins(
 ) -> Result<ProfileRecord, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        game_is_stopped()?;
         validate_profile_id(&profile_id)?;
         let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
         let profiles_root = settings::profiles_root();
@@ -5450,6 +5553,7 @@ pub async fn ensure_loader(
 ) -> Result<Option<String>, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
+        workspace_is_stopped(&profile_id)?;
         let reporter = ProgressReporter::new(on_progress);
         let profiles_root = settings::profiles_root();
         let profile_store = recovered_profile_store(&profiles_root)?;
@@ -5490,7 +5594,7 @@ pub async fn reinstall_loader(
 ) -> Result<Option<String>, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        game_is_stopped()?;
+        workspace_is_stopped(&profile_id)?;
         let profiles_root = settings::profiles_root();
         let profile_store = recovered_profile_store(&profiles_root)?;
         let profile = profile_store
@@ -5598,8 +5702,8 @@ pub async fn loader_status(game_path: String, profile_id: String) -> Result<Load
             .map(arch_str)
             .ok_or("Among Us executable architecture is unsupported")?;
         let revision = managed_instance::profile_revision(&profile_root)?;
-        let workspace = managed_instance::active_game_dir();
-        let workspace_ready = managed_instance::active_marker()?.is_some_and(|marker| {
+        let workspace = managed_instance::workspace_game_dir(&profile_id)?;
+        let workspace_ready = managed_instance::active_marker(&profile_id)?.is_some_and(|marker| {
             marker.game_instance_id == instance.id
                 && marker.profile_id == profile_id
                 && marker.profile_revision == revision
@@ -5741,13 +5845,9 @@ fn prepare_profile(
     reporter: Option<&ProgressReporter>,
     force_rebuild: bool,
 ) -> Result<Option<String>, String> {
-    prepare_profile_with_guard(
-        game_path,
-        profile_id,
-        reporter,
-        force_rebuild,
-        game_is_stopped,
-    )
+    prepare_profile_with_guard(game_path, profile_id, reporter, force_rebuild, || {
+        workspace_is_stopped(profile_id)
+    })
 }
 
 fn prepare_profile_with_guard(
@@ -5780,14 +5880,15 @@ fn prepare_profile_with_guard(
             "Creating or validating the private clean game base",
         );
     }
-    managed_instance::capture_active_config(&profiles_root)?;
+    managed_instance::capture_workspace_config(&profiles_root, profile_id)?;
     let base = managed_instance::ensure_base(&instance, profile.game_build.as_deref())?;
     let profile_root = profile_store
         .profile_dir(profile_id)
         .map_err(|error| error.to_string())?;
     with_profile_layout(&profiles_root, profile_id, || Ok(()))?;
     let revision = managed_instance::profile_revision(&profile_root)?;
-    if !force_rebuild && managed_instance::active_matches(&base, profile_id, &revision)? {
+    if !force_rebuild && managed_instance::active_matches(&base, profile_id, &revision, profile_id)?
+    {
         let context = compat::resolve_with_hint(&source, Some(instance.runtime));
         return Ok(configure_runtime_override(&context).err());
     }
@@ -5830,7 +5931,7 @@ fn prepare_profile_with_guard(
         );
     }
     process_guard()?;
-    let stage = managed_instance::begin_workspace(&base)?;
+    let stage = managed_instance::begin_workspace(&base, profile_id)?;
     let result = (|| {
         if let Some(bytes) = tou_package.as_deref() {
             loader::install_tou_package(
@@ -5876,33 +5977,40 @@ fn prepare_profile_with_guard(
                 "Verifying and publishing the isolated workspace",
             );
         }
-        managed_instance::publish_workspace(&stage, &base, profile_id, &revision)?;
+        managed_instance::publish_workspace(&stage, &base, profile_id, &revision, profile_id)?;
         let context = compat::resolve_with_hint(&source, Some(instance.runtime));
         Ok(configure_runtime_override(&context).err())
     })();
     if result.is_err() && stage.exists() {
-        let _ = managed_instance::discard_workspace(&stage);
+        let _ = managed_instance::discard_workspace(&stage, profile_id);
     }
     result
 }
 
-fn prepare_vanilla(game_path: &str) -> Result<(PathBuf, settings::GameInstance), String> {
-    game_is_stopped()?;
+fn prepare_vanilla(
+    game_path: &str,
+    workspace_id: &str,
+) -> Result<(PathBuf, settings::GameInstance), String> {
+    workspace_is_stopped(workspace_id)?;
     let mut instance = registered_game_instance(game_path)?;
     let source = canonical_game_path(Path::new(&instance.path))?;
     instance.build = game::detect_build(&source);
-    managed_instance::capture_active_config(&settings::profiles_root())?;
+    managed_instance::capture_workspace_config(&settings::profiles_root(), workspace_id)?;
     let base = managed_instance::ensure_base(&instance, None)?;
     let revision = sha256_hex(format!("vanilla\\0{}", base.record.id).as_bytes());
-    if !managed_instance::active_matches(&base, "_vanilla", &revision)? {
-        let stage = managed_instance::begin_workspace(&base)?;
-        let result = managed_instance::publish_workspace(&stage, &base, "_vanilla", &revision);
+    if !managed_instance::active_matches(&base, "_vanilla", &revision, workspace_id)? {
+        let stage = managed_instance::begin_workspace(&base, workspace_id)?;
+        let result =
+            managed_instance::publish_workspace(&stage, &base, "_vanilla", &revision, workspace_id);
         if result.is_err() && stage.exists() {
-            let _ = managed_instance::discard_workspace(&stage);
+            let _ = managed_instance::discard_workspace(&stage, workspace_id);
         }
         result?;
     }
-    Ok((managed_instance::active_game_dir(), instance))
+    Ok((
+        managed_instance::workspace_game_dir(workspace_id)?,
+        instance,
+    ))
 }
 
 fn require_launch_ready(guidance: Option<String>) -> Result<(), String> {
@@ -6019,7 +6127,11 @@ fn epic_executable_matches_pin(path: &Path) -> Result<bool, String> {
     Ok(sha256_hex(&bytes) == EPIC_EXECUTABLE_SHA256)
 }
 
-fn ensure_epic_starter(http: &dyn Http, game_dir: &Path) -> Result<PathBuf, String> {
+fn ensure_epic_starter(
+    http: &dyn Http,
+    game_dir: &Path,
+    workspace_id: &str,
+) -> Result<PathBuf, String> {
     let executable = game_dir.join("EpicGamesStarter.exe");
     if epic_executable_matches_pin(&executable)? {
         return Ok(executable);
@@ -6032,7 +6144,7 @@ fn ensure_epic_starter(http: &dyn Http, game_dir: &Path) -> Result<PathBuf, Stri
     {
         return Err("downloaded EpicGamesStarter executable failed the extracted-file pin".into());
     }
-    game_is_stopped()?;
+    workspace_is_stopped(workspace_id)?;
     atomic_write(&executable, &delivered)?;
     if !epic_executable_matches_pin(&executable)? {
         return Err("published EpicGamesStarter failed pin verification".into());
@@ -6126,24 +6238,30 @@ fn prepare_epic_auth_stores(
     Ok(())
 }
 
-fn validate_managed_launch_target(game_dir: &Path) -> Result<(), String> {
-    let active = managed_instance::active_game_dir();
+fn validate_managed_launch_target(game_dir: &Path, workspace_id: &str) -> Result<(), String> {
+    let active = managed_instance::workspace_game_dir(workspace_id)?;
     if !same_path(game_dir, &active) {
-        return Err("refusing to launch outside the managed workspace".into());
+        return Err("refusing to launch outside the managed profile workspace".into());
     }
-    managed_instance::active_marker()?.ok_or("the managed workspace has no validated marker")?;
+    managed_instance::active_marker(workspace_id)?
+        .ok_or("the managed profile workspace has no validated marker")?;
     validate_game_dir(game_dir)
 }
 
-fn launch_prepared_game(game_dir: &Path, instance: &settings::GameInstance) -> Result<(), String> {
-    validate_managed_launch_target(game_dir)?;
+fn launch_prepared_game(
+    game_dir: &Path,
+    instance: &settings::GameInstance,
+    workspace_id: &str,
+) -> Result<(), String> {
+    workspace_is_stopped(workspace_id)?;
+    validate_managed_launch_target(game_dir, workspace_id)?;
     let store = instance.store;
     let context = compat::resolve_with_hint(Path::new(&instance.path), Some(instance.runtime));
     if store == Store::Epic {
-        let starter = ensure_epic_starter(&http()?, game_dir)?;
+        let starter = ensure_epic_starter(&http()?, game_dir, workspace_id)?;
         prepare_epic_auth_stores(game_dir, &context)?;
         if cfg!(windows) {
-            return spawn_launch(|| {
+            return spawn_launch(workspace_id, || {
                 let helper_pid = process::launch_console_interactive(&starter, game_dir)
                     .map_err(|error| format!("couldn't run EpicGamesStarter: {error}"))?;
                 crate::console_monitor::start(helper_pid)
@@ -6151,7 +6269,7 @@ fn launch_prepared_game(game_dir: &Path, instance: &settings::GameInstance) -> R
             });
         }
         let specification = compat::build_program_spec(&starter, game_dir, &context);
-        return spawn_launch(|| {
+        return spawn_launch(workspace_id, || {
             process::launch_interactive(&specification)
                 .map(|_| ())
                 .map_err(|error| launch_err_msg(&context, &error))
@@ -6171,7 +6289,7 @@ fn launch_prepared_game(game_dir: &Path, instance: &settings::GameInstance) -> R
         }
     }
     let specification = compat::build_launch_spec(game_dir, &context);
-    spawn_launch(|| {
+    spawn_launch(workspace_id, || {
         process::launch(&specification)
             .map(|_| ())
             .map_err(|error| launch_err_msg(&context, &error))
@@ -6183,25 +6301,26 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
     blocking(move || {
         let _guard = lock_mutations()?;
         require_launch_ready(prepare_profile(&game_path, &profile_id, None, false)?)?;
-        game_is_stopped()?;
+        workspace_is_stopped(&profile_id)?;
         let profile = recovered_profile_store(&settings::profiles_root())?
             .load(&profile_id)
             .map_err(|error| error.to_string())?
             .ok_or("profile not found")?;
         let instance = profile_game_instance(&game_path, &profile)?;
-        let game_dir = managed_instance::active_game_dir();
-        launch_prepared_game(&game_dir, &instance)
+        let game_dir = managed_instance::workspace_game_dir(&profile_id)?;
+        launch_prepared_game(&game_dir, &instance, &profile_id)
     })
     .await
 }
 
 #[tauri::command]
-pub async fn launch_vanilla(game_path: String) -> Result<(), String> {
+pub async fn launch_vanilla(game_path: String, profile_id: String) -> Result<(), String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        let (game_dir, instance) = prepare_vanilla(&game_path)?;
-        game_is_stopped()?;
-        launch_prepared_game(&game_dir, &instance)
+        validate_profile_id(&profile_id)?;
+        let (game_dir, instance) = prepare_vanilla(&game_path, &profile_id)?;
+        workspace_is_stopped(&profile_id)?;
+        launch_prepared_game(&game_dir, &instance, &profile_id)
     })
     .await
 }
@@ -6285,7 +6404,7 @@ fn create_save_backup_impl() -> Result<SaveBackupInfo, String> {
 pub async fn backup_save_data() -> Result<SaveBackupInfo, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        game_is_stopped()?;
+        all_games_are_stopped()?;
         let backup = create_save_backup_impl()?;
         if let Err(error) = prune_save_backups() {
             log::warn!("created save backup but could not prune old backups: {error}");
@@ -6350,7 +6469,7 @@ pub async fn list_save_backups() -> Result<Vec<SaveBackupInfo>, String> {
 pub async fn restore_save_data(backup_id: String) -> Result<SaveBackupInfo, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        game_is_stopped()?;
+        all_games_are_stopped()?;
         if backup_id.is_empty()
             || backup_id.len() > 64
             || !backup_id
@@ -6574,18 +6693,19 @@ fn diagnostics_report_impl(profile_id: Option<&str>) -> Result<DiagnosticsReport
     let mut warnings = Vec::new();
     let mut loader_status = None;
     let mut log_errors = Vec::new();
-    let active_marker = managed_instance::active_marker()?;
     let game_status = if let Some(instance) = instance {
         match canonical_game_path(Path::new(&instance.path)) {
             Ok(game_dir) => {
                 let build = game::detect_build(&game_dir);
                 let writable = game::is_writable_game_dir(&game_dir);
-                let workspace_dir = profile.as_ref().and_then(|profile| {
-                    active_marker
-                        .as_ref()
+                let workspace_dir = if let Some(profile) = profile.as_ref() {
+                    managed_instance::active_marker(&profile.id)?
                         .filter(|marker| marker.profile_id == profile.id)
-                        .map(|_| managed_instance::active_game_dir())
-                });
+                        .map(|_| managed_instance::workspace_game_dir(&profile.id))
+                        .transpose()?
+                } else {
+                    None
+                };
                 if let Some(profile) = profile.as_ref() {
                     let profile_dir = profile_store
                         .profile_dir(&profile.id)
@@ -8286,6 +8406,96 @@ mod tests {
         assert!(error.contains("repository, release tag, and asset"));
     }
     #[test]
+    fn concurrent_profile_sessions_are_independent() {
+        const COORDINATOR: &str = "PERFECT_SYNC_CONCURRENT_COORDINATOR";
+        const FAKE_GAME: &str = "PERFECT_SYNC_CONCURRENT_FAKE_GAME";
+        const MANAGED_ROOT: &str = "PERFECT_SYNC_CONCURRENT_MANAGED_ROOT";
+        const TEST_NAME: &str = "commands::tests::concurrent_profile_sessions_are_independent";
+
+        if std::env::var_os(FAKE_GAME).is_some() {
+            std::thread::sleep(Duration::from_secs(5));
+            return;
+        }
+        if std::env::var_os(COORDINATOR).is_some() {
+            let managed_root = PathBuf::from(std::env::var_os(MANAGED_ROOT).unwrap());
+            settings::initialize_managed_data_dir(managed_root).unwrap();
+            let test_executable = std::env::current_exe().unwrap();
+            let steam_dir = managed_instance::workspace_game_dir("steam-profile").unwrap();
+            let epic_dir = managed_instance::workspace_game_dir("epic-profile").unwrap();
+            fs::create_dir_all(&steam_dir).unwrap();
+            fs::create_dir_all(&epic_dir).unwrap();
+            let steam_executable = steam_dir.join(process::GAME_EXE);
+            let epic_executable = epic_dir.join(process::GAME_EXE);
+            fs::copy(&test_executable, &steam_executable).unwrap();
+            fs::copy(&test_executable, &epic_executable).unwrap();
+
+            let spawn_fake = |executable: &Path| {
+                process::command(executable)
+                    .env(FAKE_GAME, "1")
+                    .args(["--exact", TEST_NAME])
+                    .spawn()
+                    .map_err(|error| error.to_string())
+            };
+            let mut steam = None;
+            spawn_launch("steam-profile", || {
+                steam = Some(spawn_fake(&steam_executable)?);
+                Ok(())
+            })
+            .unwrap();
+            let mut epic = None;
+            spawn_launch("epic-profile", || {
+                epic = Some(spawn_fake(&epic_executable)?);
+                Ok(())
+            })
+            .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if process::try_is_game_dir_running(&steam_dir).unwrap()
+                    && process::try_is_game_dir_running(&epic_dir).unwrap()
+                    && !launch_pending("steam-profile").unwrap()
+                    && !launch_pending("epic-profile").unwrap()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "both profile sessions did not become independently visible"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(workspace_is_stopped("steam-profile").is_err());
+            assert!(workspace_is_stopped("epic-profile").is_err());
+
+            let mut steam = steam.unwrap();
+            steam.kill().unwrap();
+            steam.wait().unwrap();
+            assert!(workspace_is_stopped("steam-profile").is_ok());
+            assert!(workspace_is_stopped("epic-profile").is_err());
+
+            let mut epic = epic.unwrap();
+            epic.kill().unwrap();
+            epic.wait().unwrap();
+            assert!(workspace_is_stopped("epic-profile").is_ok());
+            return;
+        }
+
+        let managed_root = tempfile::tempdir().unwrap();
+        let output = process::command(std::env::current_exe().unwrap())
+            .env(COORDINATOR, "1")
+            .env(MANAGED_ROOT, managed_root.path())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     #[ignore = "requires a local Among Us source and profile fixture"]
     fn live_managed_workspace_smoke() {
         let app_data = PathBuf::from(std::env::var("PERFECT_SYNC_SMOKE_APP_DATA").unwrap());
@@ -8299,15 +8509,18 @@ mod tests {
         let source_mira_before = fs::read(&source_mira).ok();
         prepare_profile_with_guard(&source, &profile_id, None, true, || Ok(())).unwrap();
 
-        let marker = managed_instance::active_marker().unwrap().unwrap();
+        let marker = managed_instance::active_marker(&profile_id)
+            .unwrap()
+            .unwrap();
+        let active = managed_instance::workspace_game_dir(&profile_id).unwrap();
         assert_eq!(marker.profile_id, profile_id);
         assert_ne!(
-            fs::canonicalize(managed_instance::active_game_dir()).unwrap(),
+            fs::canonicalize(&active).unwrap(),
             fs::canonicalize(&source).unwrap()
         );
-        assert!(loader::has_loader(&managed_instance::active_game_dir()));
-        validate_managed_launch_target(&managed_instance::active_game_dir()).unwrap();
-        assert!(validate_managed_launch_target(Path::new(&source)).is_err());
+        assert!(loader::has_loader(&active));
+        validate_managed_launch_target(&active, &profile_id).unwrap();
+        assert!(validate_managed_launch_target(Path::new(&source), &profile_id).is_err());
 
         let profile_record = recovered_profile_store(&settings::profiles_root())
             .unwrap()
@@ -8347,24 +8560,19 @@ mod tests {
                 }
                 assert!(found, "{name} missing from release package");
                 assert_eq!(
-                    fs::read(
-                        managed_instance::active_game_dir()
-                            .join("BepInEx")
-                            .join("plugins")
-                            .join(name)
-                    )
-                    .unwrap(),
+                    fs::read(active.join("BepInEx").join("plugins").join(name)).unwrap(),
                     expected,
                     "{name} differs from the exact release package"
                 );
             }
         }
-        let active_config = managed_instance::active_game_dir()
+        let active_config = active
             .join("BepInEx")
             .join("config")
             .join("perfect-sync-smoke.cfg");
         fs::write(&active_config, b"profile-specific setting").unwrap();
-        managed_instance::capture_active_config(&settings::profiles_root()).unwrap();
+        managed_instance::capture_workspace_config(&settings::profiles_root(), &profile_id)
+            .unwrap();
         assert_eq!(
             fs::read(
                 settings::profiles_root()
@@ -8379,10 +8587,10 @@ mod tests {
         prepare_profile_with_guard(&source, &profile_id, None, true, || Ok(())).unwrap();
         assert_eq!(
             fs::read(
-                managed_instance::active_game_dir()
+                active
                     .join("BepInEx")
                     .join("config")
-                    .join("perfect-sync-smoke.cfg")
+                    .join("perfect-sync-smoke.cfg"),
             )
             .unwrap(),
             b"profile-specific setting"

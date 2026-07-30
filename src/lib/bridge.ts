@@ -707,7 +707,7 @@ function errorLogDefaultName(): string {
 }
 
 /** Save LogOutput.log from the active managed profile workspace. */
-export async function exportErrorLog(): Promise<string | null> {
+export async function exportErrorLog(profileId: string): Promise<string | null> {
   const defaultPath = errorLogDefaultName();
   if (!inTauri) return defaultPath;
   const destination = await saveDialog({
@@ -716,7 +716,7 @@ export async function exportErrorLog(): Promise<string | null> {
     filters: [{ name: "BepInEx log", extensions: ["log"] }],
   });
   if (typeof destination !== "string") return null;
-  return invoke<string>("export_error_log", { destination });
+  return invoke<string>("export_error_log", { destination, profileId });
 }
 
 let browserBackups: SaveBackupInfo[] = [];
@@ -780,7 +780,7 @@ export async function collectDiagnostics(profileId?: string): Promise<Diagnostic
       source: mod.source,
     })),
     logErrors: [],
-    gameRunning: browserRunning,
+    gameRunning: profileId ? browserRunning.has(profileId) : browserRunning.size > 0,
     warnings: [],
   };
 }
@@ -799,11 +799,11 @@ export async function exportSupportBundle(profileId?: string): Promise<string | 
   return invoke<string>("export_support_bundle", { destination, profileId });
 }
 
-let browserRunning = false;
+const browserRunning = new Set<string>();
 
-export async function gameRunning(): Promise<boolean> {
-  if (inTauri) return invoke<boolean>("game_running");
-  return browserRunning;
+export async function gameRunning(profileId: string): Promise<boolean> {
+  if (inTauri) return invoke<boolean>("game_running", { profileId });
+  return browserRunning.has(profileId);
 }
 
 // ------------------------------------------------------------------ profiles
@@ -1412,11 +1412,11 @@ export async function reinstallLoader(
   return null;
 }
 
-function beginBrowserLaunch(): void {
-  if (browserRunning) throw new Error("Among Us is already running.");
-  browserRunning = true;
+function beginBrowserLaunch(profileId: string): void {
+  if (browserRunning.has(profileId)) throw new Error("This profile is already running.");
+  browserRunning.add(profileId);
   window.setTimeout(() => {
-    browserRunning = false;
+    browserRunning.delete(profileId);
   }, 2800);
 }
 
@@ -1426,16 +1426,16 @@ export async function launchProfile(gamePath: string, profileId: string): Promis
     return;
   }
   if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
-  beginBrowserLaunch();
+  beginBrowserLaunch(profileId);
 }
 
-export async function launchVanilla(gamePath: string): Promise<void> {
+export async function launchVanilla(gamePath: string, profileId: string): Promise<void> {
   if (inTauri) {
-    await invoke<void>("launch_vanilla", { gamePath });
+    await invoke<void>("launch_vanilla", { gamePath, profileId });
     return;
   }
   if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
-  beginBrowserLaunch();
+  beginBrowserLaunch(profileId);
 }
 
 /** Prepare the active profile in the isolated managed workspace. */

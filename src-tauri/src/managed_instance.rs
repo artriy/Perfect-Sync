@@ -157,8 +157,58 @@ fn workspaces_root() -> PathBuf {
     managed_root().join("workspace")
 }
 
-pub fn active_game_dir() -> PathBuf {
-    workspaces_root().join("current")
+fn workspace_root(workspace_id: &str) -> Result<PathBuf, String> {
+    profile::validate_profile_id(workspace_id).map_err(|error| error.to_string())?;
+    Ok(workspaces_root().join(workspace_id))
+}
+
+fn migrate_legacy_workspace(workspace_id: &str, workspace: &Path) -> Result<(), String> {
+    let legacy = workspaces_root().join("current");
+    recover_destination(&legacy)?;
+    if workspace.join("current").exists() || !legacy.exists() {
+        return Ok(());
+    }
+    let Some(marker) = read_json::<WorkspaceMarker>(&legacy.join(INSTANCE_MARKER))? else {
+        return Ok(());
+    };
+    if marker.profile_id != workspace_id && marker.profile_id != "_vanilla" {
+        return Ok(());
+    }
+    fs::create_dir_all(workspace).map_err(|error| error.to_string())?;
+    fs::rename(&legacy, workspace.join("current"))
+        .map_err(|error| format!("could not migrate the legacy managed workspace: {error}"))
+}
+
+pub fn workspace_game_dir(workspace_id: &str) -> Result<PathBuf, String> {
+    let workspace = workspace_root(workspace_id)?;
+    migrate_legacy_workspace(workspace_id, &workspace)?;
+    Ok(workspace.join("current"))
+}
+
+pub fn workspace_ids() -> Result<Vec<String>, String> {
+    let root = workspaces_root();
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str() else {
+            continue;
+        };
+        if id == "current" || id.starts_with('.') || profile::validate_profile_id(id).is_err() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        if !is_reparse(&metadata) && metadata.is_dir() {
+            ids.push(id.to_string());
+        }
+    }
+    ids.sort();
+    Ok(ids)
 }
 
 fn unique_child(parent: &Path, label: &str) -> PathBuf {
@@ -1017,12 +1067,13 @@ pub fn ensure_base(
     result
 }
 
-pub fn begin_workspace(base: &GameBase) -> Result<PathBuf, String> {
-    let workspaces = workspaces_root();
-    fs::create_dir_all(&workspaces).map_err(|error| error.to_string())?;
-    recover_destination(&active_game_dir())?;
-    remove_prefixed_children(&workspaces, ".stage.")?;
-    let stage = unique_child(&workspaces, "stage");
+pub fn begin_workspace(base: &GameBase, workspace_id: &str) -> Result<PathBuf, String> {
+    let workspace = workspace_root(workspace_id)?;
+    fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+    let active = workspace_game_dir(workspace_id)?;
+    recover_destination(&active)?;
+    remove_prefixed_children(&workspace, ".stage.")?;
+    let stage = unique_child(&workspace, "stage");
     let result = copy_base_tree(base, &stage);
     if let Err(error) = result {
         let _ = remove_tree(&stage);
@@ -1030,9 +1081,11 @@ pub fn begin_workspace(base: &GameBase) -> Result<PathBuf, String> {
     }
     Ok(stage)
 }
-pub fn discard_workspace(stage: &Path) -> Result<(), String> {
-    let workspaces = workspaces_root();
-    let canonical_parent = fs::canonicalize(&workspaces).map_err(|error| error.to_string())?;
+
+pub fn discard_workspace(stage: &Path, workspace_id: &str) -> Result<(), String> {
+    let workspace = workspace_root(workspace_id)?;
+    fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+    let canonical_parent = fs::canonicalize(&workspace).map_err(|error| error.to_string())?;
     let stage_parent = stage
         .parent()
         .and_then(|parent| fs::canonicalize(parent).ok())
@@ -1207,14 +1260,20 @@ pub fn publish_workspace(
     base: &GameBase,
     profile_id: &str,
     profile_revision: &str,
+    workspace_id: &str,
 ) -> Result<PathBuf, String> {
     profile::validate_profile_id(profile_id).map_err(|error| error.to_string())?;
+    profile::validate_profile_id(workspace_id).map_err(|error| error.to_string())?;
     if profile_revision.len() != 64
         || !profile_revision
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
     {
         return Err("profile revision is invalid".into());
+    }
+    let expected_parent = workspace_root(workspace_id)?;
+    if stage.parent() != Some(expected_parent.as_path()) {
+        return Err("workspace stage does not belong to the requested profile".into());
     }
     let managed_files = managed_delta(base, stage)?;
     let marker = WorkspaceMarker {
@@ -1227,13 +1286,13 @@ pub fn publish_workspace(
         managed_files,
     };
     write_json(&stage.join(INSTANCE_MARKER), &marker)?;
-    let active = active_game_dir();
+    let active = workspace_game_dir(workspace_id)?;
     publish_directory(stage, &active)?;
     Ok(active)
 }
 
-pub fn active_marker() -> Result<Option<WorkspaceMarker>, String> {
-    let active = active_game_dir();
+pub fn active_marker(workspace_id: &str) -> Result<Option<WorkspaceMarker>, String> {
+    let active = workspace_game_dir(workspace_id)?;
     recover_destination(&active)?;
     let Some(marker) = read_json::<WorkspaceMarker>(&active.join(INSTANCE_MARKER))? else {
         return Ok(None);
@@ -1304,8 +1363,13 @@ fn protected_files(root: &Path) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
-pub fn active_matches(base: &GameBase, profile_id: &str, revision: &str) -> Result<bool, String> {
-    let Some(marker) = active_marker()? else {
+pub fn active_matches(
+    base: &GameBase,
+    profile_id: &str,
+    revision: &str,
+    workspace_id: &str,
+) -> Result<bool, String> {
+    let Some(marker) = active_marker(workspace_id)? else {
         return Ok(false);
     };
     if marker.base_id != base.record.id
@@ -1316,7 +1380,7 @@ pub fn active_matches(base: &GameBase, profile_id: &str, revision: &str) -> Resu
     {
         return Ok(false);
     }
-    let active = active_game_dir();
+    let active = workspace_game_dir(workspace_id)?;
     let mut managed_names = HashSet::with_capacity(marker.managed_files.len());
     for expected in &marker.managed_files {
         if !managed_names.insert(expected.path.to_ascii_lowercase()) {
@@ -1426,14 +1490,16 @@ fn copy_config_tree(source: &Path, destination: &Path, replace: bool) -> Result<
     Ok(())
 }
 
-pub fn capture_active_config(profiles_root: &Path) -> Result<(), String> {
-    let Some(marker) = active_marker()? else {
+pub fn capture_workspace_config(profiles_root: &Path, workspace_id: &str) -> Result<(), String> {
+    let Some(marker) = active_marker(workspace_id)? else {
         return Ok(());
     };
     if marker.profile_id == "_vanilla" {
         return Ok(());
     }
-    let source = active_game_dir().join("BepInEx").join("config");
+    let source = workspace_game_dir(workspace_id)?
+        .join("BepInEx")
+        .join("config");
     let metadata = match fs::symlink_metadata(&source) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),

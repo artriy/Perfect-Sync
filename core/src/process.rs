@@ -8,7 +8,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 
 pub const GAME_EXE: &str = "Among Us.exe";
@@ -207,6 +207,137 @@ pub struct LaunchSpec {
     pub error: Option<String>,
 }
 
+#[cfg(windows)]
+fn windows_path_key(path: &Path) -> String {
+    let mut value = path.to_string_lossy().replace('/', "\\");
+    if value.len() >= 8 && value[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+        value = format!(r"\\{}", &value[8..]);
+    } else if value.len() >= 4 && value[..4].eq_ignore_ascii_case(r"\\?\") {
+        value = value[4..].to_string();
+    }
+    value.trim_end_matches('\\').to_ascii_lowercase()
+}
+
+#[cfg(windows)]
+fn running_game_paths() -> io::Result<Vec<PathBuf>> {
+    use std::os::windows::ffi::OsStringExt;
+
+    type Handle = *mut std::ffi::c_void;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct ProcessEntry32W {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ProcessID: u32,
+        th32DefaultHeapID: usize,
+        th32ModuleID: u32,
+        cntThreads: u32,
+        th32ParentProcessID: u32,
+        pcPriClassBase: i32,
+        dwFlags: u32,
+        szExeFile: [u16; 260],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
+        fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+        fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        fn QueryFullProcessImageNameW(
+            process: Handle,
+            flags: u32,
+            executable_name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
+    }
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x0000_1000;
+    const ERROR_NO_MORE_FILES: i32 = 18;
+    let invalid_handle = -1_isize as Handle;
+    // SAFETY: the snapshot call has no borrowed pointer arguments.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == invalid_handle {
+        return Err(io::Error::last_os_error());
+    }
+    let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<ProcessEntry32W>() as u32;
+    // SAFETY: `entry` has the documented size and remains live for enumeration.
+    let mut present = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    if !present {
+        let error = io::Error::last_os_error();
+        // SAFETY: `snapshot` is a live handle returned above.
+        unsafe { CloseHandle(snapshot) };
+        return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+            Ok(Vec::new())
+        } else {
+            Err(error)
+        };
+    }
+
+    let mut paths = Vec::new();
+    while present {
+        let name_end = entry
+            .szExeFile
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let executable_name = OsString::from_wide(&entry.szExeFile[..name_end]);
+        if executable_name
+            .to_string_lossy()
+            .eq_ignore_ascii_case(GAME_EXE)
+        {
+            // Access-denied races are normal for processes exiting during the snapshot.
+            // SAFETY: the process ID came from the live Toolhelp snapshot.
+            let process =
+                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID) };
+            if !process.is_null() {
+                let mut buffer = vec![0_u16; 32_768];
+                let mut size = buffer.len() as u32;
+                // SAFETY: the writable buffer has `size` UTF-16 elements.
+                let queried = unsafe {
+                    QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size)
+                };
+                if queried != 0 {
+                    paths.push(PathBuf::from(OsString::from_wide(&buffer[..size as usize])));
+                }
+                // SAFETY: `process` is a live handle returned by OpenProcess.
+                unsafe { CloseHandle(process) };
+            }
+        }
+        // SAFETY: `entry` remains initialized with its documented size.
+        present = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: `snapshot` is a live handle returned above.
+    unsafe { CloseHandle(snapshot) };
+    Ok(paths)
+}
+
+/// Query whether the Among Us executable inside one concrete game directory is
+/// running. Unlike the global query, another profile or source does not match.
+pub fn try_is_game_dir_running(game_dir: &Path) -> io::Result<bool> {
+    let executable = game_dir.join(GAME_EXE);
+    #[cfg(windows)]
+    {
+        let expected = windows_path_key(&executable);
+        Ok(running_game_paths()?
+            .iter()
+            .any(|path| windows_path_key(path) == expected))
+    }
+    #[cfg(not(windows))]
+    {
+        let output = command("ps").args(["-ax", "-o", "command="]).output()?;
+        if !output.status.success() {
+            return Err(query_failed("ps", &output));
+        }
+        let expected = executable.to_string_lossy();
+        Ok(String::from_utf8_lossy(&output.stdout).contains(expected.as_ref()))
+    }
+}
+
 /// Query whether Among Us is running. A helper failure is distinct from a
 /// successful query which found no matching process.
 pub fn try_is_running() -> io::Result<bool> {
@@ -249,6 +380,7 @@ fn pgrep_state(status_code: Option<i32>, has_output: bool) -> Option<bool> {
 
 fn interpret_pgrep(result: io::Result<Output>) -> io::Result<bool> {
     let output = result?;
+
     pgrep_state(output.status.code(), !output.stdout.is_empty())
         .ok_or_else(|| query_failed("pgrep", &output))
 }
@@ -307,6 +439,7 @@ mod tests {
 
     const NO_CONSOLE_CHILD: &str = "PERFECT_SYNC_NO_CONSOLE_CHILD";
     const INTERACTIVE_CONSOLE_CHILD: &str = "PERFECT_SYNC_INTERACTIVE_CONSOLE_CHILD";
+    const PATH_QUERY_CHILD: &str = "PERFECT_SYNC_PATH_QUERY_CHILD";
 
     #[link(name = "Kernel32")]
     extern "system" {
@@ -384,5 +517,56 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+    #[test]
+    fn path_specific_query_tracks_concurrent_game_directories_independently() {
+        if std::env::var_os(PATH_QUERY_CHILD).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let first_dir = temp.path().join("steam-profile");
+        let second_dir = temp.path().join("epic-profile");
+        std::fs::create_dir(&first_dir).unwrap();
+        std::fs::create_dir(&second_dir).unwrap();
+        let current_executable = std::env::current_exe().unwrap();
+        let first_executable = first_dir.join(GAME_EXE);
+        let second_executable = second_dir.join(GAME_EXE);
+        std::fs::copy(&current_executable, &first_executable).unwrap();
+        std::fs::copy(&current_executable, &second_executable).unwrap();
+        let spawn_game = |executable: &Path| {
+            command(executable)
+                .env(PATH_QUERY_CHILD, "1")
+                .args([
+                    "--exact",
+                    "process::tests::path_specific_query_tracks_concurrent_game_directories_independently",
+                ])
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn_game(&first_executable);
+        let mut second = spawn_game(&second_executable);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if try_is_game_dir_running(&first_dir).unwrap()
+                && try_is_game_dir_running(&second_dir).unwrap()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "concurrent copied Among Us.exe processes were not detected"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        first.kill().unwrap();
+        first.wait().unwrap();
+        assert!(!try_is_game_dir_running(&first_dir).unwrap());
+        assert!(try_is_game_dir_running(&second_dir).unwrap());
+        second.kill().unwrap();
+        second.wait().unwrap();
     }
 }

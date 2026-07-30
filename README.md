@@ -153,16 +153,18 @@ Perfect Sync keeps small user state separate from large managed game data:
 | Settings, profiles, and catalog overrides | `%APPDATA%\Perfect-Sync\` |
 | A profile's owned DLLs and mutable BepInEx configuration | `%APPDATA%\Perfect-Sync\profiles\<profile-id>\BepInEx\` |
 | Immutable game bases | `%LOCALAPPDATA%\Perfect-Sync\managed-games\bases\<instance-id-hash>\versions\<base-id>\game\` |
-| Currently selected runnable profile | `%LOCALAPPDATA%\Perfect-Sync\managed-games\workspace\current\` |
+| Each runnable profile workspace | `%LOCALAPPDATA%\Perfect-Sync\managed-games\workspace\<profile-id>\current\` |
 | Downloaded package caches | `%APPDATA%\Perfect-Sync\cache\` |
 
-Only one full runnable workspace is kept active. Profiles permanently store their own
-mods and configuration, not another complete copy of Among Us. Downloaded Town of Us
-and BepInEx packages are shared caches. The selected Steam, Epic, Microsoft Store, or
-manual folder remains outside these paths and is never changed.
+Each prepared profile keeps one runnable workspace. Because workspaces are isolated by
+profile, Steam, Epic, and other instances can run concurrently; Perfect Sync tracks the
+exact executable path for each session and blocks file-changing actions only for that
+profile. Profiles permanently store their owned mods and configuration, while downloaded
+Town of Us and BepInEx packages remain shared caches. The selected Steam, Epic, Microsoft
+Store, or manual source folder remains outside these paths and is never changed.
 
 The first-run wizard and Settings can relocate the large managed data to an empty
-custom folder. Perfect Sync copies and SHA-256-verifies the bases, active workspace,
+custom folder. Perfect Sync copies and SHA-256-verifies the bases, profile workspaces,
 and package caches before switching, then removes the old copy. A custom root uses
 `<selected-folder>\managed-games\` and `<selected-folder>\cache\`; profiles and
 settings remain under `%APPDATA%`.

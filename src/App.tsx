@@ -97,13 +97,11 @@ export function App() {
   const [loaded, setLoaded] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [activeId, setActiveId] = useState("");
-  const [running, setRunningState] = useState(false);
+  const [runningStatus, setRunningStatus] = useState({ profileId: "", running: false, known: false });
   const [operationBusy, setOperationBusy] = useState(false);
   const [operationActivity, setOperationActivity] = useState<OperationActivity | null>(null);
 
   const operationRef = useRef(false);
-  const runningRef = useRef(false);
-  const launchSession = useRef(0);
   const startupPromiseRef = useRef<Promise<StartupResult> | null>(null);
   const operationActivityId = useRef(0);
   const initialWorkspacePreparationStarted = useRef(false);
@@ -182,13 +180,9 @@ export function App() {
     resolve?.(confirmed);
   };
 
-  const setRunning = (value: boolean) => {
-    runningRef.current = value;
-    setRunningState(value);
-  };
 
   const beginOperation = (): boolean => {
-    if (operationRef.current || runningRef.current) return false;
+    if (operationRef.current) return false;
     operationRef.current = true;
     setOperationBusy(true);
     return true;
@@ -464,6 +458,8 @@ export function App() {
   }, [loaded]);
 
   const active = profiles.find((profile) => profile.id === activeId) ?? profiles[0];
+  const runningKnown = runningStatus.profileId === active?.id && runningStatus.known;
+  const running = runningStatus.profileId === active?.id && runningStatus.running;
   const installedSnapshot = useMemo(
     () => active?.mods.map((mod) => [mod.packageId, mod.version] as [string, string]) ?? [],
     [active?.mods],
@@ -474,8 +470,49 @@ export function App() {
   const activeGame = gameForProfile(active);
   const arch: Arch = activeGame?.arch ?? "x86";
   const gameStatus = { store: activeGame?.store ?? "manual", arch, running };
-  const busy = operationBusy || running;
+  const busy = operationBusy;
   const firstRun = loaded && !settings.setupComplete;
+
+  useEffect(() => {
+    if (!loaded || !active) {
+      setRunningStatus({ profileId: "", running: false, known: false });
+      return;
+    }
+    let current = true;
+    let timer: number | undefined;
+    let warned = false;
+    const profileId = active.id;
+    const updateRunningStatus = (isRunning: boolean, known: boolean) => {
+      setRunningStatus((previous) =>
+        previous.profileId === profileId &&
+        previous.running === isRunning &&
+        previous.known === known
+          ? previous
+          : { profileId, running: isRunning, known },
+      );
+    };
+    const poll = async () => {
+      try {
+        const isRunning = await bridge.gameRunning(profileId);
+        if (!current) return;
+        warned = false;
+        updateRunningStatus(isRunning, true);
+      } catch (error) {
+        if (!current) return;
+        updateRunningStatus(false, false);
+        if (!warned) {
+          warned = true;
+          notify(`Could not read ${active.name}'s game status: ${messageFrom(error)}`, "error");
+        }
+      }
+      if (current) timer = window.setTimeout(poll, 2000);
+    };
+    void poll();
+    return () => {
+      current = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [loaded, active?.id]);
 
   useEffect(() => {
     if (
@@ -484,6 +521,7 @@ export function App() {
       !active ||
       !activeGame ||
       operationBusy ||
+      !runningKnown ||
       running ||
       initialWorkspacePreparationStarted.current
     ) {
@@ -510,7 +548,7 @@ export function App() {
     return () => {
       current = false;
     };
-  }, [loaded, firstRun, active?.id, activeGame?.path, operationBusy, running]);
+  }, [loaded, firstRun, active?.id, activeGame?.path, operationBusy, runningKnown, running]);
 
   useEffect(() => {
     if (!loaded || !active || !activeGame) {
@@ -858,7 +896,7 @@ export function App() {
   };
 
   const openAddPanel = () => {
-    if (operationRef.current || runningRef.current) return;
+    if (operationRef.current) return;
     setSelectedCatalogIds([]);
     setMapsOpen(false);
     setAddOpen(true);
@@ -879,7 +917,7 @@ export function App() {
   };
 
   const addUrl = async (url: string): Promise<void> => {
-    if (operationRef.current || runningRef.current) return;
+    if (operationRef.current) return;
     const match = url.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
     const repo = match ? `${match[1]}/${match[2]}` : url;
     const name = match ? match[2] : "Mod";
@@ -1165,7 +1203,7 @@ export function App() {
   };
 
   const openPicker = (modId: string) => {
-    if (operationRef.current || runningRef.current) return;
+    if (operationRef.current) return;
     const mod = active.mods.find((candidate) => candidate.packageId === modId);
     if (mod) {
       const repo = mod.repo ?? mod.packageId;
@@ -1265,32 +1303,6 @@ export function App() {
     }
   };
 
-  const monitorGame = () => {
-    const session = ++launchSession.current;
-    const startedAt = Date.now();
-    let seen = false;
-    const poll = async () => {
-      if (launchSession.current !== session) return;
-      try {
-        const alive = await bridge.gameRunning();
-        if (launchSession.current !== session) return;
-        if (alive) {
-          seen = true;
-          window.setTimeout(poll, 2000);
-        } else if (seen || Date.now() - startedAt > 20000) {
-          setRunning(false);
-        } else {
-          window.setTimeout(poll, 2000);
-        }
-      } catch (error) {
-        if (launchSession.current === session) {
-          setRunning(false);
-          notify(`Could not read game status: ${messageFrom(error)}`, "error");
-        }
-      }
-    };
-    window.setTimeout(poll, 2000);
-  };
 
   const launchInternal = async (profile: Profile, vanilla: boolean) => {
     const instance = gameForProfile(profile);
@@ -1298,18 +1310,17 @@ export function App() {
     if (!vanilla && !await requestUnmanagedPluginResolution(profile, true, instance)) {
       throw UNMANAGED_REVIEW_CANCELLED;
     }
-    setRunning(true);
+    setRunningStatus({ profileId: profile.id, running: true, known: true });
     try {
-      if (vanilla) await bridge.launchVanilla(instance.path);
+      if (vanilla) await bridge.launchVanilla(instance.path, profile.id);
       else await bridge.launchProfile(instance.path, profile.id);
       notify(
         instance.store === "epic"
           ? `Launching ${vanilla ? "vanilla Among Us" : profile.name}. Epic may ask you to sign in the first time, that's normal.`
           : `Launching ${vanilla ? "vanilla Among Us" : profile.name}`,
       );
-      monitorGame();
     } catch (error) {
-      setRunning(false);
+      setRunningStatus({ profileId: profile.id, running: false, known: true });
       throw error;
     }
   };
@@ -1485,7 +1496,7 @@ export function App() {
     notify(normalized.storageWarning ?? "Managed storage location updated", normalized.storageWarning ? "error" : "success");
   };
   const saveErrorLog = async (): Promise<void> => {
-    const destination = await exclusive(() => bridge.exportErrorLog());
+    const destination = await exclusive(() => bridge.exportErrorLog(active.id));
     if (destination) notify("BepInEx error log saved", "success");
   };
 
@@ -1822,7 +1833,7 @@ export function App() {
         installed={installedSnapshot}
         trustOf={trustOf}
         personalMods={settings.personalMods}
-        busyReason={running ? "Close Among Us before applying this lobby." : operationBusy ? "Wait for the current operation to finish." : undefined}
+        busyReason={operationBusy ? "Wait for the current operation to finish." : undefined}
         onClose={() => {
           if (!operationRef.current) setLobbyOpen(false);
         }}

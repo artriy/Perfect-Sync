@@ -15,22 +15,23 @@
 - Version immutable bases by source identity, executable, build, store, architecture,
   and content; retain historical generations required by profiles, migrate compatible
   legacy bases, and garbage-collect unreferenced generations after successful use.
-- Materialize each selected profile into one disposable private workspace with verified
-  file copies, profile-specific config persistence, crash recovery, and atomic
+- Materialize every prepared profile into its own disposable private workspace with
+  verified file copies, profile-specific config persistence, crash recovery, and atomic
   replacement that preserves both the immutable base and previous working instance.
 - Launch only validated managed workspaces across native Windows, Proton, Wine,
-  CrossOver, Whisky, and Bottles; profile switching and mod toggles rebuild the selected
-  workspace without changing the original game installation.
+  CrossOver, Whisky, and Bottles; track running processes by exact workspace path so
+  Steam, Epic, and other profiles can run concurrently without locking the rest of the
+  app, while file-changing actions remain blocked only for the affected profile.
 - Verify both x86 Steam and x64 Epic Town of Us workspaces against the exact release ZIP,
   including `MiraAPI.dll`, `touhats.bundle`, and `touhats.catalog`.
 - Treat automatic update discovery as best-effort so a missing or temporarily
   unavailable release manifest cannot interrupt application startup.
 - Auto-detect only fresh Among Us sources without known loader or mod artifacts;
   manually inspected sources still report their exact contamination warning.
-- Let first-time setup and Settings place managed bases, the active workspace, and
-  package caches in an empty custom folder. Relocation copies and SHA-256-verifies
-  every file before switching and preserves the previous location on failure.
-- Add a Settings action that exports the active managed workspace's bounded,
+- Let first-time setup and Settings place managed bases, profile workspaces, and package
+  caches in an empty custom folder. Relocation copies and SHA-256-verifies every file
+  before switching and preserves the previous location on failure.
+- Add a Settings action that exports the selected profile workspace's bounded,
   non-linked BepInEx `LogOutput.log` through the native save dialog.
 - Prompt existing users to rerun setup until a fresh source has been selected for the
   exact immutable-base workflow.
