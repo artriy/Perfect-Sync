@@ -92,6 +92,7 @@ pub fn run() {
             commands::inspect_game,
             commands::get_settings,
             commands::save_settings,
+            commands::select_active_profile,
             commands::move_storage,
             commands::export_error_log,
             commands::game_running,

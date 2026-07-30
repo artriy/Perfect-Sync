@@ -22,12 +22,24 @@ pub fn run_if_requested() -> bool {
 
 #[cfg(windows)]
 pub fn start(helper_pid: u32) -> io::Result<()> {
-    let executable = std::env::current_exe()?;
-    perfect_sync_core::process::command(executable)
-        .arg(MONITOR_ARG)
-        .arg(helper_pid.to_string())
-        .spawn()
-        .map(|_| ())
+    #[cfg(test)]
+    {
+        std::thread::Builder::new()
+            .name("epic-console-monitor".into())
+            .spawn(move || {
+                let _ = wait_for_game_and_submit_enter(helper_pid);
+            })
+            .map(|_| ())
+    }
+    #[cfg(not(test))]
+    {
+        let executable = std::env::current_exe()?;
+        perfect_sync_core::process::command(executable)
+            .arg(MONITOR_ARG)
+            .arg(helper_pid.to_string())
+            .spawn()
+            .map(|_| ())
+    }
 }
 
 #[cfg(not(windows))]

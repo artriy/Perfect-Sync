@@ -1397,19 +1397,6 @@ fn same_path(a: &Path, b: &Path) -> bool {
     )
 }
 
-fn inferred_store(game_dir: &Path) -> Store {
-    let path = game_dir.to_string_lossy().replace('\\', "/").to_lowercase();
-    if path.contains("/steamapps/") {
-        Store::Steam
-    } else if game_dir.join(".egstore").is_dir() || path.contains("/epic games/") {
-        Store::Epic
-    } else if path.contains("/windowsapps/") || path.contains("/xboxgames/") {
-        Store::Msstore
-    } else {
-        Store::Manual
-    }
-}
-
 fn validate_game_dir(game_dir: &Path) -> Result<(), String> {
     if !game_dir.is_dir() {
         return Err(format!("game folder not found: {}", game_dir.display()));
@@ -1567,6 +1554,11 @@ fn repair_moved_game_instances(saved: &mut Settings) -> Result<(bool, Vec<String
         if let Ok(canonical) = canonical_game_path(Path::new(&instance.path)) {
             let identity = game_executable_identity(&canonical);
             let normalized = canonical.to_string_lossy().into_owned();
+            let detected_store = game::store_for_path(&canonical, Store::Manual);
+            if detected_store != Store::Manual && instance.store != detected_store {
+                instance.store = detected_store;
+                changed = true;
+            }
             if instance.path != normalized || instance.executable_identity != identity {
                 instance.path = normalized;
                 instance.executable_identity = identity;
@@ -1621,6 +1613,10 @@ fn repair_moved_game_instances(saved: &mut Settings) -> Result<(bool, Vec<String
         instance.runtime = compat::resolve_with_hint(&candidate, Some(instance.runtime)).runtime;
         instance.build = game::detect_build(&candidate);
         instance.writable = game::is_writable_game_dir(&candidate);
+        let detected_store = game::store_for_path(&candidate, Store::Manual);
+        if detected_store != Store::Manual {
+            instance.store = detected_store;
+        }
         repaired.push(instance.name.clone());
         changed = true;
     }
@@ -1839,7 +1835,7 @@ pub async fn inspect_game(game_path: String) -> Result<GameInstallView, String> 
     blocking(move || {
         let _guard = lock_mutations()?;
         let canonical = canonical_game_path(Path::new(&game_path))?;
-        let store = inferred_store(&canonical);
+        let store = game::store_for_path(&canonical, Store::Manual);
         let arch = game::exe_arch(&canonical.join(process::GAME_EXE))
             .ok_or("Among Us executable architecture is unsupported")?;
         let runtime = compat::resolve(&canonical).runtime;
@@ -1875,6 +1871,29 @@ pub async fn get_settings() -> Result<SettingsView, String> {
             );
         }
         Ok(view)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn select_active_profile(profile_id: String) -> Result<SettingsView, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        let profile_id = profile_id.trim().to_string();
+        validate_profile_id(&profile_id)?;
+        if recovered_profile_store(&settings::profiles_root())?
+            .load(&profile_id)
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            return Err("Profile not found.".into());
+        }
+        let mut saved = settings::load().map_err(|error| error.to_string())?;
+        if saved.active_profile.as_deref() != Some(profile_id.as_str()) {
+            saved.active_profile = Some(profile_id);
+            settings::save(&saved).map_err(|error| error.to_string())?;
+        }
+        settings::view().map_err(|error| error.to_string())
     })
     .await
 }
@@ -1921,7 +1940,7 @@ pub async fn save_settings(
                 .ok_or("Among Us executable architecture is unsupported")?;
             instance.runtime =
                 compat::resolve_with_hint(&canonical, Some(instance.runtime)).runtime;
-            let detected_store = inferred_store(&canonical);
+            let detected_store = game::store_for_path(&canonical, Store::Manual);
             if detected_store != Store::Manual {
                 instance.store = detected_store;
             }
@@ -7951,6 +7970,38 @@ mod tests {
     }
 
     #[test]
+    fn repairs_store_for_an_existing_relocated_epic_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let game_dir = temp.path().join("Epic Games Games").join("AmongUs");
+        fs::create_dir_all(&game_dir).unwrap();
+        let mut executable = vec![0_u8; 72];
+        executable[0..2].copy_from_slice(b"MZ");
+        executable[0x3c..0x40].copy_from_slice(&(64_u32).to_le_bytes());
+        executable[64..68].copy_from_slice(b"PE\0\0");
+        executable[68..70].copy_from_slice(&(0x8664_u16).to_le_bytes());
+        fs::write(game_dir.join(process::GAME_EXE), executable).unwrap();
+        let mut saved = Settings::default();
+        saved.game_instances.push(settings::GameInstance {
+            id: "epic".into(),
+            name: "Epic".into(),
+            path: game_dir.to_string_lossy().into_owned(),
+            executable_identity: None,
+            arch: Arch::X64,
+            store: Store::Manual,
+            runtime: Runtime::Native,
+            build: None,
+            writable: true,
+        });
+
+        let (changed, repaired) = repair_moved_game_instances(&mut saved).unwrap();
+
+        assert!(changed);
+        assert!(repaired.is_empty());
+        assert_eq!(saved.game_instances[0].store, Store::Epic);
+        assert!(saved.game_instances[0].executable_identity.is_some());
+    }
+
+    #[test]
     fn selected_game_folder_must_contain_the_executable() {
         let temp = tempfile::tempdir().unwrap();
         let error = validate_game_dir(temp.path()).unwrap_err();
@@ -8596,5 +8647,45 @@ mod tests {
             b"profile-specific setting"
         );
         assert_eq!(fs::read(source_mira).ok(), source_mira_before);
+    }
+
+    #[test]
+    #[ignore = "launches a local Epic profile through EpicGamesStarter"]
+    fn live_epic_auth_launch_smoke() {
+        let app_data = PathBuf::from(std::env::var("PERFECT_SYNC_SMOKE_APP_DATA").unwrap());
+        let managed_data = PathBuf::from(std::env::var("PERFECT_SYNC_SMOKE_MANAGED_DATA").unwrap());
+        let profile_id = std::env::var("PERFECT_SYNC_SMOKE_PROFILE").unwrap();
+        settings::initialize_app_data_dir(app_data).unwrap();
+        settings::initialize_managed_data_dir(managed_data).unwrap();
+
+        let profile_record = recovered_profile_store(&settings::profiles_root())
+            .unwrap()
+            .load(&profile_id)
+            .unwrap()
+            .unwrap();
+        let saved = settings::load().unwrap();
+        let instance = saved
+            .game_instances
+            .iter()
+            .find(|instance| {
+                profile_record.game_instance_id.as_deref() == Some(instance.id.as_str())
+            })
+            .unwrap();
+        assert_eq!(instance.store, Store::Epic);
+        let active = managed_instance::workspace_game_dir(&profile_id).unwrap();
+
+        launch_prepared_game(&active, instance, &profile_id).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while Instant::now() < deadline {
+            if process::try_is_game_dir_running(&active).unwrap() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        panic!(
+            "EpicGamesStarter did not launch the authenticated managed profile at {}",
+            active.display()
+        );
     }
 }

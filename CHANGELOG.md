@@ -24,6 +24,13 @@
   app, while file-changing actions remain blocked only for the affected profile.
 - Verify both x86 Steam and x64 Epic Town of Us workspaces against the exact release ZIP,
   including `MiraAPI.dll`, `touhats.bundle`, and `touhats.catalog`.
+- Repair relocated Epic source metadata from durable folder evidence, expose an explicit
+  storefront picker during setup, and fall back to the current x64 Epic architecture.
+- Download and SHA-256-verify the pinned EpicGamesStarter helper, launch it with a usable
+  interactive console, dismiss its success prompt automatically, and preserve concurrently
+  running Steam profiles while the authenticated Epic workspace starts.
+- Switch the selected profile through a dedicated lightweight settings command instead of
+  rebuilding its already-isolated workspace; launch still validates and repairs stale workspaces.
 - Treat automatic update discovery as best-effort so a missing or temporarily
   unavailable release manifest cannot interrupt application startup.
 - Auto-detect only fresh Among Us sources without known loader or mod artifacts;

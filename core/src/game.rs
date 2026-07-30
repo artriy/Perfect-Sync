@@ -35,10 +35,10 @@ pub struct GameInstall {
     pub writable: bool,
 }
 
-/// Architecture a store's Among Us build uses (Steam/Epic/itch = x86, MS Store = x64).
+/// Architecture used by current store builds (Steam/itch = x86, Epic/MS Store = x64).
 pub fn arch_for_store(store: Store) -> Arch {
     match store {
-        Store::Msstore => Arch::X64,
+        Store::Epic | Store::Msstore => Arch::X64,
         _ => Arch::X86,
     }
 }
@@ -456,16 +456,39 @@ fn find_exe_dir(root: &Path, depth: usize) -> Option<PathBuf> {
     None
 }
 
-/// Infer the storefront from the actual game path instead of assigning every
-/// bottle the same store.
-fn store_for_path(path: &Path, fallback: Store) -> Store {
-    let p = path.to_string_lossy().replace('\\', "/").to_lowercase();
-    if p.contains("/steamapps/") {
+/// Infer a storefront from durable install markers and path components.
+///
+/// `fallback` is retained when the folder has no store-specific evidence. Epic
+/// users often relocate a clean install without its hidden `.egstore` folder,
+/// so an ancestor such as `Epic Games` or `Epic Games Games` is also evidence.
+pub fn store_for_path(path: &Path, fallback: Store) -> Store {
+    let normalized = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let components = normalized
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let ancestors = components
+        .get(..components.len().saturating_sub(1))
+        .unwrap_or_default();
+
+    if components.contains(&"steamapps") {
         Store::Steam
-    } else if path.join(".egstore").is_dir() || p.contains("/epic games/") {
+    } else if path.join(".egstore").is_dir()
+        || ancestors
+            .iter()
+            .any(|component| component.contains("epic games") || component.contains("epicgames"))
+    {
         Store::Epic
-    } else if p.contains("/windowsapps/") || p.contains("/xboxgames/") {
+    } else if components
+        .iter()
+        .any(|component| matches!(*component, "windowsapps" | "xboxgames"))
+    {
         Store::Msstore
+    } else if ancestors
+        .iter()
+        .any(|component| component.contains("itch.io") || *component == "itch")
+    {
+        Store::Itch
     } else {
         fallback
     }
@@ -709,6 +732,18 @@ mod tests {
     }
 
     #[test]
+    fn infers_relocated_epic_install_from_ancestor_name() {
+        assert_eq!(
+            store_for_path(Path::new(r"D:\Epic Games Games\AmongUs"), Store::Manual),
+            Store::Epic
+        );
+        assert_eq!(
+            store_for_path(Path::new(r"D:\Games\Among Us Epic Games"), Store::Manual),
+            Store::Manual
+        );
+    }
+
+    #[test]
     fn parses_msstore_registry_locations() {
         let output = r#"
 HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\GamingServices\PackageRepository\Root\one
@@ -875,7 +910,7 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\GamingServices\PackageRepository\Root\two
     #[test]
     fn arch_mapping() {
         assert_eq!(arch_for_store(Store::Steam), Arch::X86);
-        assert_eq!(arch_for_store(Store::Epic), Arch::X86);
+        assert_eq!(arch_for_store(Store::Epic), Arch::X64);
         assert_eq!(arch_for_store(Store::Msstore), Arch::X64);
     }
 

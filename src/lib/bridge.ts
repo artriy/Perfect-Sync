@@ -671,6 +671,15 @@ export async function saveSettings(
   return structuredClone(browserSettings);
 }
 
+export async function selectActiveProfile(profileId: string): Promise<Settings> {
+  if (inTauri) return invoke<Settings>("select_active_profile", { profileId });
+  if (!browserProfiles.some((profile) => profile.id === profileId)) {
+    throw new Error("Profile not found.");
+  }
+  browserSettings = { ...browserSettings, activeProfile: profileId };
+  return structuredClone(browserSettings);
+}
+
 export async function moveStorage(
   storagePath?: string,
   onProgress?: (progress: OperationProgress) => void,

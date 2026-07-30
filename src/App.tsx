@@ -756,31 +756,14 @@ export function App() {
   const selectProfile = async (id: string) => {
     if (id === active.id) return;
     try {
-      await trackedExclusive(
-        {
-          scope: "profile",
-          title: "Switching isolated profile",
-          message: "Saving the selected profile",
-        },
-        async (report) => {
-          const next = profiles.find((profile) => profile.id === id);
-          if (!next) throw new Error("Profile not found.");
-          const normalized = await bridge.saveSettings({ ...settings, activeProfile: id });
-          setSettings(normalized);
-          setActiveId(id);
-          const instance = gameForProfile(next);
-          if (instance) {
-            report({ phase: "preparing", message: "Building the selected profile workspace" });
-            const warning = await bridge.syncProfile(instance.path, next.id, report);
-            notify(
-              warning
-                ? `${next.name} is ready. ${warning}`
-                : `${next.name} is ready in its isolated workspace`,
-              warning ? "error" : "success",
-            );
-          }
-        },
-      );
+      await exclusive(async () => {
+        if (!profiles.some((profile) => profile.id === id)) {
+          throw new Error("Profile not found.");
+        }
+        const normalized = await bridge.selectActiveProfile(id);
+        setSettings(normalized);
+        setActiveId(id);
+      });
     } catch (error) {
       if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }

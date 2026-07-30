@@ -3,7 +3,7 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { CheckCircle, FolderOpen, GameController, GearSix, HardDrives, Package, WarningCircle } from "@phosphor-icons/react";
 import { inspectGame, listTouSetupOptions, pickFolder } from "../lib/bridge";
 import { useModalFocus } from "../lib/useModalFocus";
-import type { GameInstall, ModInstallOption, Runtime } from "../lib/types";
+import type { GameInstall, ModInstallOption, Runtime, Store } from "../lib/types";
 import { displayPath } from "../lib/displayPath";
 
 export type SetupSelection =
@@ -30,6 +30,14 @@ interface SetupModalProps {
 
 const LABEL = "mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase";
 
+const STORE_CHOICES: Array<{ id: Store; label: string }> = [
+  { id: "steam", label: "Steam" },
+  { id: "epic", label: "Epic Games" },
+  { id: "msstore", label: "Microsoft Store" },
+  { id: "itch", label: "itch.io" },
+  { id: "manual", label: "Direct executable" },
+];
+
 function sameGamePath(left: string, right: string): boolean {
   const normalize = (value: string) =>
     value.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
@@ -51,6 +59,7 @@ export function SetupModal({
   const modalRef = useRef<HTMLDivElement>(null);
   const [chosen, setChosen] = useState<string | null>(null);
   const [inspected, setInspected] = useState<GameInstall | null>(null);
+  const [selectedStore, setSelectedStore] = useState<Store | null>(null);
   const [browsing, setBrowsing] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [storagePending, setStoragePending] = useState(false);
@@ -78,6 +87,7 @@ export function SetupModal({
   const selectedInstall =
     detected.find((game) => !!chosen && sameGamePath(game.path, chosen)) ??
     (inspected && chosen && sameGamePath(inspected.path, chosen) ? inspected : null);
+  const effectiveStore = selectedStore ?? selectedInstall?.store ?? "manual";
 
   openRef.current = open;
   chosenRef.current = chosen;
@@ -101,6 +111,7 @@ export function SetupModal({
       sessionRef.current += 1;
       setChosen(null);
       setInspected(null);
+      setSelectedStore(null);
       setBrowsing(false);
       setInstalling(false);
       setMessage("");
@@ -138,6 +149,7 @@ export function SetupModal({
     const replacement = detected.length === 1 ? detected[0] : null;
     setChosen(replacement?.path ?? null);
     setInspected(null);
+    setSelectedStore(replacement?.store ?? null);
     setMessage(
       replacement
         ? ""
@@ -160,7 +172,7 @@ export function SetupModal({
     setTouOptionKey("");
     setTouOptionsLoading(true);
     setTouOptionsError("");
-    listTouSetupOptions(game.arch, game.store, game.runtime ?? "native")
+    listTouSetupOptions(game.arch, effectiveStore, game.runtime ?? "native")
       .then((options) => {
         if (
           request !== touOptionsRequestRef.current ||
@@ -199,7 +211,7 @@ export function SetupModal({
     selectedInstall?.arch,
     selectedInstall?.path,
     selectedInstall?.runtime,
-    selectedInstall?.store,
+    effectiveStore,
     setupKind,
   ]);
 
@@ -216,6 +228,7 @@ export function SetupModal({
       if (!openRef.current || sessionRef.current !== session) return;
       setInspected(game);
       setChosen(game.path);
+      setSelectedStore(game.store);
     } catch (error) {
       if (openRef.current && sessionRef.current === session) {
         setMessage(`Folder inspection failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -285,7 +298,7 @@ export function SetupModal({
         : "Saving setup…",
     );
     try {
-      const completed = await finishRef.current(game.path, game.arch, game.store, game.runtime, selection);
+      const completed = await finishRef.current(game.path, game.arch, effectiveStore, game.runtime, selection);
       if (!completed && openRef.current && sessionRef.current === session) {
         setMessage("Setup canceled. No changes were made.");
       }
@@ -369,6 +382,7 @@ export function SetupModal({
                             onClick={() => {
                               setInspected(null);
                               setChosen(game.path);
+                              setSelectedStore(game.store);
                               setMessage("");
                             }}
                             className="ring-focus glass flex items-center gap-3 rounded-xl px-3.5 py-3 text-left hover:bg-white/10 disabled:opacity-50"
@@ -418,6 +432,7 @@ export function SetupModal({
                       type="button"
                       onClick={() => {
                         setChosen(null);
+                        setSelectedStore(null);
                         setMessage("");
                         setSetupKind(null);
                         setTouOptions([]);
@@ -430,6 +445,44 @@ export function SetupModal({
                       Change
                     </button>
                   </div>
+                  <span className={`${LABEL} mt-5`}>Storefront</span>
+                  <div
+                    className="grid grid-cols-2 gap-2 max-[480px]:grid-cols-1"
+                    role="radiogroup"
+                    aria-label="Among Us storefront"
+                  >
+                    {STORE_CHOICES.map((store) => (
+                      <button
+                        key={store.id}
+                        type="button"
+                        role="radio"
+                        aria-checked={effectiveStore === store.id}
+                        disabled={installing}
+                        onClick={() => {
+                          setSelectedStore(store.id);
+                          setMessage("");
+                        }}
+                        className={`ring-focus rounded-xl border px-3 py-2.5 text-left text-[12.5px] font-semibold transition-colors disabled:opacity-50 ${
+                          effectiveStore === store.id
+                            ? "border-[#9b7bff]/60 bg-[#9b7bff]/16 text-ink"
+                            : "border-white/10 bg-white/[0.04] text-ink-dim hover:bg-white/[0.08] hover:text-ink"
+                        }`}
+                      >
+                        {store.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p
+                    className={`mt-2 px-1 text-[11.5px] leading-relaxed ${
+                      effectiveStore === "manual" ? "text-[#ffd7a0]" : "text-ink-faint"
+                    }`}
+                  >
+                    {effectiveStore === "epic"
+                      ? "Epic profiles use the verified EpicGamesStarter authentication helper."
+                      : effectiveStore === "manual"
+                        ? "Direct launch skips storefront authentication. If this copy came from Epic, select Epic Games."
+                        : "This controls package selection and the storefront-specific launch path."}
+                  </p>
                   <div className="mt-2 flex items-start gap-2 rounded-xl border border-[#5be3b0]/25 bg-[#5be3b0]/8 px-3.5 py-3 text-[12px] leading-relaxed text-ink-dim">
                     <CheckCircle size={17} weight="fill" className="mt-0.5 shrink-0 text-[#5be3b0]" />
                     <span>
