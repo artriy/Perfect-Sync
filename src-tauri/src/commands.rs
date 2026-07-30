@@ -8672,13 +8672,24 @@ mod tests {
             })
             .unwrap();
         assert_eq!(instance.store, Store::Epic);
+        let preparation_started = Instant::now();
+        prepare_profile_with_guard(&instance.path, &profile_id, None, false, || Ok(())).unwrap();
+        eprintln!(
+            "Epic profile preparation: {:.3}s",
+            preparation_started.elapsed().as_secs_f64()
+        );
         let active = managed_instance::workspace_game_dir(&profile_id).unwrap();
 
+        let launch_started = Instant::now();
         launch_prepared_game(&active, instance, &profile_id).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(180);
         while Instant::now() < deadline {
             if process::try_is_game_dir_running(&active).unwrap() {
+                eprintln!(
+                    "Epic authentication launch: {:.3}s",
+                    launch_started.elapsed().as_secs_f64()
+                );
                 return;
             }
             std::thread::sleep(Duration::from_millis(250));

@@ -12,9 +12,9 @@
 - Treat every selected Among Us folder as a read-only source; reject known existing
   mod-loader artifacts rather than silently filtering them, then import every source
   file into an exact SHA-256-manifested immutable base under local app data.
-- Version immutable bases by source identity, executable, build, store, architecture,
-  and content; retain historical generations required by profiles, migrate compatible
-  legacy bases, and garbage-collect unreferenced generations after successful use.
+- Version immutable bases by source identity, executable, build, and content; retain
+  historical generations required by profiles, migrate compatible legacy bases, and
+  garbage-collect unreferenced generations after successful use.
 - Materialize every prepared profile into its own disposable private workspace with
   verified file copies, profile-specific config persistence, crash recovery, and atomic
   replacement that preserves both the immutable base and previous working instance.
@@ -31,6 +31,9 @@
   running Steam profiles while the authenticated Epic workspace starts.
 - Switch the selected profile through a dedicated lightweight settings command instead of
   rebuilding its already-isolated workspace; launch still validates and repairs stale workspaces.
+- Reuse the same immutable base after storefront or architecture metadata is corrected,
+  persist completed base validation across app restarts, and avoid republishing unchanged
+  profile configs so repeat launches do not recopy or rehash the clean game.
 - Treat automatic update discovery as best-effort so a missing or temporarily
   unavailable release manifest cannot interrupt application startup.
 - Auto-detect only fresh Among Us sources without known loader or mod artifacts;
