@@ -5899,13 +5899,26 @@ fn prepare_profile_with_guard(
             "Creating or validating the private clean game base",
         );
     }
-    managed_instance::capture_workspace_config(&profiles_root, profile_id)?;
-    let base = managed_instance::ensure_base(&instance, profile.game_build.as_deref())?;
     let profile_root = profile_store
         .profile_dir(profile_id)
         .map_err(|error| error.to_string())?;
     with_profile_layout(&profiles_root, profile_id, || Ok(()))?;
-    let revision = managed_instance::profile_revision(&profile_root)?;
+    let (previous_revision, previous_material_revision) =
+        managed_instance::profile_revisions(&profile_root)?;
+    managed_instance::capture_workspace_config(&profiles_root, profile_id)?;
+    let (revision, material_revision) = managed_instance::profile_revisions(&profile_root)?;
+    if !force_rebuild
+        && previous_revision != revision
+        && previous_material_revision == material_revision
+    {
+        managed_instance::refresh_active_profile_revision(
+            profile_id,
+            profile_id,
+            &previous_revision,
+            &revision,
+        )?;
+    }
+    let base = managed_instance::ensure_base(&instance, profile.game_build.as_deref())?;
     if !force_rebuild && managed_instance::active_matches(&base, profile_id, &revision, profile_id)?
     {
         let context = compat::resolve_with_hint(&source, Some(instance.runtime));

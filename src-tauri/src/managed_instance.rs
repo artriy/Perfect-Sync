@@ -15,7 +15,7 @@ use std::sync::{
 pub const INSTANCE_MARKER: &str = ".perfectsync-instance.json";
 const BASE_RECORD: &str = "base.json";
 const BASE_VALIDATION_RECORD: &str = ".perfectsync-base-validation.json";
-const BASE_VALIDATION_SCHEMA: u32 = 2;
+const BASE_VALIDATION_SCHEMA: u32 = 3;
 const SCHEMA: u32 = 1;
 const MAX_FILES: usize = 200_000;
 const MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -91,6 +91,7 @@ struct BaseValidationRecord {
     schema: u32,
     base_id: String,
     manifest_sha256: String,
+    metadata_fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -538,14 +539,37 @@ fn base_validation_key(root: &Path, record: &BaseRecord) -> String {
     )
 }
 
-fn base_is_validated(root: &Path, record: &BaseRecord) -> Result<bool, String> {
+fn base_metadata_fingerprint(root: &Path, record: &BaseRecord) -> Result<String, String> {
+    let game_dir = root.join("game");
+    let mut hasher = Sha256::new();
+    for expected in &record.files {
+        let path = game_dir.join(relative_path(&expected.path)?);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if is_reparse(&metadata) || !metadata.is_file() || metadata.len() != expected.size {
+            return Err(format!("immutable base file changed: {}", expected.path));
+        }
+        let modified = metadata
+            .modified()
+            .map_err(|error| error.to_string())?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| format!("immutable base timestamp is invalid: {}", expected.path))?
+            .as_nanos();
+        hasher.update((expected.path.len() as u64).to_le_bytes());
+        hasher.update(expected.path.as_bytes());
+        hasher.update(expected.size.to_le_bytes());
+        hasher.update(modified.to_le_bytes());
+    }
+    Ok(hex_digest(hasher.finalize()))
+}
+
+fn base_is_validated(root: &Path, record: &BaseRecord, fingerprint: &str) -> Result<bool, String> {
     let key = base_validation_key(root, record);
     let validated = VALIDATED_BASES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| "managed base validation cache is poisoned".to_string())?
         .get(&key)
-        .is_some_and(|cached| cached.eq_ignore_ascii_case(&record.manifest_sha256));
+        .is_some_and(|cached| cached == fingerprint);
     if validated {
         return Ok(true);
     }
@@ -557,39 +581,40 @@ fn base_is_validated(root: &Path, record: &BaseRecord) -> Result<bool, String> {
             && cached
                 .manifest_sha256
                 .eq_ignore_ascii_case(&record.manifest_sha256)
+            && cached.metadata_fingerprint == fingerprint
     });
     if validated {
         VALIDATED_BASES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .map_err(|_| "managed base validation cache is poisoned".to_string())?
-            .insert(key, record.manifest_sha256.clone());
+            .insert(key, fingerprint.to_string());
     }
     Ok(validated)
 }
 
 fn mark_base_validated(root: &Path, record: &BaseRecord) -> Result<(), String> {
+    let fingerprint = base_metadata_fingerprint(root, record)?;
     write_json(
         &root.join(BASE_VALIDATION_RECORD),
         &BaseValidationRecord {
             schema: BASE_VALIDATION_SCHEMA,
             base_id: record.id.clone(),
             manifest_sha256: record.manifest_sha256.clone(),
+            metadata_fingerprint: fingerprint.clone(),
         },
     )?;
     VALIDATED_BASES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| "managed base validation cache is poisoned".to_string())?
-        .insert(
-            base_validation_key(root, record),
-            record.manifest_sha256.clone(),
-        );
+        .insert(base_validation_key(root, record), fingerprint);
     Ok(())
 }
 
 fn validate_base_files(root: &Path, record: &BaseRecord) -> Result<(), String> {
-    if base_is_validated(root, record)? {
+    let fingerprint = base_metadata_fingerprint(root, record)?;
+    if base_is_validated(root, record, &fingerprint)? {
         return Ok(());
     }
     let game_dir = root.join("game");
@@ -599,10 +624,6 @@ fn validate_base_files(root: &Path, record: &BaseRecord) -> Result<(), String> {
             return Err("immutable base manifest has case-colliding paths".into());
         }
         let path = game_dir.join(relative_path(&expected.path)?);
-        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-        if is_reparse(&metadata) || !metadata.is_file() || metadata.len() != expected.size {
-            return Err(format!("immutable base file changed: {}", expected.path));
-        }
         if sha256_file(&path, Some(expected.size))? != expected.sha256 {
             return Err(format!("immutable base file changed: {}", expected.path));
         }
@@ -1340,6 +1361,7 @@ fn protected_files(root: &Path) -> Result<Vec<String>, String> {
         if is_reparse(&metadata) || !metadata.is_dir() {
             return Err(format!("protected workspace path is invalid: {prefix}"));
         }
+
         let mut pending = vec![(directory, PathBuf::from(prefix))];
         while let Some((current, relative_root)) = pending.pop() {
             for entry in sorted_entries(&current)? {
@@ -1372,6 +1394,33 @@ fn protected_files(root: &Path) -> Result<Vec<String>, String> {
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+fn valid_profile_revision(revision: &str) -> bool {
+    revision.len() == 64 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub fn refresh_active_profile_revision(
+    workspace_id: &str,
+    profile_id: &str,
+    expected_revision: &str,
+    revision: &str,
+) -> Result<bool, String> {
+    profile::validate_profile_id(profile_id).map_err(|error| error.to_string())?;
+    if !valid_profile_revision(expected_revision) || !valid_profile_revision(revision) {
+        return Err("profile revision is invalid".into());
+    }
+    let Some(mut marker) = active_marker(workspace_id)? else {
+        return Ok(false);
+    };
+    if marker.profile_id != profile_id || marker.profile_revision != expected_revision {
+        return Ok(false);
+    }
+    marker.profile_revision = revision.to_string();
+    write_json(
+        &workspace_game_dir(workspace_id)?.join(INSTANCE_MARKER),
+        &marker,
+    )?;
+    Ok(true)
 }
 
 pub fn active_matches(
@@ -1431,20 +1480,34 @@ pub fn active_matches(
     Ok(true)
 }
 
-pub fn profile_revision(profile_root: &Path) -> Result<String, String> {
-    let mut hasher = Sha256::new();
+pub fn profile_revisions(profile_root: &Path) -> Result<(String, String), String> {
+    let mut revision = Sha256::new();
+    let mut material_revision = Sha256::new();
     if profile_root.is_dir() {
         for file in collect_tree(profile_root, false)? {
             if file.path.eq_ignore_ascii_case("profile.json") {
                 continue;
             }
-            hasher.update((file.path.len() as u64).to_le_bytes());
-            hasher.update(file.path.as_bytes());
-            hasher.update(file.size.to_le_bytes());
-            hasher.update(file.sha256.as_bytes());
+            let update = |hasher: &mut Sha256| {
+                hasher.update((file.path.len() as u64).to_le_bytes());
+                hasher.update(file.path.as_bytes());
+                hasher.update(file.size.to_le_bytes());
+                hasher.update(file.sha256.as_bytes());
+            };
+            update(&mut revision);
+            if !is_mutable_path(&file.path) {
+                update(&mut material_revision);
+            }
         }
     }
-    Ok(hex_digest(hasher.finalize()))
+    Ok((
+        hex_digest(revision.finalize()),
+        hex_digest(material_revision.finalize()),
+    ))
+}
+
+pub fn profile_revision(profile_root: &Path) -> Result<String, String> {
+    profile_revisions(profile_root).map(|(revision, _)| revision)
 }
 
 fn config_manifest(root: &Path) -> Result<Option<Vec<ManifestFile>>, String> {
@@ -1541,6 +1604,7 @@ fn copy_config_tree(source: &Path, destination: &Path, replace: bool) -> Result<
                 if copied != metadata.len() {
                     return Err("profile configuration changed while it was copied".into());
                 }
+                output.sync_all().map_err(|error| error.to_string())?;
             } else {
                 return Err("profile configuration contains an unsupported entry".into());
             }
@@ -1826,7 +1890,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_persisted_base_validation_avoids_rehashing() {
+    fn persisted_base_validation_skips_hashing_until_metadata_changes() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("base");
         let game = root.join("game");
@@ -1856,20 +1920,15 @@ mod tests {
 
         mark_base_validated(&root, &record).unwrap();
         clear_validation_cache();
-        assert!(base_is_validated(&root, &record).unwrap());
+        let fingerprint = base_metadata_fingerprint(&root, &record).unwrap();
+        assert!(base_is_validated(&root, &record, &fingerprint).unwrap());
 
+        std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&path, b"modified  game bytes").unwrap();
-        write_json(
-            &root.join(BASE_VALIDATION_RECORD),
-            &BaseValidationRecord {
-                schema: BASE_VALIDATION_SCHEMA,
-                base_id: "stale-base".into(),
-                manifest_sha256: record.manifest_sha256.clone(),
-            },
-        )
-        .unwrap();
         clear_validation_cache();
-        assert!(!base_is_validated(&root, &record).unwrap());
+        let changed_fingerprint = base_metadata_fingerprint(&root, &record).unwrap();
+        assert_ne!(changed_fingerprint, fingerprint);
+        assert!(!base_is_validated(&root, &record, &changed_fingerprint).unwrap());
         assert!(validate_base_files(&root, &record).is_err());
     }
 
@@ -1914,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_config_overrides_packaged_defaults_and_changes_revision() {
+    fn profile_config_changes_only_the_mutable_revision() {
         let temp = tempfile::tempdir().unwrap();
         let profile_root = temp.path().join("profile");
         let profile_config = profile_root.join("BepInEx/config");
@@ -1924,15 +1983,19 @@ mod tests {
         fs::create_dir_all(game.join("BepInEx/config")).unwrap();
         fs::write(game.join("BepInEx/config/mod.cfg"), b"package default").unwrap();
 
-        let before = profile_revision(&profile_root).unwrap();
+        let (before, before_material) = profile_revisions(&profile_root).unwrap();
         overlay_profile_config(&profile_root, &game).unwrap();
         assert_eq!(
             fs::read(game.join("BepInEx/config/mod.cfg")).unwrap(),
             b"profile value"
         );
         fs::write(profile_config.join("mod.cfg"), b"changed value").unwrap();
-        let after = profile_revision(&profile_root).unwrap();
+        let (after, after_material) = profile_revisions(&profile_root).unwrap();
         assert_ne!(before, after);
+        assert_eq!(before_material, after_material);
+
+        fs::write(profile_root.join("mod.dll"), b"plugin").unwrap();
+        assert_ne!(profile_revisions(&profile_root).unwrap().1, after_material);
     }
 
     #[test]

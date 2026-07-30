@@ -32,8 +32,9 @@
 - Switch the selected profile through a dedicated lightweight settings command instead of
   rebuilding its already-isolated workspace; launch still validates and repairs stale workspaces.
 - Reuse the same immutable base after storefront or architecture metadata is corrected,
-  persist completed base validation across app restarts, and avoid republishing unchanged
-  profile configs so repeat launches do not recopy or rehash the clean game.
+  persist completed validation across app restarts, skip unchanged config publication,
+  and refresh the active revision after capturing runtime config so repeat launches do
+  not recopy or rehash the clean game.
 - Treat automatic update discovery as best-effort so a missing or temporarily
   unavailable release manifest cannot interrupt application startup.
 - Auto-detect only fresh Among Us sources without known loader or mod artifacts;
