@@ -30,7 +30,8 @@
   manually inspected sources still report their exact contamination warning.
 - Let first-time setup and Settings place managed bases, profile workspaces, and package
   caches in an empty custom folder. Relocation copies and SHA-256-verifies every file
-  before switching and preserves the previous location on failure.
+  before switching, rejects source-path aliases across platforms, and preserves the
+  previous location on failure.
 - Add a Settings action that exports the selected profile workspace's bounded,
   non-linked BepInEx `LogOutput.log` through the native save dialog.
 - Prompt existing users to rerun setup until a fresh source has been selected for the

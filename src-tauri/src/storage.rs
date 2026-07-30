@@ -80,6 +80,10 @@ fn normalized(path: &Path) -> String {
     }
 }
 
+fn canonical_or_original(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     normalized(left) == normalized(right)
 }
@@ -153,8 +157,8 @@ pub fn validate_configured_root(
     let target = fs::canonicalize(&requested)
         .map_err(|error| format!("could not open the configured storage folder: {error}"))?;
     validate_regular_directory(&target, "The configured storage folder")?;
-    let default = fs::canonicalize(default_root).unwrap_or_else(|_| default_root.to_path_buf());
-    let app_data = fs::canonicalize(app_data_root).unwrap_or_else(|_| app_data_root.to_path_buf());
+    let default = canonical_or_original(default_root);
+    let app_data = canonical_or_original(app_data_root);
     if paths_overlap(&target, &default) {
         return Err("the custom storage folder overlaps the local default".into());
     }
@@ -165,7 +169,8 @@ pub fn validate_configured_root(
     }
     if game_sources
         .iter()
-        .any(|source| paths_overlap(&target, source))
+        .map(|source| canonical_or_original(source))
+        .any(|source| paths_overlap(&target, &source))
     {
         return Err(
             "managed storage cannot contain an Among Us source or be placed inside one".into(),
@@ -213,9 +218,9 @@ pub fn resolve_target(
         .map_err(|error| format!("could not open the selected storage folder: {error}"))?;
     validate_regular_directory(&target, "The storage folder")?;
 
-    let current = fs::canonicalize(current_root).unwrap_or_else(|_| current_root.to_path_buf());
-    let default = fs::canonicalize(default_root).unwrap_or_else(|_| default_root.to_path_buf());
-    let app_data = fs::canonicalize(app_data_root).unwrap_or_else(|_| app_data_root.to_path_buf());
+    let current = canonical_or_original(current_root);
+    let default = canonical_or_original(default_root);
+    let app_data = canonical_or_original(app_data_root);
     if same_path(&target, &current) {
         return Ok(None);
     }
@@ -232,7 +237,8 @@ pub fn resolve_target(
     }
     if game_sources
         .iter()
-        .any(|source| paths_overlap(&target, source))
+        .map(|source| canonical_or_original(source))
+        .any(|source| paths_overlap(&target, &source))
     {
         return Err(
             "Managed storage cannot contain an Among Us source or be placed inside one".into(),
