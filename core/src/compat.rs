@@ -45,9 +45,8 @@ pub struct RuntimeContext {
     /// Wine prefix (the dir holding `user.reg`): Proton's `compatdata/<id>/pfx`
     /// or a Wine/CrossOver/Whisky/Bottles bottle. `None` on native Windows.
     pub prefix: Option<PathBuf>,
-    /// Binary used to start the game (`steam`, `flatpak`, `wine`, `cxrun`, etc.).
-    /// `None` means resolution failed for Steam, or use the runtime's normal
-    /// command name as an error-producing fallback for Wine-based runtimes.
+    /// Binary used to start the selected executable (`proton`, `wine`, `cxrun`,
+    /// etc.). `None` means runtime discovery failed.
     pub launcher: Option<PathBuf>,
     /// Arguments which select the launcher/bottle, before the game-specific args.
     pub launcher_args: Vec<OsString>,
@@ -153,6 +152,13 @@ pub fn proton_prefix_from_game(game_dir: &Path) -> Option<PathBuf> {
     }
     None
 }
+fn steam_root_from_prefix(prefix: &Path) -> Option<PathBuf> {
+    prefix
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("steamapps"))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
 
 /// Wine prefix (the dir containing `drive_c`) for a game dir inside a bottle.
 pub fn wine_prefix_from_game(game_dir: &Path) -> Option<PathBuf> {
@@ -203,15 +209,69 @@ fn find_flatpak() -> Option<PathBuf> {
     find_binary(&["flatpak"])
 }
 
-fn steam_launcher(game_dir: &Path) -> (Option<PathBuf>, Vec<OsString>) {
-    match crate::game::steam_client_for_install(game_dir) {
-        Some(crate::game::SteamClient::Native) => (find_binary(&["steam"]), Vec::new()),
-        Some(crate::game::SteamClient::Flatpak) => (
-            find_flatpak(),
-            vec!["run".into(), "com.valvesoftware.Steam".into()],
-        ),
-        None => (None, Vec::new()),
+fn proton_launcher(game_dir: &Path, prefix: Option<&Path>) -> (Option<PathBuf>, Vec<OsString>) {
+    let mut roots = Vec::new();
+    if let Some(paths) = std::env::var_os("STEAM_COMPAT_TOOL_PATHS") {
+        roots.extend(std::env::split_paths(&paths));
     }
+    if let Some(steamapps) = game_dir
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("steamapps"))
+    {
+        roots.push(steamapps.join("common"));
+        if let Some(steam_root) = steamapps.parent() {
+            roots.push(steam_root.join("compatibilitytools.d"));
+        }
+    }
+    if let Some(home) = home_dir() {
+        roots.push(home.join(".steam/root/compatibilitytools.d"));
+        roots.push(home.join(".local/share/Steam/compatibilitytools.d"));
+        roots.push(home.join(".var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"));
+    }
+
+    let mut candidates = Vec::new();
+    for root in roots {
+        let direct = root.join("proton");
+        if direct.is_file() {
+            candidates.push(direct);
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten().take(128) {
+            let candidate = entry.path().join("proton");
+            if candidate.is_file() {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    let desired = prefix
+        .and_then(Path::parent)
+        .and_then(|compatdata| fs::read_to_string(compatdata.join("version")).ok())
+        .or_else(|| {
+            prefix
+                .and_then(Path::parent)
+                .and_then(|compatdata| fs::read_to_string(compatdata.join("config_info")).ok())
+        })
+        .and_then(|value| value.lines().next().map(str::to_owned));
+    candidates.sort_by_key(|candidate| {
+        let version_matches = desired.as_ref().is_some_and(|desired| {
+            candidate
+                .parent()
+                .and_then(|root| fs::read_to_string(root.join("version")).ok())
+                .is_some_and(|version| {
+                    version.contains(desired) || desired.contains(version.trim())
+                })
+        });
+        let modified = fs::metadata(candidate)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        (version_matches, modified)
+    });
+    (candidates.pop(), vec![OsString::from("run")])
 }
 
 fn find_crossover_cxrun() -> Option<PathBuf> {
@@ -250,7 +310,7 @@ fn find_launcher(
 ) -> (Option<PathBuf>, Vec<OsString>) {
     match runtime {
         Runtime::Native => (None, Vec::new()),
-        Runtime::Proton => steam_launcher(game_dir),
+        Runtime::Proton => proton_launcher(game_dir, prefix),
         Runtime::Wine => (find_binary(&["wine", "wine64"]), Vec::new()),
         Runtime::Crossover => {
             let mut args = Vec::new();
@@ -307,7 +367,7 @@ fn find_launcher(
 fn runtime_fallback(runtime: Runtime) -> &'static str {
     match runtime {
         Runtime::Native => GAME_EXE,
-        Runtime::Proton => "steam",
+        Runtime::Proton => "proton",
         Runtime::Wine => "wine",
         Runtime::Crossover => "cxrun",
         Runtime::Whisky => "wine64",
@@ -328,9 +388,28 @@ fn wine_environment(
             if let Some(name) = bottle_name(Some(prefix)) {
                 env.push(("CX_BOTTLE".into(), name));
             }
-        } else if ctx.runtime != Runtime::Bottles {
+        } else if !matches!(ctx.runtime, Runtime::Bottles | Runtime::Proton) {
             env.push(("WINEPREFIX".into(), prefix.as_os_str().to_owned()));
         }
+    }
+    if ctx.runtime == Runtime::Proton {
+        if let Some(compatdata) = ctx.prefix.as_deref().and_then(Path::parent) {
+            env.push((
+                "STEAM_COMPAT_DATA_PATH".into(),
+                compatdata.as_os_str().to_owned(),
+            ));
+        }
+        if let Some(steam_root) = ctx.prefix.as_deref().and_then(steam_root_from_prefix) {
+            env.push((
+                "STEAM_COMPAT_CLIENT_INSTALL_PATH".into(),
+                steam_root.as_os_str().to_owned(),
+            ));
+        }
+        env.extend([
+            ("SteamAppId".into(), STEAM_APP_ID.into()),
+            ("SteamGameId".into(), STEAM_APP_ID.into()),
+            ("STEAM_COMPAT_APP_ID".into(), STEAM_APP_ID.into()),
+        ]);
     }
     env
 }
@@ -348,14 +427,23 @@ pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> L
         },
         Runtime::Proton => {
             let mut args = ctx.launcher_args.clone();
-            let error = if ctx.launcher.is_some() {
-                args.extend([OsString::from("-applaunch"), OsString::from(STEAM_APP_ID)]);
-                None
+            args.push(program.as_os_str().to_owned());
+            let error = if ctx.launcher.is_none() {
+                Some(
+                    "Could not find the Proton tool for this Steam installation; select Proton in Steam once, then retry."
+                        .to_string(),
+                )
+            } else if ctx.prefix.is_none() {
+                Some("Steam has not created the Among Us Proton prefix yet.".to_string())
+            } else if ctx
+                .prefix
+                .as_deref()
+                .and_then(steam_root_from_prefix)
+                .is_none()
+            {
+                Some("Could not locate the Steam client files required by Proton.".to_string())
             } else {
-                Some(format!(
-                    "Steam does not have this Among Us folder registered: {}",
-                    cwd.display()
-                ))
+                None
             };
             LaunchSpec {
                 program: ctx
@@ -364,7 +452,7 @@ pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> L
                     .unwrap_or_else(|| PathBuf::from(runtime_fallback(ctx.runtime))),
                 args,
                 cwd: cwd.to_path_buf(),
-                env: Vec::new(),
+                env: wine_environment(ctx, std::env::var_os("WINEDLLOVERRIDES")),
                 error,
             }
         }
@@ -751,32 +839,44 @@ mod tests {
     }
 
     #[test]
-    fn proton_spec_launches_via_steam() {
-        let game = Path::new("/g/steamapps/common/Among Us");
-        let mut ctx = context(Runtime::Proton, "/usr/bin/steam");
+    fn proton_spec_runs_the_managed_executable_directly() {
+        let game = Path::new("/managed/workspace/current");
+        let mut ctx = context(Runtime::Proton, "/g/steamapps/common/Proton 10.0/proton");
         ctx.prefix = Some(PathBuf::from("/g/steamapps/compatdata/945360/pfx"));
-        let spec = build_launch_spec(game, &ctx);
-        assert_eq!(spec.program, PathBuf::from("/usr/bin/steam"));
-        assert_eq!(spec.args, vec!["-applaunch", "945360"]);
-    }
-
-    #[test]
-    fn flatpak_steam_args_are_preserved() {
-        let game = Path::new("/g/steamapps/common/Among Us");
-        let mut ctx = context(Runtime::Proton, "/usr/bin/flatpak");
-        ctx.launcher_args = vec!["run".into(), "com.valvesoftware.Steam".into()];
+        ctx.launcher_args = vec!["run".into()];
         let spec = build_launch_spec(game, &ctx);
         assert_eq!(
-            spec.args,
-            vec!["run", "com.valvesoftware.Steam", "-applaunch", "945360"]
+            spec.program,
+            PathBuf::from("/g/steamapps/common/Proton 10.0/proton")
         );
+        assert_eq!(spec.args[0], "run");
+        assert!(Path::new(&spec.args[1]).ends_with("Among Us.exe"));
+        assert!(spec.args[1]
+            .to_string_lossy()
+            .contains("managed/workspace/current"));
+        assert!(!spec
+            .args
+            .iter()
+            .any(|arg| arg == "-applaunch" || arg == STEAM_APP_ID));
+        assert!(spec.env.iter().any(|(key, value)| {
+            key == "STEAM_COMPAT_DATA_PATH" && value == Path::new("/g/steamapps/compatdata/945360")
+        }));
+        assert!(spec.env.iter().any(|(key, value)| {
+            key == "STEAM_COMPAT_CLIENT_INSTALL_PATH" && value == Path::new("/g")
+        }));
+        assert!(spec
+            .env
+            .iter()
+            .any(|(key, value)| key == "SteamAppId" && value == STEAM_APP_ID));
     }
 
     #[test]
-    fn unregistered_proton_copy_never_emits_an_app_id_launch() {
-        let game = Path::new("/unregistered/steamapps/common/Among Us");
-        let mut ctx = context(Runtime::Proton, "steam");
+    fn missing_proton_tool_fails_closed_without_an_app_id_launch() {
+        let game = Path::new("/managed/workspace/current");
+        let mut ctx = context(Runtime::Proton, "proton");
+        ctx.prefix = Some(PathBuf::from("/g/steamapps/compatdata/945360/pfx"));
         ctx.launcher = None;
+        ctx.launcher_args = vec!["run".into()];
         let spec = build_launch_spec(game, &ctx);
         assert!(spec.error.is_some());
         assert!(!spec

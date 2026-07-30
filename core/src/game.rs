@@ -372,6 +372,7 @@ fn steam_installs() -> Vec<(GameInstall, SteamClient)> {
     steam_installs_from_roots(&steam_roots())
 }
 
+#[cfg(test)]
 fn steam_client_for_install_from(
     installs: &[(GameInstall, SteamClient)],
     game_dir: &Path,
@@ -390,12 +391,7 @@ fn steam_client_for_install_from(
     client
 }
 
-/// Return the one Steam client which has this exact path registered. Ambiguous
-/// native/Flatpak registrations are rejected rather than choosing a client.
-pub(crate) fn steam_client_for_install(game_dir: &Path) -> Option<SteamClient> {
-    steam_client_for_install_from(&steam_installs(), game_dir)
-}
-
+#[cfg(test)]
 fn steam_root_for_install_from<'a>(
     roots: &'a [SteamRoot],
     game_dir: &Path,
@@ -418,6 +414,7 @@ fn steam_root_for_install_from<'a>(
     registration
 }
 
+#[cfg(test)]
 fn native_steam_client_for_install_from(roots: &[SteamRoot], game_dir: &Path) -> Option<PathBuf> {
     let root = steam_root_for_install_from(roots, game_dir)?;
     if root.client != SteamClient::Native {
@@ -426,13 +423,6 @@ fn native_steam_client_for_install_from(roots: &[SteamRoot], game_dir: &Path) ->
     let name = if cfg!(windows) { "steam.exe" } else { "steam" };
     let client = root.path.join(name);
     client.is_file().then_some(client)
-}
-
-/// Return the native Steam executable belonging to the unique Steam root that
-/// registered this exact game path. Flatpak and ambiguous registrations return
-/// `None` so launchers can use the runtime-specific compatibility path instead.
-pub fn native_steam_client_for_install(game_dir: &Path) -> Option<PathBuf> {
-    native_steam_client_for_install_from(&steam_roots(), game_dir)
 }
 
 fn home_dir() -> Option<PathBuf> {

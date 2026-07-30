@@ -1,13 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { CheckCircle, FolderOpen, GameController, GearSix, Package, Warning } from "@phosphor-icons/react";
-import {
-  inspectGame,
-  listTouSetupOptions,
-  loaderStatus,
-  pickFolder,
-  type LoaderStatus,
-} from "../lib/bridge";
+import { CheckCircle, FolderOpen, GameController, GearSix, HardDrives, Package, WarningCircle } from "@phosphor-icons/react";
+import { inspectGame, listTouSetupOptions, pickFolder } from "../lib/bridge";
 import { useModalFocus } from "../lib/useModalFocus";
 import type { GameInstall, ModInstallOption, Runtime } from "../lib/types";
 import { displayPath } from "../lib/displayPath";
@@ -18,8 +12,11 @@ export type SetupSelection =
 
 interface SetupModalProps {
   open: boolean;
+  migrationRequired?: boolean;
   detected: GameInstall[];
-  profileId: string;
+  activeStoragePath: string;
+  defaultStoragePath: string;
+  onMoveStorage: (storagePath?: string) => Promise<void>;
   onFinish: (
     gamePath?: string,
     arch?: string,
@@ -27,23 +24,9 @@ interface SetupModalProps {
     runtime?: Runtime,
     selection?: SetupSelection,
   ) => Promise<boolean>;
-  onInstallLoader: (
-    gamePath: string,
-    profileId: string,
-    arch: string,
-    applyDoorstopFix: boolean,
-  ) => Promise<string | null>;
   onDismiss: () => Promise<void>;
 }
 
-type StatusState =
-  | { kind: "idle" }
-  | { kind: "loading"; path: string; profileId: string }
-  | { kind: "ready"; path: string; profileId: string; value: LoaderStatus }
-  | { kind: "missing"; path: string; profileId: string; value: LoaderStatus | null }
-  | { kind: "error"; path: string; profileId: string; message: string };
-
-type RequestIdentity = { session: number; path: string; profileId: string };
 
 const LABEL = "mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase";
 
@@ -53,16 +36,25 @@ function sameGamePath(left: string, right: string): boolean {
   return normalize(left) === normalize(right);
 }
 
-/** First-run onboarding: pick the Among Us folder (detected or browsed), then optionally install the loader. */
-export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onInstallLoader }: SetupModalProps) {
+/** First-run onboarding: select a read-only Among Us source, then choose the managed profile setup. */
+export function SetupModal({
+  open,
+  migrationRequired = false,
+  detected,
+  activeStoragePath,
+  defaultStoragePath,
+  onMoveStorage,
+  onFinish,
+  onDismiss,
+}: SetupModalProps) {
   const reduce = useReducedMotion();
   const modalRef = useRef<HTMLDivElement>(null);
   const [chosen, setChosen] = useState<string | null>(null);
   const [inspected, setInspected] = useState<GameInstall | null>(null);
-  const [status, setStatus] = useState<StatusState>({ kind: "idle" });
-  const [retry, setRetry] = useState(0);
   const [browsing, setBrowsing] = useState(false);
   const [installing, setInstalling] = useState(false);
+  const [storagePending, setStoragePending] = useState(false);
+  const [storageMessage, setStorageMessage] = useState("");
   const [message, setMessage] = useState("");
   const [applyDoorstopFix, setApplyDoorstopFix] = useState(false);
   const [setupKind, setSetupKind] = useState<SetupSelection["kind"] | null>(null);
@@ -74,33 +66,28 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
   const sessionRef = useRef(0);
   const wasOpenRef = useRef(false);
   const openRef = useRef(open);
-  const profileIdRef = useRef(profileId);
   const chosenRef = useRef(chosen);
   const finishRef = useRef(onFinish);
   const dismissRef = useRef(onDismiss);
   const installingRef = useRef(false);
+  const moveStorageRef = useRef(onMoveStorage);
+  const storagePendingRef = useRef(false);
   const browsingRef = useRef(false);
-  const applyDoorstopFixRef = useRef(false);
-  const statusRequestRef = useRef(0);
-  const installRequestRef = useRef(0);
   const touOptionsRequestRef = useRef(0);
 
   const selectedInstall =
     detected.find((game) => !!chosen && sameGamePath(game.path, chosen)) ??
     (inspected && chosen && sameGamePath(inspected.path, chosen) ? inspected : null);
-  const selectedInstallRef = useRef<GameInstall | null>(selectedInstall);
 
   openRef.current = open;
-  profileIdRef.current = profileId;
   chosenRef.current = chosen;
   finishRef.current = onFinish;
   dismissRef.current = onDismiss;
-  selectedInstallRef.current = selectedInstall;
+  moveStorageRef.current = onMoveStorage;
   installingRef.current = installing;
-  applyDoorstopFixRef.current = applyDoorstopFix;
 
   const requestDismiss = useCallback(() => {
-    if (installingRef.current) return;
+    if (installingRef.current || storagePendingRef.current) return;
     void dismissRef.current().catch((error: unknown) => {
       if (openRef.current) {
         setMessage(`Could not close setup: ${error instanceof Error ? error.message : String(error)}`);
@@ -114,26 +101,26 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
       sessionRef.current += 1;
       setChosen(null);
       setInspected(null);
-      setStatus({ kind: "idle" });
       setBrowsing(false);
       setInstalling(false);
       setMessage("");
+      setStoragePending(false);
+      setStorageMessage("");
       setApplyDoorstopFix(false);
       setSetupKind(null);
       setTouOptions([]);
       setTouOptionKey("");
       setTouOptionsLoading(false);
       setTouOptionsError("");
-      applyDoorstopFixRef.current = false;
       browsingRef.current = false;
       installingRef.current = false;
+      storagePendingRef.current = false;
     } else if (!open && wasOpenRef.current) {
       sessionRef.current += 1;
-      statusRequestRef.current += 1;
-      installRequestRef.current += 1;
       touOptionsRequestRef.current += 1;
       browsingRef.current = false;
     }
+      storagePendingRef.current = false;
     wasOpenRef.current = open;
   }, [open]);
 
@@ -148,11 +135,9 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
     ) {
       return;
     }
-    statusRequestRef.current += 1;
     const replacement = detected.length === 1 ? detected[0] : null;
     setChosen(replacement?.path ?? null);
     setInspected(null);
-    setStatus({ kind: "idle" });
     setMessage(
       replacement
         ? ""
@@ -160,33 +145,6 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
     );
   }, [chosen, detected, inspected, open]);
 
-  useEffect(() => {
-    const path = chosen ?? "";
-    const request = ++statusRequestRef.current;
-    if (!open || !path || setupKind !== "bepinex") {
-      setStatus({ kind: "idle" });
-      return;
-    }
-
-    const identity: RequestIdentity = { session: sessionRef.current, path, profileId };
-    setStatus({ kind: "loading", path, profileId });
-    setMessage("");
-    loaderStatus(path, profileId)
-      .then((value) => {
-        if (!requestIsCurrent(identity, request, statusRequestRef, openRef, sessionRef, profileIdRef, chosenRef)) return;
-        setStatus(
-          value?.current &&
-            value.runtimeReady &&
-            (!applyDoorstopFix || value.doorstopFix)
-            ? { kind: "ready", path, profileId, value }
-            : { kind: "missing", path, profileId, value },
-        );
-      })
-      .catch((error: unknown) => {
-        if (!requestIsCurrent(identity, request, statusRequestRef, openRef, sessionRef, profileIdRef, chosenRef)) return;
-        setStatus({ kind: "error", path, profileId, message: error instanceof Error ? error.message : String(error) });
-      });
-  }, [applyDoorstopFix, chosen, open, profileId, retry, setupKind]);
 
   useEffect(() => {
     const request = ++touOptionsRequestRef.current;
@@ -246,102 +204,56 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
   ]);
 
   const browse = async () => {
-    if (browsingRef.current || installingRef.current) return;
+    if (browsingRef.current || installingRef.current || storagePendingRef.current) return;
     browsingRef.current = true;
     setBrowsing(true);
     setMessage("");
     const session = sessionRef.current;
-    const requestProfileId = profileIdRef.current;
     try {
       const path = await pickFolder();
-      if (!path || !openRef.current || sessionRef.current !== session || profileIdRef.current !== requestProfileId) return;
+      if (!path || !openRef.current || sessionRef.current !== session) return;
       const game = await inspectGame(path);
-      if (!openRef.current || sessionRef.current !== session || profileIdRef.current !== requestProfileId) return;
+      if (!openRef.current || sessionRef.current !== session) return;
       setInspected(game);
       setChosen(game.path);
     } catch (error) {
-      if (openRef.current && sessionRef.current === session && profileIdRef.current === requestProfileId) {
+      if (openRef.current && sessionRef.current === session) {
         setMessage(`Folder inspection failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     } finally {
-      if (openRef.current && sessionRef.current === session && profileIdRef.current === requestProfileId) {
+      if (openRef.current && sessionRef.current === session) {
         browsingRef.current = false;
         setBrowsing(false);
       }
     }
   };
 
-  const install = async () => {
-    const path = chosenRef.current;
-    const game = selectedInstallRef.current;
-    if (!path || installingRef.current) return;
 
-    const identity: RequestIdentity = {
-      session: sessionRef.current,
-      path,
-      profileId: profileIdRef.current,
-    };
-    const request = ++installRequestRef.current;
-    statusRequestRef.current += 1;
-    installingRef.current = true;
-    setInstalling(true);
-    setStatus({ kind: "loading", path, profileId: identity.profileId });
-    setMessage(
-      applyDoorstopFixRef.current
-        ? "Installing BepInEx and the compatibility fix. Downloads about 30 MB once."
-        : "Installing BepInEx. Downloads about 30 MB once.",
-    );
-
+  const moveStorage = async (restoreDefault = false) => {
+    if (storagePendingRef.current || installingRef.current) return;
+    storagePendingRef.current = true;
+    setStoragePending(true);
+    setStorageMessage("");
+    const session = sessionRef.current;
     try {
-      const warning = await onInstallLoader(
-        path,
-        identity.profileId,
-        game?.arch ?? "x86",
-        applyDoorstopFixRef.current,
-      );
-      if (!requestIsCurrent(identity, request, installRequestRef, openRef, sessionRef, profileIdRef, chosenRef)) return;
-
-      try {
-        const value = await loaderStatus(path, identity.profileId);
-        if (!requestIsCurrent(identity, request, installRequestRef, openRef, sessionRef, profileIdRef, chosenRef)) return;
-        const ready =
-          !!value &&
-          value.current &&
-          value.runtimeReady &&
-          (!applyDoorstopFixRef.current || value.doorstopFix);
-        if (ready) {
-          setStatus({ kind: "ready", path, profileId: identity.profileId, value });
-        } else {
-          setStatus({ kind: "missing", path, profileId: identity.profileId, value });
-        }
-        setMessage(
-          warning ??
-            (ready
-              ? applyDoorstopFixRef.current
-                ? "BepInEx and the compatibility fix are installed."
-                : "BepInEx installed."
-              : "BepInEx still needs runtime setup. Launch Among Us once without mods, close it, then retry."),
-        );
-      } catch (error) {
-        if (!requestIsCurrent(identity, request, installRequestRef, openRef, sessionRef, profileIdRef, chosenRef)) return;
-        const detail = error instanceof Error ? error.message : String(error);
-        setStatus({ kind: "error", path, profileId: identity.profileId, message: detail });
-        setMessage(`BepInEx installation completed, but verification failed: ${detail}`);
+      let path: string | undefined;
+      if (!restoreDefault) {
+        const selected = await pickFolder("Choose a Perfect Sync storage folder");
+        if (!selected || !openRef.current || sessionRef.current !== session) return;
+        path = selected;
+      }
+      await moveStorageRef.current(path);
+      if (openRef.current && sessionRef.current === session) {
+        setStorageMessage("Storage location updated.");
       }
     } catch (error) {
-      if (requestIsCurrent(identity, request, installRequestRef, openRef, sessionRef, profileIdRef, chosenRef)) {
-        const detail = error instanceof Error ? error.message : String(error);
-        setStatus({ kind: "error", path, profileId: identity.profileId, message: detail });
-        setMessage(`Install failed: ${detail}`);
+      if (openRef.current && sessionRef.current === session) {
+        setStorageMessage(`Storage move failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     } finally {
-      if (
-        openRef.current &&
-        sessionRef.current === identity.session &&
-        installRequestRef.current === request
-      ) {
-        installingRef.current = false;
-        setInstalling(false);
+      if (openRef.current && sessionRef.current === session) {
+        storagePendingRef.current = false;
+        setStoragePending(false);
       }
     }
   };
@@ -352,8 +264,8 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
 
   const finishSetup = async () => {
     const path = chosenRef.current;
-    const game = selectedInstallRef.current;
-    if (!path || !game || !setupKind || installingRef.current) return;
+    const game = selectedInstall;
+    if (!path || !game || !setupKind || installingRef.current || storagePendingRef.current) return;
     const selection: SetupSelection =
       setupKind === "tou"
         ? {
@@ -361,7 +273,7 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
             tag: selectedTouOption?.tag ?? "",
             assetName: selectedTouOption?.assetName ?? "",
           }
-        : { kind: "bepinex", applyDoorstopFix: applyDoorstopFixRef.current };
+        : { kind: "bepinex", applyDoorstopFix };
     if (selection.kind === "tou" && (!selection.tag || !selection.assetName)) return;
 
     const session = sessionRef.current;
@@ -390,23 +302,7 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
   };
 
 
-  const visibleStatus: StatusState =
-    !chosen
-      ? { kind: "idle" }
-      : status.kind !== "idle" && status.path === chosen && status.profileId === profileId
-        ? status
-        : { kind: "loading", path: chosen, profileId };
-  const statusBlocksFinish =
-    setupKind === "bepinex" &&
-    (visibleStatus.kind === "loading" ||
-      visibleStatus.kind === "error" ||
-      visibleStatus.kind === "idle");
-  const visibleMessage =
-    setupKind === "tou"
-      ? message
-      : !chosen || (status.kind !== "idle" && status.path === chosen && status.profileId === profileId)
-        ? message
-        : "";
+  const visibleMessage = message;
 
   return (
     <AnimatePresence>
@@ -425,7 +321,7 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
             role="dialog"
             aria-modal="true"
             aria-label="Set up Perfect Sync"
-            aria-busy={installing || browsing || visibleStatus.kind === "loading"}
+            aria-busy={installing || browsing || storagePending}
             tabIndex={-1}
             initial={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.96, y: 12 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
@@ -433,17 +329,37 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
             className="glass-strong relative flex max-h-[90vh] w-[560px] max-w-full flex-col rounded-3xl p-6 max-[600px]:h-[100dvh] max-[600px]:max-h-none max-[600px]:w-full max-[600px]:rounded-none max-[600px]:p-4"
           >
-            <h2 className="text-[20px] font-semibold text-ink">Welcome to Perfect Sync</h2>
+            <h2 className="text-[20px] font-semibold text-ink">
+              {migrationRequired ? "Select a fresh Among Us installation" : "Welcome to Perfect Sync"}
+            </h2>
             <p className="mt-0.5 text-[13px] text-ink-dim">
-              {chosen ? "Step 2 of 2: choose your mod setup." : "Step 1 of 2: find your Among Us install."}
+              {chosen
+                ? "Step 2 of 2: choose storage and your isolated mod setup."
+                : "Step 1 of 2: find your fresh Among Us source."}
             </p>
+            {migrationRequired && (
+              <div
+                role="alert"
+                className="mt-4 flex items-start gap-2.5 rounded-xl border border-[#ffbf69]/35 bg-[#ffbf69]/10 px-3.5 py-3 text-[12.5px] leading-relaxed text-[#ffd7a0]"
+              >
+                <WarningCircle size={18} weight="fill" className="mt-0.5 shrink-0" />
+                <span>
+                  <strong className="block font-semibold text-[#ffe4bd]">
+                    v0.1.6 requires a fresh source for the new exact-base workflow.
+                  </strong>
+                  Verify or reinstall Among Us, then select that untouched folder here. Perfect Sync
+                  will preserve your profiles and mods, import a private clean base, and leave the
+                  original game folder unchanged.
+                </span>
+              </div>
+            )}
 
             <div className="scroll-region mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
               {!chosen ? (
                 <>
                   {detected.length > 0 && (
                     <>
-                      <span className={LABEL}>Detected installs</span>
+                      <span className={LABEL}>Detected sources</span>
                       <div className="flex flex-col gap-2">
                         {detected.map((game) => (
                           <button
@@ -477,7 +393,7 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
                     disabled={browsing}
                     className="ring-focus glass flex w-full items-center justify-center gap-2 rounded-xl px-3 py-3 text-[13px] text-ink-dim hover:text-ink disabled:opacity-50"
                   >
-                    <FolderOpen size={16} /> {browsing ? "Inspecting folder" : "Browse for your Among Us folder"}
+                    <FolderOpen size={16} /> {browsing ? "Inspecting source" : "Browse for your Among Us source"}
                   </button>
                   {detected.length === 0 && (
                     <p className="mt-2 px-1 text-[12px] text-ink-faint">
@@ -492,7 +408,7 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
                 </>
               ) : (
                 <>
-                  <span className={LABEL}>Among Us folder</span>
+                  <span className={LABEL}>Among Us source</span>
                   <div className="glass flex items-center gap-2 rounded-xl px-3.5 py-3">
                     <GameController size={18} className="shrink-0 text-ink-dim" />
                     <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">
@@ -502,7 +418,6 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
                       type="button"
                       onClick={() => {
                         setChosen(null);
-                        setStatus({ kind: "idle" });
                         setMessage("");
                         setSetupKind(null);
                         setTouOptions([]);
@@ -514,6 +429,74 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
                     >
                       Change
                     </button>
+                  </div>
+                  <div className="mt-2 flex items-start gap-2 rounded-xl border border-[#5be3b0]/25 bg-[#5be3b0]/8 px-3.5 py-3 text-[12px] leading-relaxed text-ink-dim">
+                    <CheckCircle size={17} weight="fill" className="mt-0.5 shrink-0 text-[#5be3b0]" />
+                    <span>
+                      {selectedInstall?.sourceClean === false
+                        ? "Perfect Sync leaves this folder untouched. Setup can only reuse a compatible private base that was created earlier."
+                        : "Perfect Sync leaves this folder untouched. The first setup imports an exact private base, and every profile runs from one disposable isolated workspace."}
+                    </span>
+                  </div>
+                  {selectedInstall?.sourceClean === false && (
+                    <div role="alert" className="mt-2 flex items-start gap-2 rounded-xl border border-[#ff8a8a]/30 bg-[#ff8a8a]/10 px-3.5 py-3 text-[12px] leading-relaxed text-[#ffb4b4]">
+                      <WarningCircle size={17} weight="fill" className="mt-0.5 shrink-0" />
+                      <span>
+                        This source contains existing mod-loader files (
+                        {selectedInstall.sourceModArtifacts?.slice(0, 4).join(", ") || "unknown artifacts"}
+                        {(selectedInstall.sourceModArtifacts?.length ?? 0) > 4 ? ", …" : ""}). Perfect Sync will not remove them or call this a fresh base. Verify or reinstall a clean game first, unless this source already has a compatible private base.
+                      </span>
+                    </div>
+                  )}
+
+                  <span className={`${LABEL} mt-5`}>Managed storage</span>
+                  <div className="rounded-xl border border-white/10 bg-white/[0.035] p-3.5">
+                    <div className="flex min-w-0 items-center gap-3">
+                      <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-[#9b7bff]/12 text-accent-2">
+                        <HardDrives size={18} />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[12.5px] font-semibold text-ink">
+                          {sameGamePath(activeStoragePath, defaultStoragePath) ? "Local app data" : "Custom location"}
+                        </div>
+                        <div className="truncate font-mono text-[11.5px] text-ink-faint" title={activeStoragePath}>
+                          {displayPath(activeStoragePath)}
+                        </div>
+                      </div>
+                    </div>
+                    <p className="mt-2.5 text-[11.5px] leading-relaxed text-ink-faint">
+                      The clean game base, isolated workspace, and download cache live here. Profiles and settings stay in AppData.
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void moveStorage(false)}
+                        disabled={installing || storagePending}
+                        className="ring-focus glass rounded-lg px-3 py-2 text-[12px] font-semibold text-ink-dim hover:text-ink disabled:opacity-50"
+                      >
+                        {storagePending ? "Moving storage…" : "Choose location"}
+                      </button>
+                      {!sameGamePath(activeStoragePath, defaultStoragePath) && (
+                        <button
+                          type="button"
+                          onClick={() => void moveStorage(true)}
+                          disabled={installing || storagePending}
+                          className="ring-focus rounded-lg px-3 py-2 text-[12px] text-ink-faint hover:bg-white/10 hover:text-ink disabled:opacity-50"
+                        >
+                          Restore default
+                        </button>
+                      )}
+                    </div>
+                    {storageMessage && (
+                      <p
+                        role={storageMessage.startsWith("Storage move failed:") ? "alert" : "status"}
+                        className={`mt-2 text-[11.5px] leading-relaxed ${
+                          storageMessage.startsWith("Storage move failed:") ? "text-[#ffb4b4]" : "text-[#83efc7]"
+                        }`}
+                      >
+                        {storageMessage}
+                      </p>
+                    )}
                   </div>
 
                   <span className={`${LABEL} mt-5`}>Choose your setup</span>
@@ -568,108 +551,33 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
 
                   {setupKind === "bepinex" ? (
                     <>
-                  <span className={`${LABEL} mt-5`}>Mod loader (BepInEx)</span>
-                  <label className="mb-2 flex cursor-pointer items-start gap-2 px-1 text-[12px] text-ink-dim">
-                    <input
-                      type="checkbox"
-                      checked={applyDoorstopFix}
-                      onChange={(event) => setApplyDoorstopFix(event.target.checked)}
-                      disabled={installing}
-                      className="mt-0.5 h-4 w-4 shrink-0 accent-[#9b7bff]"
-                    />
-                    <span>
-                      Apply optional UnityDoorstop 4.5.1 compatibility fix
-                      <span className="block text-[11px] text-ink-faint">
-                        Off by default. Enable only if the standard BepInEx loader has startup problems.
-                      </span>
-                    </span>
-                  </label>
-                  {visibleStatus.kind === "loading" ? (
-                    <div role="status" className="glass rounded-xl px-3.5 py-3 text-[13px] text-ink-faint">
-                      {installing ? "Installing and verifying BepInEx" : "Checking loader status"}
-                    </div>
-                  ) : visibleStatus.kind === "ready" ? (
-                    <div className="glass flex items-center gap-2 rounded-xl px-3.5 py-3 text-[13px] text-[#aef3d8]">
-                      <CheckCircle size={16} weight="fill" /> BepInEx is installed and ready.
-                    </div>
-                  ) : visibleStatus.kind === "error" ? (
-                    <div className="rounded-xl border border-[#ff8a8a]/30 bg-[#ff8a8a]/10 px-3.5 py-3 text-[13px] text-[#ffb4b4]">
-                      <div role="alert">Could not check BepInEx: {visibleStatus.message}</div>
-                      <button
-                        type="button"
-                        onClick={() => setRetry((value) => value + 1)}
-                        disabled={installing}
-                        className="ring-focus mt-3 rounded-lg bg-white/10 px-3 py-2 text-[12.5px] font-semibold text-ink disabled:opacity-50"
-                      >
-                        Retry status check
-                      </button>
-                    </div>
-                  ) : visibleStatus.kind === "missing" &&
-                    visibleStatus.value?.current &&
-                    visibleStatus.value.runtimeReady &&
-                    applyDoorstopFix &&
-                    !visibleStatus.value.doorstopFix ? (
-                    <div
-                      className="rounded-xl px-3.5 py-3 text-[13px]"
-                      style={{ background: "rgba(255,210,63,0.12)", border: "1px solid rgba(255,210,63,0.32)", color: "#ffe49a" }}
-                    >
-                      <div className="flex items-center gap-2">
-                        <Warning size={16} weight="fill" /> BepInEx is ready. The compatibility fix has not been applied.
+                      <span className={`${LABEL} mt-5`}>Managed loader</span>
+                      <label className="mb-2 flex cursor-pointer items-start gap-2 px-1 text-[12px] text-ink-dim">
+                        <input
+                          type="checkbox"
+                          checked={applyDoorstopFix}
+                          onChange={(event) => setApplyDoorstopFix(event.target.checked)}
+                          disabled={installing}
+                          className="mt-0.5 h-4 w-4 shrink-0 accent-[#9b7bff]"
+                        />
+                        <span>
+                          Apply optional UnityDoorstop 4.5.1 compatibility fix
+                          <span className="block text-[11px] text-ink-faint">
+                            Off by default. Enable only if the standard BepInEx loader has startup problems.
+                          </span>
+                        </span>
+                      </label>
+                      <div className="glass mt-3 flex items-start gap-2 rounded-xl px-3.5 py-3 text-[12px] leading-relaxed text-ink-dim">
+                        <CheckCircle size={16} weight="fill" className="mt-0.5 shrink-0 text-[#5be3b0]" />
+                        <span>
+                          Continue to import the clean game base, install BepInEx, and verify the private workspace.
+                        </span>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => void install()}
-                        disabled={installing}
-                        className="ring-focus accent-grad mt-3 flex items-center gap-1.5 rounded-lg px-3 py-2 text-[12.5px] font-semibold text-[#0d0820] disabled:opacity-50"
-                      >
-                        <GearSix size={14} className={installing ? "animate-spin" : ""} />
-                        {installing ? "Applying" : "Apply compatibility fix"}
-                      </button>
-                    </div>
-                  ) : visibleStatus.kind === "missing" && visibleStatus.value?.current ? (
-                    <div
-                      className="rounded-xl px-3.5 py-3 text-[13px]"
-                      style={{ background: "rgba(255,210,63,0.12)", border: "1px solid rgba(255,210,63,0.32)", color: "#ffe49a" }}
-                    >
-                      <div className="flex items-center gap-2">
-                        <Warning size={16} weight="fill" /> BepInEx files are installed. {visibleStatus.value.runtime} still needs its winhttp override.
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => void install()}
-                        disabled={installing}
-                        className="ring-focus accent-grad mt-3 flex items-center gap-1.5 rounded-lg px-3 py-2 text-[12.5px] font-semibold text-[#0d0820] disabled:opacity-50"
-                      >
-                        <GearSix size={14} className={installing ? "animate-spin" : ""} />
-                        {installing ? "Checking" : "Retry runtime setup"}
-                      </button>
-                    </div>
-                  ) : visibleStatus.kind === "missing" ? (
-                    <div
-                      className="rounded-xl px-3.5 py-3 text-[13px]"
-                      style={{ background: "rgba(255,210,63,0.12)", border: "1px solid rgba(255,210,63,0.32)", color: "#ffe49a" }}
-                    >
-                      <div className="flex items-center gap-2">
-                        <Warning size={16} weight="fill" /> BepInEx isn’t set up. Mods won’t load until it is.
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => void install()}
-                        disabled={installing}
-                        className="ring-focus accent-grad mt-3 flex items-center gap-1.5 rounded-lg px-3 py-2 text-[12.5px] font-semibold text-[#0d0820] disabled:opacity-50"
-                      >
-                        <GearSix size={14} className={installing ? "animate-spin" : ""} />
-                        {installing ? "Installing" : "Install BepInEx"}
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="glass rounded-xl px-3.5 py-3 text-[13px] text-ink-faint">Waiting to check loader status</div>
-                  )}
-                  {visibleMessage && (
-                    <p aria-live="polite" className="mt-2 px-1 text-[12px] text-ink-dim">
-                      {visibleMessage}
-                    </p>
-                  )}
+                      {visibleMessage && (
+                        <p aria-live="polite" className={`mt-2 px-1 text-[12px] ${visibleMessage.startsWith("Setup failed:") ? "text-[#ffb4b4]" : "text-ink-dim"}`}>
+                          {visibleMessage}
+                        </p>
+                      )}
                     </>
                   ) : setupKind === "tou" ? (
                     <>
@@ -734,10 +642,10 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
               <button
                 type="button"
                 onClick={requestDismiss}
-                disabled={installing}
+                disabled={installing || storagePending}
                 className="ring-focus rounded-lg px-2 py-1 text-[13px] text-ink-faint hover:text-ink disabled:opacity-50"
               >
-                Skip setup
+                {migrationRequired ? "Do this later" : "Skip setup"}
               </button>
               <button
                 type="button"
@@ -745,7 +653,7 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
                   !chosen ||
                   !setupKind ||
                   installing ||
-                  statusBlocksFinish ||
+                  storagePending ||
                   (setupKind === "tou" &&
                     (touOptionsLoading || !!touOptionsError || !selectedTouOption))
                 }
@@ -755,35 +663,15 @@ export function SetupModal({ open, detected, profileId, onFinish, onDismiss, onI
                 {installing
                   ? setupKind === "tou"
                     ? "Installing Town of Us…"
-                    : "Saving…"
+                    : "Preparing workspace…"
                   : setupKind === "tou"
                     ? "Install Town of Us"
-                    : visibleStatus.kind === "ready"
-                      ? "Finish"
-                      : "Finish without loader"}
+                    : "Set up BepInEx"}
               </button>
             </div>
           </motion.div>
         </motion.div>
       )}
     </AnimatePresence>
-  );
-}
-
-function requestIsCurrent(
-  identity: RequestIdentity,
-  request: number,
-  requestRef: { current: number },
-  openRef: { current: boolean },
-  sessionRef: { current: number },
-  profileIdRef: { current: string },
-  chosenRef: { current: string | null },
-): boolean {
-  return (
-    openRef.current &&
-    sessionRef.current === identity.session &&
-    requestRef.current === request &&
-    profileIdRef.current === identity.profileId &&
-    chosenRef.current === identity.path
   );
 }

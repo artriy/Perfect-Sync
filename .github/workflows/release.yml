@@ -150,9 +150,13 @@ jobs:
               --draft \
               --title "Perfect Sync $RELEASE_TAG" \
               --notes-file - <<'NOTES'
+          IMPORTANT: After updating to v0.1.6, rerun first-time setup and select a
+          fresh, untouched Among Us installation. Verify or reinstall the game first
+          if needed. Perfect Sync preserves profiles and mods, imports a private clean
+          base, and never modifies the selected source folder.
+
           Experimental release, nothing official or stable yet. Expect rough edges
-          and breaking changes, and behavior may differ across Among Us versions and
-          stores. Use at your own risk. See CHANGELOG.md for details and known limitations.
+          and breaking changes. See CHANGELOG.md for details and known limitations.
           NOTES
           fi
 

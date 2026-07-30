@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.5"
+version = "0.1.6"
 description = "Among Us BepInEx mod manager with shareable lobby mod-sync"
 authors = ["artriy"]
 license = "MIT"

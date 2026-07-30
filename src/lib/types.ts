@@ -90,7 +90,7 @@ export interface ModInstallSelection {
 }
 
 export interface OperationProgress {
-  phase: "preparing" | "resolving" | "downloading" | "finalizing";
+  phase: "preparing" | "resolving" | "downloading" | "copying" | "finalizing";
   message: string;
   bytesReceived?: number;
   bytesTotal?: number;
@@ -133,8 +133,12 @@ export interface GameInstall {
   runtime?: Runtime;
   /** detected Among Us build/version when readable */
   build?: string;
-  /** whether Perfect Sync can safely modify this folder */
+  /** legacy writability diagnostic; Perfect Sync never writes to the source */
   writable?: boolean;
+  /** true when no known mod-loader artifacts are present in the source root */
+  sourceClean?: boolean;
+  /** existing root artifacts that prevent a new exact source snapshot */
+  sourceModArtifacts?: string[];
 }
 
 export interface GameInstance extends GameInstall {
@@ -175,12 +179,22 @@ export interface Settings {
   /** local DLLs that should be installed into every profile */
   personalLocalMods?: PersonalLocalMod[];
   setupComplete: boolean;
+  /** true after setup has selected a fresh source for the exact immutable-base workflow */
+  freshSourceSetupComplete?: boolean;
   /** don't warn on launch when BepInEx isn't fully installed */
   skipLaunchWarning?: boolean;
   /** id of the profile to re-select on startup */
   activeProfile?: string;
+  /** custom root for managed game data and package caches; omitted for the platform default */
+  storagePath?: string;
   /** whether a GitHub token is stored in the native credential store */
   hasGithubToken: boolean;
   /** warning returned after malformed settings were quarantined */
   recoveryWarning?: string;
+  /** storage root active in this process */
+  activeStoragePath: string;
+  /** platform-local storage root used when no custom location is selected */
+  defaultStoragePath: string;
+  /** warning when configured storage was unavailable or old copies could not be removed */
+  storageWarning?: string;
 }

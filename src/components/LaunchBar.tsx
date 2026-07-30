@@ -42,7 +42,7 @@ export function LaunchBar({ profileName, running, busy, onLaunch, onSetup }: Lau
         disabled={blocked}
         aria-label={running ? "Set up mods unavailable while Among Us is running" : busy ? "Setting up unavailable while busy" : "Set up mods"}
         className="ring-focus glass flex shrink-0 items-center gap-2 rounded-xl px-4 py-3 text-[14px] font-semibold text-ink-dim transition-colors hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
-        title="Install BepInEx + this profile's mods into your Among Us folder without launching"
+        title="Prepare BepInEx and this profile's mods in the isolated workspace without launching"
       >
         <Wrench size={16} />
         {running ? "Game running" : busy ? "Please wait…" : "Set up mods"}

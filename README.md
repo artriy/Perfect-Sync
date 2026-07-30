@@ -5,7 +5,7 @@
 <br>
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-9b7bff?style=flat-square)](#platform-support)
-[![Version](https://img.shields.io/badge/version-0.1.5%20experimental-7a5bff?style=flat-square)](https://github.com/artriy/Perfect-Sync/releases)
+[![Version](https://img.shields.io/badge/version-0.1.6%20experimental-7a5bff?style=flat-square)](https://github.com/artriy/Perfect-Sync/releases)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-5bc0ff?style=flat-square)](https://tauri.app)
 [![License](https://img.shields.io/badge/license-MIT-5bc0ff?style=flat-square)](LICENSE)
 
@@ -68,38 +68,46 @@ personal GitHub or local-DLL defaults merged into every applied lobby profile. L
 remain device-only and are never serialized into lobby codes.
 
 > [!TIP]
-> **The app-data profile is the source of truth for the complete modded runtime.**
-> Before setup or launch, Perfect Sync recursively checks `BepInEx/plugins` for DLLs
-> outside the selected profile. It shows every extra DLL and blocks publication until
-> each one is resolved. You can select any subset, import safe root-level DLLs into the
-> profile, move files to the instance's checksummed `.perfectsync-quarantine`, or
-> explicitly delete them after confirmation. Perfect Sync otherwise replaces or removes
-> only files it owns. Microsoft Store / Game Pass installs in the protected `WindowsApps`
-> tree use Settings' managed-copy flow to create a normal, writable x64 game copy.
+> **The selected Among Us folder is a read-only source.** Perfect Sync never installs
+> BepInEx, mods, configs, or compatibility files into it. Before the first import, the
+> app rejects known existing mod-loader artifacts instead of silently omitting them.
+> It then records and copies every source file into a SHA-256-manifested immutable base
+> under local application data. Profiles are rebuilt into one disposable private
+> workspace with verified copies, so game writes cannot mutate the base. Existing
+> Steam, Epic, Microsoft Store, Game Pass, manual, Wine, Proton, CrossOver, Whisky, and
+> Bottles game folders remain unchanged.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
 ## How it works
 
-1. **Set up.** On first run the wizard detects supported Steam, Epic, Microsoft Store,
-   or Game Pass locations, or you select a folder containing `Among Us.exe`. Add and
-   name other game copies later in Settings. Protected Store installations can be copied
-   transactionally into a writable managed location from the same screen.
-2. **Add mods.** Browse the catalog or enter an exact HTTPS GitHub repository URL.
-3. **Pick a version.** Choose a release asset. Unknown repositories and assets require
-   an explicit confirmation before native code is installed.
+1. **Choose a fresh source.** On first run the wizard auto-detects only supported
+   Steam, Epic, Microsoft Store, or Game Pass locations without known mod-loader
+   artifacts. You can also inspect a folder containing `Among Us.exe`, then add and
+   name other read-only game sources later in Settings.
+2. **Build the clean base.** Perfect Sync first rejects known BepInEx and mod-loader
+   artifacts, then copies every file from the selected source and verifies an exact
+   SHA-256 manifest. Bases are immutable and versioned by source executable, game
+   build, architecture, store, and content. Profiles pinned to an older build retain
+   its base; unreferenced generations are garbage-collected after successful use.
+   The wizard also lets you keep managed data in local app data or select an empty
+   custom storage folder on another drive.
+3. **Add mods.** Browse the catalog or enter an exact HTTPS GitHub repository URL,
+   then choose a release asset. Unknown repositories and assets require explicit
+   confirmation before native code is installed.
 4. **Manage.** Toggle mods, change versions, create or switch profiles, and assign a
-   game instance to each profile. The profile and its managed DLLs live under the
-   host's application-data directory, not in the selected game folder.
-5. **Share or apply.** Export a `PERFECT-` code containing every enabled shareable
-   mod's exact repository identity, release version, selected asset, and the exact
-   LevelImposter map IDs. Preview the resulting per-mod changes and trust classification
-   before applying it. Local DLLs and game-build restrictions remain device-local.
-   Unknown lobby repositories still require explicit confirmation.
-6. **Launch.** Perfect Sync reconciles dependencies, transactionally publishes the
-   profile's owned DLLs, verifies BepInEx, and starts the Windows game. On Linux and
-   macOS the native Perfect Sync app launches the Windows game through a configured
-   supported compatibility runtime. **Set up mods** performs publication without launch.
+   game source to each profile. Profile-owned DLLs and mutable BepInEx configuration
+   live under application data, never in the selected source.
+5. **Materialize.** Perfect Sync stages a fresh workspace from the clean base, applies
+   the profile's exact loader, dependencies, mods, maps, cosmetics, and saved config,
+   verifies the managed files, then atomically publishes it. Failed builds leave the
+   previous workspace launchable.
+6. **Share or apply.** Export a `PERFECT-` code containing every enabled shareable
+   mod's exact repository identity, release version, selected asset, and exact
+   LevelImposter map IDs. Local DLLs and game-build restrictions remain device-local.
+7. **Launch.** Perfect Sync launches only the validated private workspace. On Linux
+   and macOS it uses the selected Proton, Wine, CrossOver, Whisky, or Bottles context.
+   **Set up mods** performs the same publication without launch.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
@@ -136,6 +144,29 @@ xattr -dr com.apple.quarantine "/Applications/Perfect Sync.app"
 Running the Windows `app.exe` itself under Wine/Proton is not supported; use the native
 Perfect Sync build for the host.
 
+## Storage locations
+
+Perfect Sync keeps small user state separate from large managed game data:
+
+| Data | Windows location |
+| --- | --- |
+| Settings, profiles, and catalog overrides | `%APPDATA%\Perfect-Sync\` |
+| A profile's owned DLLs and mutable BepInEx configuration | `%APPDATA%\Perfect-Sync\profiles\<profile-id>\BepInEx\` |
+| Immutable game bases | `%LOCALAPPDATA%\Perfect-Sync\managed-games\bases\<instance-id-hash>\versions\<base-id>\game\` |
+| Currently selected runnable profile | `%LOCALAPPDATA%\Perfect-Sync\managed-games\workspace\current\` |
+| Downloaded package caches | `%APPDATA%\Perfect-Sync\cache\` |
+
+Only one full runnable workspace is kept active. Profiles permanently store their own
+mods and configuration, not another complete copy of Among Us. Downloaded Town of Us
+and BepInEx packages are shared caches. The selected Steam, Epic, Microsoft Store, or
+manual folder remains outside these paths and is never changed.
+
+The first-run wizard and Settings can relocate the large managed data to an empty
+custom folder. Perfect Sync copies and SHA-256-verifies the bases, active workspace,
+and package caches before switching, then removes the old copy. A custom root uses
+`<selected-folder>\managed-games\` and `<selected-folder>\cache\`; profiles and
+settings remain under `%APPDATA%`.
+
 ## Build from source
 
 See [BUILD.md](BUILD.md). The Windows NSIS quick path is:
@@ -154,10 +185,9 @@ Stack: Tauri 2, React 19, TypeScript, Vite, Tailwind v4, with a Rust core crate.
 
 | Perfect Sync host | Windows Among Us runtime | Status |
 | --- | --- | --- |
-| Windows 10/11 x64 | Native Steam, Epic, or writable manual copy | **Primary supported target** |
-| Windows 10/11 x64 | Microsoft Store / Game Pass | Protected native folder is not writable; copy the game to a normal folder and select that copy |
-| Linux x86_64 / Steam Deck | Steam/Flatpak Steam + Proton, Wine, or Bottles | **Experimental**; native app build and CI coverage exist, but each real host/runtime/store combination still needs validation |
-| macOS Intel or Apple Silicon | CrossOver, Whisky, or Wine | **Experimental**; native app build and CI coverage exist, but each real host/runtime/store combination still needs validation |
+| Windows 10/11 x64 | Native Steam, Epic, Microsoft Store / Game Pass, or manual source | **Primary supported target**; sources are imported into private managed storage and never modified |
+| Linux x86_64 / Steam Deck | Steam/Flatpak Steam + Proton, Wine, or Bottles | **Experimental**; the private workspace launches through the source's compatibility context |
+| macOS Intel or Apple Silicon | CrossOver, Whisky, or Wine | **Experimental**; the private workspace launches through the selected bottle or prefix |
 | Windows Perfect Sync executable under Wine/Proton | Any | **Unsupported** — use the native host build |
 | Android, iOS, BSD, ChromeOS, Linux ARM64, Windows ARM64 | Any | **Unsupported** |
 

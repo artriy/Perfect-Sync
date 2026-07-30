@@ -26,9 +26,10 @@ Write-Host "Building signed release app + NSIS installer..." -ForegroundColor Cy
 pnpm tauri build --bundles nsis
 
 $rel = Join-Path $root "target\release"
+$version = (Get-Content (Join-Path $root "package.json") -Raw | ConvertFrom-Json).version
 $portable = Join-Path $rel "app.exe"
-$installer = Get-ChildItem (Join-Path $rel "bundle\nsis") -Filter "*-setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-$signature = Get-ChildItem (Join-Path $rel "bundle\nsis") -Filter "*-setup.exe.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
+$installer = Get-ChildItem (Join-Path $rel "bundle\nsis") -Filter "*_$($version)_*-setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+$signature = Get-ChildItem (Join-Path $rel "bundle\nsis") -Filter "*_$($version)_*-setup.exe.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
 
 Write-Host ""
 Write-Host "Done." -ForegroundColor Green

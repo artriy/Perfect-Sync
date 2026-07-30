@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.1.6 (experimental)
+
+> [!IMPORTANT]
+> **Action required after updating:** rerun first-time setup and select a fresh,
+> untouched Among Us installation. Verify or reinstall the game through Steam, Epic,
+> or Microsoft Store first if necessary. Perfect Sync v0.1.6 will prompt you on launch,
+> preserve your profiles and mods, import a private clean base, and never modify the
+> selected source folder.
+
+- Treat every selected Among Us folder as a read-only source; reject known existing
+  mod-loader artifacts rather than silently filtering them, then import every source
+  file into an exact SHA-256-manifested immutable base under local app data.
+- Version immutable bases by source identity, executable, build, store, architecture,
+  and content; retain historical generations required by profiles, migrate compatible
+  legacy bases, and garbage-collect unreferenced generations after successful use.
+- Materialize each selected profile into one disposable private workspace with verified
+  file copies, profile-specific config persistence, crash recovery, and atomic
+  replacement that preserves both the immutable base and previous working instance.
+- Launch only validated managed workspaces across native Windows, Proton, Wine,
+  CrossOver, Whisky, and Bottles; profile switching and mod toggles rebuild the selected
+  workspace without changing the original game installation.
+- Verify both x86 Steam and x64 Epic Town of Us workspaces against the exact release ZIP,
+  including `MiraAPI.dll`, `touhats.bundle`, and `touhats.catalog`.
+- Treat automatic update discovery as best-effort so a missing or temporarily
+  unavailable release manifest cannot interrupt application startup.
+- Auto-detect only fresh Among Us sources without known loader or mod artifacts;
+  manually inspected sources still report their exact contamination warning.
+- Let first-time setup and Settings place managed bases, the active workspace, and
+  package caches in an empty custom folder. Relocation copies and SHA-256-verifies
+  every file before switching and preserves the previous location on failure.
+- Add a Settings action that exports the active managed workspace's bounded,
+  non-linked BepInEx `LogOutput.log` through the native save dialog.
+- Prompt existing users to rerun setup until a fresh source has been selected for the
+  exact immutable-base workflow.
+- Keep all five live operation stages aligned in one progress row.
+
 ## v0.1.5 (experimental)
 
 - Let catalog bundles declare the dependency packages they provide, so install review,

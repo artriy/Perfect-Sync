@@ -4,7 +4,7 @@ import { Check, CircleNotch, Clock, DownloadSimple, ShieldCheck } from "@phospho
 import type { OperationProgress } from "../lib/types";
 import { useModalFocus } from "../lib/useModalFocus";
 
-export type OperationScope = "lobby" | "mods" | "release" | "maps" | "setup";
+export type OperationScope = "lobby" | "mods" | "release" | "maps" | "setup" | "profile" | "storage";
 
 export interface OperationActivity extends OperationProgress {
   id: number;
@@ -17,11 +17,12 @@ interface OperationProgressModalProps {
   activity: OperationActivity | null;
 }
 
-const PHASES: OperationProgress["phase"][] = ["preparing", "resolving", "downloading", "finalizing"];
+const PHASES: OperationProgress["phase"][] = ["preparing", "resolving", "downloading", "copying", "finalizing"];
 const PHASE_LABELS: Record<OperationProgress["phase"], string> = {
   preparing: "Prepare",
   resolving: "Resolve",
   downloading: "Download",
+  copying: "Copy",
   finalizing: "Finish",
 };
 
@@ -129,7 +130,7 @@ export function OperationProgressModal({ activity }: OperationProgressModalProps
                 aria-valuemin={0}
                 aria-valuemax={hasByteTotal ? 100 : undefined}
                 aria-valuenow={percentage ?? undefined}
-                aria-valuetext={percentage === null ? `${PHASE_LABELS[activity.phase]} in progress` : `${percentage}% downloaded`}
+                aria-valuetext={percentage === null ? `${PHASE_LABELS[activity.phase]} in progress` : `${percentage}% complete`}
               >
                 {percentage === null ? (
                   <motion.div
@@ -160,7 +161,7 @@ export function OperationProgressModal({ activity }: OperationProgressModalProps
               </div>
             </div>
 
-            <ol className="mt-6 grid grid-cols-4" aria-label="Installation stages">
+            <ol className="mt-6 grid grid-cols-5" aria-label="Installation stages">
               {PHASES.map((phase, index) => {
                 const complete = index < phaseIndex;
                 const current = index === phaseIndex;

@@ -6,6 +6,7 @@ import {
   CheckCircle,
   FolderOpen,
   FileCode,
+  FileArrowDown,
   GameController,
   GithubLogo,
   HardDrives,
@@ -15,12 +16,10 @@ import {
   XCircle,
 } from "@phosphor-icons/react";
 import {
-  createManagedGameCopy,
   inspectGame,
   loaderStatus,
   pickFolder,
   pickLocalDll,
-  pickManagedCopyDestination,
   reinstallLoader,
   type LoaderStatus,
 } from "../lib/bridge";
@@ -39,6 +38,8 @@ interface SettingsModalProps {
   onClose: () => void;
   onSave: (settings: Settings, tokenAction: GithubTokenAction) => Promise<void>;
   onRunSetup: () => void;
+  onMoveStorage: (storagePath?: string) => Promise<void>;
+  onSaveErrorLog: () => Promise<void>;
   trustOf: (repo: string) => Trust;
 }
 
@@ -63,6 +64,8 @@ export function SettingsModal({
   onClose,
   onSave,
   onRunSetup,
+  onMoveStorage,
+  onSaveErrorLog,
   trustOf,
 }: SettingsModalProps) {
   const reduce = useReducedMotion();
@@ -84,6 +87,8 @@ export function SettingsModal({
   const [folderPending, setFolderPending] = useState(false);
   const [reinstalling, setReinstalling] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [storagePending, setStoragePending] = useState(false);
+  const [errorLogSaving, setErrorLogSaving] = useState(false);
   const [draftError, setDraftError] = useState("");
   const [personalError, setPersonalError] = useState("");
   const [loaderNotice, setLoaderNotice] = useState<{ path: string; profileId: string; text: string } | null>(null);
@@ -101,6 +106,8 @@ export function SettingsModal({
   const reinstallPendingRef = useRef(false);
   const folderPendingRef = useRef(false);
   const savePendingRef = useRef(false);
+  const storagePendingRef = useRef(false);
+  const errorLogSavingRef = useRef(false);
 
   const selected = instances.find((instance) => instance.id === selectedId) ?? null;
   const selectedRef = useRef<GameInstance | null>(selected);
@@ -111,7 +118,7 @@ export function SettingsModal({
   latestOpenDataRef.current = { settings, profileGameInstanceId };
   selectedRef.current = selected;
 
-  const hasPendingWork = folderPending || reinstalling || saving;
+  const hasPendingWork = folderPending || reinstalling || saving || storagePending || errorLogSaving;
   const canDismissRef = useRef(!hasPendingWork);
   canDismissRef.current = !hasPendingWork;
 
@@ -121,6 +128,8 @@ export function SettingsModal({
       !folderPendingRef.current &&
       !reinstallPendingRef.current &&
       !savePendingRef.current
+      && !storagePendingRef.current
+      && !errorLogSavingRef.current
     ) closeRef.current();
   }, []);
   useModalFocus(open, modalRef, requestClose);
@@ -145,6 +154,8 @@ export function SettingsModal({
       setFolderPending(false);
       setReinstalling(false);
       setSaving(false);
+      setStoragePending(false);
+      setErrorLogSaving(false);
       setDraftError("");
       setPersonalError("");
       setLoaderNotice(null);
@@ -153,6 +164,8 @@ export function SettingsModal({
       folderPendingRef.current = false;
       reinstallPendingRef.current = false;
       savePendingRef.current = false;
+      storagePendingRef.current = false;
+      errorLogSavingRef.current = false;
     } else if (!open && wasOpenRef.current) {
       sessionRef.current += 1;
       loaderRequestRef.current += 1;
@@ -160,6 +173,8 @@ export function SettingsModal({
       folderPendingRef.current = false;
       reinstallPendingRef.current = false;
       savePendingRef.current = false;
+      storagePendingRef.current = false;
+      errorLogSavingRef.current = false;
     }
     wasOpenRef.current = open;
   }, [open]);
@@ -203,6 +218,54 @@ export function SettingsModal({
     if (!openRef.current || sessionRef.current !== session) return;
     folderPendingRef.current = false;
     setFolderPending(false);
+  };
+
+  const changeStorage = async (restoreDefault = false) => {
+    if (hasPendingWork || storagePendingRef.current) return;
+    const session = sessionRef.current;
+    const requestProfileId = profileIdRef.current;
+    let path: string | undefined;
+    if (!restoreDefault) {
+      const selectedPath = await pickFolder("Choose a Perfect Sync storage folder");
+      if (!selectedPath || !sameOpenSession(session, requestProfileId, openRef, sessionRef, profileIdRef)) return;
+      path = selectedPath;
+    }
+    storagePendingRef.current = true;
+    setStoragePending(true);
+    setDraftError("");
+    try {
+      await onMoveStorage(path);
+    } catch (error) {
+      if (sameOpenSession(session, requestProfileId, openRef, sessionRef, profileIdRef)) {
+        setDraftError(actionableSettingsError(error));
+      }
+    } finally {
+      if (sameOpenSession(session, requestProfileId, openRef, sessionRef, profileIdRef)) {
+        storagePendingRef.current = false;
+        setStoragePending(false);
+      }
+    }
+  };
+
+  const saveErrorLog = async () => {
+    if (hasPendingWork || errorLogSavingRef.current) return;
+    const session = sessionRef.current;
+    const requestProfileId = profileIdRef.current;
+    errorLogSavingRef.current = true;
+    setErrorLogSaving(true);
+    setDraftError("");
+    try {
+      await onSaveErrorLog();
+    } catch (error) {
+      if (sameOpenSession(session, requestProfileId, openRef, sessionRef, profileIdRef)) {
+        setDraftError(errorMessage(error));
+      }
+    } finally {
+      if (sameOpenSession(session, requestProfileId, openRef, sessionRef, profileIdRef)) {
+        errorLogSavingRef.current = false;
+        setErrorLogSaving(false);
+      }
+    }
   };
 
   const addInstance = async () => {
@@ -275,75 +338,6 @@ export function SettingsModal({
     }
   };
 
-  const createManagedCopy = async () => {
-    const target = selectedRef.current;
-    if (!target || target.store !== "msstore" || target.writable !== false || !beginFolderWork()) return;
-    const session = sessionRef.current;
-    const requestProfileId = profileIdRef.current;
-    const targetId = target.id;
-    const originalPath = target.path;
-    try {
-      const destination = await pickManagedCopyDestination();
-      if (
-        !destination ||
-        !sameSelectedSession(
-          session,
-          requestProfileId,
-          targetId,
-          originalPath,
-          openRef,
-          sessionRef,
-          profileIdRef,
-          selectedRef,
-        )
-      ) return;
-      const game = await createManagedGameCopy(originalPath, destination);
-      if (
-        !sameSelectedSession(
-          session,
-          requestProfileId,
-          targetId,
-          originalPath,
-          openRef,
-          sessionRef,
-          profileIdRef,
-          selectedRef,
-        )
-      ) return;
-      setInstances((current) =>
-        current.map((instance) =>
-          instance.id === targetId
-            ? {
-                ...instance,
-                name: instance.name.includes("managed") ? instance.name : `${instance.name} managed`,
-                path: game.path,
-                store: game.store,
-                arch: game.arch,
-                runtime: game.runtime ?? "native",
-                build: game.build,
-                writable: game.writable,
-              }
-            : instance,
-        ),
-      );
-      setLoaderRetry((value) => value + 1);
-    } catch (error) {
-      if (
-        sameSelectedSession(
-          session,
-          requestProfileId,
-          targetId,
-          originalPath,
-          openRef,
-          sessionRef,
-          profileIdRef,
-          selectedRef,
-        )
-      ) setDraftError(errorMessage(error));
-    } finally {
-      endFolderWork(session);
-    }
-  };
 
   const removeInstance = (id: string) => {
     if (hasPendingWork) return;
@@ -569,9 +563,59 @@ export function SettingsModal({
             <h2 className="text-[20px] font-semibold text-ink">Settings</h2>
 
             <div className="scroll-region min-h-0 flex-1 overflow-x-hidden overflow-y-auto pr-2">
+              <div className="mt-5 mb-2 text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
+                Managed storage
+              </div>
+              <div className="rounded-xl border border-white/9 bg-white/[0.035] p-3.5">
+                <div className="flex min-w-0 items-center gap-3">
+                  <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-[#9b7bff]/12 text-accent-2">
+                    <HardDrives size={18} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[12.5px] font-semibold text-ink">
+                      {settings.storagePath ? "Custom location" : "Local app data"}
+                    </div>
+                    <div
+                      className="truncate font-mono text-[11.5px] text-ink-faint"
+                      title={settings.activeStoragePath}
+                    >
+                      {displayPath(settings.activeStoragePath)}
+                    </div>
+                  </div>
+                </div>
+                <p className="mt-2.5 text-[11.5px] leading-relaxed text-ink-faint">
+                  Clean bases, the active isolated workspace, and downloaded packages use this folder. Profiles and settings remain in AppData.
+                </p>
+                {settings.storageWarning && (
+                  <p role="alert" className="mt-2 text-[11.5px] leading-relaxed text-[#ffb4b4]">
+                    {settings.storageWarning}
+                  </p>
+                )}
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void changeStorage(false)}
+                    disabled={hasPendingWork}
+                    className="ring-focus glass rounded-lg px-3 py-2 text-[12px] font-semibold text-ink-dim hover:text-ink disabled:opacity-50"
+                  >
+                    {storagePending ? "Moving storage…" : "Change location"}
+                  </button>
+                  {settings.storagePath && (
+                    <button
+                      type="button"
+                      onClick={() => void changeStorage(true)}
+                      disabled={hasPendingWork}
+                      className="ring-focus rounded-lg px-3 py-2 text-[12px] text-ink-faint hover:bg-white/10 hover:text-ink disabled:opacity-50"
+                    >
+                      Restore default
+                    </button>
+                  )}
+                </div>
+              </div>
+
               <div className="mt-5 mb-2 flex items-center justify-between">
                 <span className="text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
-                  Among Us instances
+                  Among Us sources
                 </span>
                 <button
                   type="button"
@@ -579,7 +623,7 @@ export function SettingsModal({
                   disabled={hasPendingWork}
                   className="ring-focus flex items-center gap-1 rounded-lg px-2 py-1 text-[11.5px] font-semibold text-ink-dim hover:bg-white/10 hover:text-ink disabled:opacity-50"
                 >
-                  <Plus size={12} weight="bold" /> {folderPending ? "Inspecting" : "Add folder"}
+                  <Plus size={12} weight="bold" /> {folderPending ? "Inspecting" : "Add source"}
                 </button>
               </div>
               <div className="flex flex-col gap-1.5">
@@ -634,7 +678,7 @@ export function SettingsModal({
                 })}
                 {instances.length === 0 && (
                   <div className="glass rounded-xl px-3 py-4 text-center text-[12px] text-ink-faint">
-                    Add every Among Us folder you want to use with profiles.
+                    Add each Steam, Epic, itch.io, or Microsoft Store source used by your profiles. Perfect Sync never modifies these folders.
                   </div>
                 )}
               </div>
@@ -683,7 +727,7 @@ export function SettingsModal({
                   </div>
                   {selected.id === profileGameInstanceId && (
                     <p className="px-1 text-[11.5px] leading-relaxed text-ink-faint">
-                      This profile uses this instance. To move it to a different folder, use Change so the profile stays connected.
+                      This profile uses this source. Changing it creates a new private base while keeping the profile connected.
                     </p>
                   )}
                   {selected.store === "msstore" && selected.writable === false && (
@@ -692,20 +736,12 @@ export function SettingsModal({
                         <HardDrives size={18} className="mt-0.5 shrink-0 text-crew-gold" />
                         <div className="min-w-0 flex-1">
                           <p className="text-[12.5px] font-semibold text-ink">
-                            This Microsoft Store folder is protected
+                            This Microsoft Store source is read-only
                           </p>
                           <p className="mt-1 text-[12px] leading-relaxed text-ink-dim">
-                            Create a verified writable copy before installing BepInEx or launching a modded profile.
+                            Supported. Perfect Sync imports it into a writable private workspace automatically and leaves this source untouched.
                           </p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => void createManagedCopy()}
-                          disabled={hasPendingWork}
-                          className="ring-focus shrink-0 rounded-lg bg-[#ffd23f] px-3 py-2 text-[12px] font-bold text-[#241900] disabled:opacity-50"
-                        >
-                          {folderPending ? "Copying" : "Create managed copy"}
-                        </button>
                       </div>
                     </div>
                   )}
@@ -1063,6 +1099,28 @@ export function SettingsModal({
                 </button>
               </div>
 
+              <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
+                Support
+              </span>
+              <div className="glass flex items-center justify-between gap-3 rounded-xl px-3.5 py-3 max-[480px]:items-start">
+                <div>
+                  <p className="text-[12.5px] text-ink">BepInEx error log</p>
+                  <p className="mt-0.5 text-[11px] leading-relaxed text-ink-faint">
+                    Save LogOutput.log from the active isolated workspace for troubleshooting.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void saveErrorLog()}
+                  disabled={hasPendingWork}
+                  title="Save LogOutput.log from the active managed profile workspace"
+                  className="ring-focus glass-2 flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-[12px] font-semibold text-ink-dim hover:text-ink disabled:opacity-50"
+                >
+                  <FileArrowDown size={15} />
+                  {errorLogSaving ? "Saving…" : "Save error log"}
+                </button>
+              </div>
+
               {draftError && (
                 <p role="alert" className="mt-4 rounded-xl border border-[#ff8a8a]/30 bg-[#ff8a8a]/10 px-3 py-2.5 text-[12.5px] text-[#ffb4b4]">
                   {draftError}
@@ -1139,7 +1197,7 @@ const STORE_NAMES: Record<Store, string> = {
 
 function LoaderStatusView({ state, selected }: { state: LoaderView; selected: boolean }) {
   if (state.kind === "idle") {
-    return <div className="text-ink-faint">{selected ? "Loader status has not been checked." : "Select an instance above to check the loader."}</div>;
+    return <div className="text-ink-faint">{selected ? "Workspace status has not been checked." : "Select a source above to check the workspace."}</div>;
   }
   if (state.kind === "loading") {
     return <div role="status" className="text-ink-faint">Checking loader status</div>;
@@ -1155,7 +1213,7 @@ function LoaderStatusView({ state, selected }: { state: LoaderView; selected: bo
     return state.value ? (
       <LoaderDetails status={state.value} incomplete />
     ) : (
-      <div className="text-[#ffe49a]">BepInEx is not installed for this game folder.</div>
+      <div className="text-[#ffe49a]">This profile has not prepared an isolated workspace yet.</div>
     );
   }
   return <LoaderDetails status={state.value} />;
@@ -1165,8 +1223,9 @@ function LoaderDetails({ status, incomplete = false }: { status: LoaderStatus; i
   return (
     <div className="flex flex-col gap-1">
       {incomplete && (
-        <div className="mb-1 text-[#ffe49a]">BepInEx setup is incomplete for this game folder.</div>
+        <div className="mb-1 text-[#ffe49a]">The isolated workspace needs to be prepared or repaired.</div>
       )}
+      <StatusRow ok={status.workspaceReady} label="Isolated profile workspace" />
       <StatusRow ok={status.winhttp} label="Doorstop (winhttp.dll)" />
       <StatusRow ok={status.preloader} label="BepInEx core" />
       <StatusRow
@@ -1178,7 +1237,8 @@ function LoaderDetails({ status, incomplete = false }: { status: LoaderStatus; i
       <StatusRow ok={status.steamAppid} label="Steam launch fix" />
       {status.runtime !== "native" && <StatusRow ok={status.runtimeReady} label={`${status.runtime} winhttp override`} />}
       <div className="mt-1 text-ink-faint">
-        plugins: {status.profilePlugins} in profile · {status.gamePlugins} synced to game
+        plugins: {status.profilePlugins} in profile · {status.gamePlugins} in private workspace
+        {status.workspacePath ? <span className="mt-0.5 block truncate font-mono">{displayPath(status.workspacePath)}</span> : null}
       </div>
     </div>
   );

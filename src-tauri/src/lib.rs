@@ -1,6 +1,8 @@
 mod commands;
 mod console_monitor;
+mod managed_instance;
 mod settings;
+mod storage;
 
 use tauri::Manager;
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
@@ -46,6 +48,33 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().data_dir()?.join("Perfect-Sync");
             settings::initialize_app_data_dir(data_dir)?;
+            let managed_data_dir = app.path().local_data_dir()?.join("Perfect-Sync");
+            settings::initialize_managed_data_dir(managed_data_dir)?;
+            let saved = settings::load()?;
+            if let Some(storage_path) = saved.storage_path.as_deref() {
+                let game_sources = saved
+                    .game_instances
+                    .iter()
+                    .map(|instance| instance.path.clone().into())
+                    .collect::<Vec<_>>();
+                match storage::validate_configured_root(
+                    storage_path,
+                    &settings::default_managed_data_dir(),
+                    &settings::app_data_dir(),
+                    &game_sources,
+                ) {
+                    Ok(storage_root) => {
+                        if let Err(error) = settings::set_managed_data_dir(storage_root) {
+                            log::error!(
+                                "configured managed storage is unavailable; using the local default: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => log::error!(
+                        "configured managed storage is unavailable; using the local default: {error}"
+                    ),
+                }
+            }
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
@@ -61,9 +90,10 @@ pub fn run() {
             commands::preview_code,
             commands::detect_games,
             commands::inspect_game,
-            commands::create_managed_game_copy,
             commands::get_settings,
             commands::save_settings,
+            commands::move_storage,
+            commands::export_error_log,
             commands::game_running,
             commands::get_catalog,
             commands::refresh_catalog,

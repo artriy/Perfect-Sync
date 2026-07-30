@@ -5,7 +5,10 @@
 //! Network/disk-heavy commands are `async` and run their blocking body on a
 //! worker thread via `spawn_blocking`, so the UI thread never freezes.
 
+use crate::managed_instance;
 use crate::settings::{self, Settings, SettingsView, TokenAction};
+use crate::storage;
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use perfect_sync_core::catalog::{parse, AssetArchRule, AssetRules, Catalog};
 use perfect_sync_core::deps;
@@ -15,7 +18,7 @@ use perfect_sync_core::resolver::{download_resolved, Http, Release, ResolvedDown
 use perfect_sync_core::types::{
     valid_levelimposter_map_id, Arch, ModSource, ModTag, Runtime, Store, Trust,
 };
-use perfect_sync_core::{codec, compat, game, loader, process, profile, resolver, tou_cosmetics};
+use perfect_sync_core::{codec, compat, game, loader, process, profile, resolver};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,8 +79,9 @@ const MAX_PROFILE_STAGE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PROFILE_RECOVERY_JOURNALS: usize = 64;
 const MAX_PROFILE_RECOVERY_PARENT_ENTRIES: usize = 4_096;
 const MAX_PROFILE_RECOVERY_JOURNAL_BYTES: u64 = 1_024;
-const MAX_MANAGED_GAME_COPY_FILES: usize = 200_000;
-const MAX_MANAGED_GAME_COPY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_RECURSIVE_COPY_FILES: usize = 200_000;
+const MAX_RECURSIVE_COPY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_ERROR_LOG_BYTES: u64 = 256 * 1024 * 1024;
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LAUNCH_PENDING: AtomicBool = AtomicBool::new(false);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +110,12 @@ fn validate_profile_id(id: &str) -> Result<(), String> {
 }
 
 fn game_is_stopped() -> Result<(), String> {
+    #[cfg(test)]
+    if std::env::var_os("PERFECT_SYNC_SMOKE_ALLOW_RUNNING").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        return Ok(());
+    }
     if LAUNCH_PENDING.load(Ordering::Acquire) {
         return Err(
             "Among Us is still launching. Wait for startup to finish before changing files.".into(),
@@ -511,98 +521,6 @@ fn with_existing_profile_layout<T>(
         .map_err(|error| error.to_string())?
         .ok_or("profile not found")?;
     with_profile_layout(profiles_root, profile_id, operation)
-}
-
-fn app_loader_owned(game_dir: &Path) -> Result<bool, String> {
-    let marker = game_dir.join("BepInEx").join(APP_LOADER_MARKER);
-    match fs::symlink_metadata(marker) {
-        Ok(metadata) if !is_reparse(&metadata) && metadata.is_file() => Ok(true),
-        Ok(_) => Err("Perfect Sync loader ownership marker is not a regular file".into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn restore_doorstop(game_dir: &Path) -> Result<(), String> {
-    let disabled = game_dir.join(DISABLED_DOORSTOP);
-    let destination = game_dir.join("winhttp.dll");
-    let metadata = match fs::symlink_metadata(&disabled) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.to_string()),
-    };
-    if is_reparse(&metadata) || !metadata.is_file() {
-        return Err("disabled Doorstop entry point is not a regular file".into());
-    }
-    if !app_loader_owned(game_dir)? {
-        return Err("disabled Doorstop entry point has no Perfect Sync ownership marker".into());
-    }
-    if destination.exists() {
-        return Err(
-            "Cannot restore the Perfect Sync Doorstop entry point because winhttp.dll already exists."
-                .into(),
-        );
-    }
-    fs::rename(disabled, destination).map_err(|error| error.to_string())
-}
-
-fn disable_doorstop(game_dir: &Path) -> Result<bool, String> {
-    let source = game_dir.join("winhttp.dll");
-    let disabled = game_dir.join(DISABLED_DOORSTOP);
-    let owned = app_loader_owned(game_dir)?;
-    if disabled.exists() {
-        if source.exists() {
-            return Err(
-                "Both active and disabled Perfect Sync Doorstop entry points exist.".into(),
-            );
-        }
-        let metadata = fs::symlink_metadata(&disabled).map_err(|error| error.to_string())?;
-        if is_reparse(&metadata) || !metadata.is_file() {
-            return Err("disabled Doorstop entry point is not a regular file".into());
-        }
-        if !owned {
-            return Err(
-                "disabled Doorstop entry point has no Perfect Sync ownership marker".into(),
-            );
-        }
-        return Ok(false);
-    }
-    if !owned {
-        return Ok(false);
-    }
-    if !source.exists() {
-        return Ok(false);
-    }
-    let metadata = fs::symlink_metadata(&source).map_err(|error| error.to_string())?;
-    if is_reparse(&metadata) || !metadata.is_file() {
-        return Err("Perfect Sync Doorstop entry point is not a regular file".into());
-    }
-    fs::rename(&source, &disabled).map_err(|error| error.to_string())?;
-    Ok(true)
-}
-
-fn launch_without_doorstop(
-    game_dir: &Path,
-    launch: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-    let disabled_here = disable_doorstop(game_dir)?;
-    match fs::symlink_metadata(game_dir.join("winhttp.dll")) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Ok(_) => {
-            return Err("Cannot launch vanilla while an unowned winhttp.dll remains active.".into())
-        }
-        Err(error) => return Err(error.to_string()),
-    }
-    match launch() {
-        Ok(()) => Ok(()),
-        Err(error) if !disabled_here => Err(error),
-        Err(error) => match restore_doorstop(game_dir) {
-            Ok(()) => Err(error),
-            Err(rollback) => Err(format!(
-                "{error}; additionally could not restore Doorstop after launch failure: {rollback}"
-            )),
-        },
-    }
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -1391,47 +1309,23 @@ fn inferred_store(game_dir: &Path) -> Store {
     }
 }
 
-fn runtime_context(game_dir: &Path) -> Result<compat::RuntimeContext, String> {
-    let saved = settings::load().map_err(|error| error.to_string())?;
-    let hint = saved
-        .game_instances
-        .iter()
-        .find(|instance| same_path(Path::new(&instance.path), game_dir))
-        .map(|instance| instance.runtime);
-    Ok(compat::resolve_with_hint(game_dir, hint))
-}
-
 fn validate_game_dir(game_dir: &Path) -> Result<(), String> {
     if !game_dir.is_dir() {
         return Err(format!("game folder not found: {}", game_dir.display()));
     }
-    let exe = game_dir.join(process::GAME_EXE);
-    if !exe.is_file() {
-        return Err(format!(
-            "This is not the Among Us folder: {} is missing",
-            exe.display()
-        ));
-    }
-    if let Some(hint) = protected_install_hint(game_dir) {
-        return Err(hint);
-    }
-    let probe = game_dir.join(format!(".perfectsync-write-test-{}", std::process::id()));
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .map_err(|e| {
-            format!(
-                "Perfect Sync cannot modify the Among Us folder {}: {e}",
-                game_dir.display()
-            )
-        })?;
-    fs::remove_file(&probe).map_err(|e| {
+    let executable = game_dir.join(process::GAME_EXE);
+    let metadata = fs::symlink_metadata(&executable).map_err(|_| {
         format!(
-            "Perfect Sync could not clean up its write probe {}: {e}",
-            probe.display()
+            "This is not the Among Us folder: {} is missing",
+            executable.display()
         )
-    })
+    })?;
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err("Among Us executable is not a regular file".into());
+    }
+    game::exe_arch(&executable)
+        .ok_or_else(|| "Among Us executable architecture is unsupported".to_string())
+        .map(|_| ())
 }
 
 fn copy_game_tree(
@@ -1443,7 +1337,7 @@ fn copy_game_tree(
     let source_metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     if is_reparse(&source_metadata) || !source_metadata.is_dir() {
         return Err(format!(
-            "Managed game copies cannot follow links or reparse points: {}",
+            "Backup copies cannot follow links or reparse points: {}",
             source.display()
         ));
     }
@@ -1459,7 +1353,7 @@ fn copy_game_tree(
         let metadata = fs::symlink_metadata(&from).map_err(|error| error.to_string())?;
         if is_reparse(&metadata) {
             return Err(format!(
-                "Managed game copies cannot follow links or reparse points: {}",
+                "Backup copies cannot follow links or reparse points: {}",
                 from.display()
             ));
         }
@@ -1472,12 +1366,12 @@ fn copy_game_tree(
         }
         *files = files
             .checked_add(1)
-            .ok_or("Managed game copy file count overflow")?;
+            .ok_or("Backup copy file count overflow")?;
         *bytes = bytes
             .checked_add(metadata.len())
-            .ok_or("Managed game copy size overflow")?;
-        if *files > MAX_MANAGED_GAME_COPY_FILES || *bytes > MAX_MANAGED_GAME_COPY_BYTES {
-            return Err("The selected game copy exceeds the managed-copy safety limit.".into());
+            .ok_or("Backup copy size overflow")?;
+        if *files > MAX_RECURSIVE_COPY_FILES || *bytes > MAX_RECURSIVE_COPY_BYTES {
+            return Err("The backup exceeds its copy safety limit.".into());
         }
         let mut input = File::open(&from).map_err(|error| error.to_string())?;
         let mut output = OpenOptions::new()
@@ -1489,61 +1383,6 @@ fn copy_game_tree(
         output.sync_all().map_err(|error| error.to_string())?;
     }
     Ok(())
-}
-
-#[tauri::command]
-pub async fn create_managed_game_copy(
-    source_path: String,
-    destination_parent: String,
-) -> Result<game::GameInstall, String> {
-    blocking(move || {
-        let _guard = lock_mutations()?;
-        game_is_stopped()?;
-        let source = canonical_game_path(Path::new(&source_path))?;
-        let parent = fs::canonicalize(Path::new(&destination_parent))
-            .map_err(|error| format!("Could not open the managed-copy destination: {error}"))?;
-        if !parent.is_dir() || !game::is_writable_game_dir(&parent) {
-            return Err("Choose a writable destination folder for the managed game copy.".into());
-        }
-        if parent.starts_with(&source) {
-            return Err(
-                "Choose a managed-copy destination outside the original game folder.".into(),
-            );
-        }
-        let destination = parent.join("Among Us - Perfect Sync");
-        if destination.exists() {
-            return Err(format!(
-                "{} already exists. Choose a different destination or remove that prior copy.",
-                destination.display()
-            ));
-        }
-        let stage = parent.join(format!(
-            ".perfectsync-game-copy-{}-{}",
-            std::process::id(),
-            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let result = (|| {
-            let mut files = 0;
-            let mut bytes = 0;
-            copy_game_tree(&source, &stage, &mut files, &mut bytes)?;
-            validate_game_dir(&stage)?;
-            fs::rename(&stage, &destination).map_err(|error| error.to_string())?;
-            Ok(game::GameInstall {
-                path: destination.clone(),
-                store: Store::Msstore,
-                arch: game::exe_arch(&destination.join(process::GAME_EXE))
-                    .ok_or("Managed Among Us copy has unsupported architecture")?,
-                runtime: Runtime::Native,
-                build: game::detect_build(&destination),
-                writable: true,
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&stage);
-        }
-        result
-    })
-    .await
 }
 
 fn canonical_game_path(game_dir: &Path) -> Result<PathBuf, String> {
@@ -1754,19 +1593,19 @@ fn configure_runtime_override(ctx: &compat::RuntimeContext) -> Result<(), String
 fn launch_err_msg(ctx: &compat::RuntimeContext, e: &std::io::Error) -> String {
     match ctx.runtime {
         Runtime::Proton => format!(
-            "Couldn't start Steam or Flatpak Steam for Proton ({e}). The Among Us folder is already synchronized; launch the game from Steam."
+            "Couldn't start the selected Proton tool ({e}). The isolated workspace is still ready; verify Proton in Steam, then retry."
         ),
         Runtime::Wine => format!(
-            "Couldn't run Wine ({e}). The Among Us folder is already synchronized; launch the game from your Wine frontend."
+            "Couldn't run Wine ({e}). The isolated workspace is still ready; verify the configured Wine runtime, then retry."
         ),
         Runtime::Crossover => format!(
-            "Couldn't run CrossOver's cxrun ({e}). The Among Us folder is already synchronized; launch it from CrossOver."
+            "Couldn't run CrossOver's cxrun ({e}). The isolated workspace is still ready; verify the selected bottle, then retry."
         ),
         Runtime::Whisky => format!(
-            "Couldn't run Whisky's Wine ({e}). The Among Us folder is already synchronized; launch it from Whisky."
+            "Couldn't run Whisky's Wine ({e}). The isolated workspace is still ready; verify the selected bottle, then retry."
         ),
         Runtime::Bottles => format!(
-            "Couldn't run bottles-cli ({e}). The Among Us folder is already synchronized; launch it from Bottles."
+            "Couldn't run bottles-cli ({e}). The isolated workspace is still ready; verify the selected bottle, then retry."
         ),
         Runtime::Native => format!("Failed to launch the game: {e}"),
     }
@@ -1840,27 +1679,6 @@ fn resolve_loader(http: &dyn Http, arch: &str) -> Result<(String, String), Strin
     Err("could not resolve a BepInEx loader source (check your internet)".to_string())
 }
 
-fn resolve_loader_for_ensure(
-    complete_owned_loader: bool,
-    resolve: impl FnOnce() -> Result<(String, String), String>,
-) -> Result<Option<(String, String)>, String> {
-    match resolve() {
-        Ok(resolved) => Ok(Some(resolved)),
-        Err(_) if complete_owned_loader => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn download_loader_for_ensure(
-    complete_owned_loader: bool,
-    download: impl FnOnce() -> Result<Vec<u8>, String>,
-) -> Result<Option<Vec<u8>>, String> {
-    match download() {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(_) if complete_owned_loader => Ok(None),
-        Err(error) => Err(error),
-    }
-}
 fn download_doorstop_fix(http: &dyn Http) -> Result<Vec<u8>, String> {
     let bytes = http
         .get_bytes(DOORSTOP_FIX_URL)
@@ -1877,183 +1695,46 @@ fn download_doorstop_fix(http: &dyn Http) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn install_loader_and_optional_fix(
-    game_dir: &Path,
-    pack: Option<(&Path, &str)>,
-    fix: Option<&[u8]>,
-) -> Result<(), String> {
-    game_artifact_transaction(game_dir, || {
-        if let Some((pack_root, version)) = pack {
-            loader::install_pack(pack_root, game_dir, version)
-                .map_err(|error| error.to_string())?;
-        }
-        if let Some(bytes) = fix {
-            let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
-                .map(arch_str)
-                .ok_or("Among Us executable architecture is unsupported")?;
-            loader::install_windows_doorstop_patch(bytes, game_dir, DOORSTOP_FIX_VERSION, &arch)
-                .map_err(|error| error.to_string())?;
-        } else if pack.is_some() {
-            loader::clear_doorstop_patch_marker(game_dir).map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    })
-}
-
 fn doorstop_fix_is_current(game_dir: &Path, arch: &str) -> bool {
     loader::has_doorstop_patch(game_dir, DOORSTOP_FIX_VERSION, arch)
 }
 
-/// Install the Doorstop/BepInEx loader for a profile (idempotent). Downloads +
-/// caches the GitHub pack once per arch.
-fn ensure_loader_impl(
-    game_path: &str,
-    profile_id: &str,
-    _arch: &str,
-    apply_doorstop_fix: bool,
-    http: &dyn Http,
-    reporter: Option<&ProgressReporter>,
-) -> Result<(), String> {
-    if let Some(reporter) = reporter {
-        reporter.stage(
-            "preparing",
-            "Checking the Among Us folder and active profile",
-        );
-    }
-    game_is_stopped()?;
-    let game_dir = validate_game_target(game_path, Some(profile_id))?;
-    restore_doorstop(&game_dir)?;
-    validate_game_dir(&game_dir)?;
-    let root = settings::profiles_root();
-    let profile = recovered_profile_store(&root)?
-        .load(profile_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "profile not found".to_string())?;
-    if profile_uses_tou_mira(&profile) {
-        if apply_doorstop_fix {
-            return Err(
-                "Town of Us includes its own fixed UnityDoorstop build; the separate compatibility fix is only available for BepInEx-only profiles."
-                    .into(),
-            );
-        }
-        return loader::has_loader(&game_dir)
-            .then_some(())
-            .ok_or_else(|| "The Town of Us BepInEx package is missing. Synchronize the profile to restore its complete release package.".into());
-    }
-    let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
-        .map(arch_str)
-        .ok_or("Among Us executable architecture is unsupported")?;
-    if let Some(reporter) = reporter {
-        reporter.stage(
-            "resolving",
-            "Checking the pinned BepInEx build and local cache",
-        );
-    }
-    let have = loader::has_loader(&game_dir);
-    let resolved = resolve_loader_for_ensure(have, || pinned_loader(&arch))?;
-    let requested_install = resolved.filter(|(id, _)| {
-        !have || loader::is_outdated(loader::installed_version(&game_dir).as_deref(), id)
-    });
-
-    let mut pack_install = None;
-    if let Some((id, url)) = requested_install {
-        let cache = loader::loader_cache_dir(&settings::cache_dir(), &id, &arch)
-            .map_err(|error| error.to_string())?;
-        let pack_root = if let Some(root) = loader::locate_pack_root(&cache) {
-            Some(root)
-        } else {
-            download_loader_for_ensure(have, || {
-                http.get_bytes(&url).map_err(|error| error.to_string())
-            })?
-            .map(|bytes| {
-                loader::publish_pack_cache(&bytes, &cache).map_err(|error| error.to_string())
-            })
-            .transpose()?
-        };
-        if let Some(pack_root) = pack_root {
-            pack_install = Some((pack_root, id));
-        }
-    }
-
-    let needs_fix = apply_doorstop_fix && !doorstop_fix_is_current(&game_dir, &arch);
-    if pack_install.is_none() && !needs_fix {
-        return Ok(());
-    }
-    if let Some(reporter) = reporter {
-        reporter.stage(
-            "finalizing",
-            "Publishing and configuring the BepInEx loader",
-        );
-    }
-    let fix = if apply_doorstop_fix {
-        Some(download_doorstop_fix(http)?)
-    } else {
-        None
-    };
-    game_is_stopped()?;
-    install_loader_and_optional_fix(
-        &game_dir,
-        pack_install
-            .as_ref()
-            .map(|(root, version)| (root.as_path(), version.as_str())),
-        fix.as_deref(),
-    )
-}
-
-/// Force a fresh BepInEx download and rollback-safe replacement while keeping
-/// profile plugins and the prior working loader intact on failure.
-fn reinstall_loader_impl(
-    game_path: &str,
-    profile_id: &str,
-    _arch: &str,
-    apply_doorstop_fix: bool,
-    use_latest_loader: bool,
-) -> Result<(), String> {
-    game_is_stopped()?;
-    let game_dir = validate_game_target(game_path, Some(profile_id))?;
-    restore_doorstop(&game_dir)?;
-    validate_game_dir(&game_dir)?;
-    let root = settings::profiles_root();
-    let profile = recovered_profile_store(&root)?
-        .load(profile_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "profile not found".to_string())?;
-    if profile_uses_tou_mira(&profile) {
-        return Err(
-            "Town of Us owns this profile's BepInEx build. Reinstall or change the Town of Us release instead."
-                .into(),
-        );
-    }
-    let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
-        .map(arch_str)
-        .ok_or("Among Us executable architecture is unsupported")?;
-    let http = http()?;
-    let (version, url) = if use_latest_loader {
-        resolve_loader(&http, &arch)?
-    } else {
-        pinned_loader(&arch)?
-    };
-    let bytes = http.get_bytes(&url).map_err(|error| error.to_string())?;
-    let cache = loader::loader_cache_dir(&settings::cache_dir(), &version, &arch)
-        .map_err(|error| error.to_string())?;
-    let pack_root =
-        loader::publish_pack_cache(&bytes, &cache).map_err(|error| error.to_string())?;
-    let fix = apply_doorstop_fix
-        .then(|| download_doorstop_fix(&http))
-        .transpose()?;
-    game_is_stopped()?;
-    install_loader_and_optional_fix(&game_dir, Some((&pack_root, &version)), fix.as_deref())
-}
-
 // ---------- settings + detection ----------
 
-#[tauri::command]
-pub async fn detect_games() -> Result<Vec<game::GameInstall>, String> {
-    blocking(|| Ok(game::locate_all())).await
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameInstallView {
+    #[serde(flatten)]
+    install: game::GameInstall,
+    source_clean: bool,
+    source_mod_artifacts: Vec<String>,
+}
+
+fn game_install_view(install: game::GameInstall) -> Result<GameInstallView, String> {
+    let artifacts = managed_instance::source_mod_artifacts(&install.path)?;
+    Ok(GameInstallView {
+        install,
+        source_clean: artifacts.is_empty(),
+        source_mod_artifacts: artifacts,
+    })
+}
+fn fresh_game_install_view(install: game::GameInstall) -> Result<Option<GameInstallView>, String> {
+    game_install_view(install).map(|view| view.source_clean.then_some(view))
 }
 
 #[tauri::command]
-pub async fn inspect_game(game_path: String) -> Result<game::GameInstall, String> {
+pub async fn detect_games() -> Result<Vec<GameInstallView>, String> {
+    blocking(|| {
+        game::locate_all()
+            .into_iter()
+            .filter_map(|install| fresh_game_install_view(install).transpose())
+            .collect()
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn inspect_game(game_path: String) -> Result<GameInstallView, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
         let canonical = canonical_game_path(Path::new(&game_path))?;
@@ -2065,7 +1746,7 @@ pub async fn inspect_game(game_path: String) -> Result<game::GameInstall, String
             .lock()
             .map_err(|_| "inspected game lock is poisoned")?
             .insert(canonical.clone());
-        Ok(game::GameInstall {
+        game_install_view(game::GameInstall {
             path: canonical.clone(),
             store,
             arch,
@@ -2111,6 +1792,11 @@ pub async fn save_settings(
             }
         }
         let previous_settings = settings::load().map_err(|error| error.to_string())?;
+        if settings.storage_path != previous_settings.storage_path {
+            return Err(
+                "Use the storage location controls to move Perfect Sync data safely.".into(),
+            );
+        }
         let mut ids = HashSet::new();
         let mut paths = Vec::<PathBuf>::new();
         for instance in &mut settings.game_instances {
@@ -2267,6 +1953,171 @@ pub async fn save_settings(
             settings.active_profile = Some(active);
         }
         settings::apply_transaction(&settings, &token_action).map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn move_storage(
+    storage_path: Option<String>,
+    on_progress: Channel<OperationProgress>,
+) -> Result<SettingsView, String> {
+    blocking(move || {
+        let _guard = lock_mutations()?;
+        game_is_stopped()?;
+        let reporter = ProgressReporter::new(on_progress);
+        reporter.stage("preparing", "Validating the new storage location");
+
+        let previous = settings::load().map_err(|error| error.to_string())?;
+        let current_root = settings::managed_data_dir();
+        let current_cache = settings::cache_dir();
+        let default_root = settings::default_managed_data_dir();
+        let app_data_root = settings::app_data_dir();
+        let game_sources = previous
+            .game_instances
+            .iter()
+            .map(|instance| PathBuf::from(&instance.path))
+            .collect::<Vec<_>>();
+        let Some(target) = storage::resolve_target(
+            storage_path.as_deref(),
+            &current_root,
+            &default_root,
+            &app_data_root,
+            &game_sources,
+        )?
+        else {
+            return settings::view().map_err(|error| error.to_string());
+        };
+
+        reporter.stage(
+            "copying",
+            "Creating a verified copy of managed game data and caches",
+        );
+        let published = storage::copy_payload(
+            &current_root,
+            &current_cache,
+            &target,
+            |copied, total, message| reporter.transfer("copying", message, copied, Some(total)),
+        )?;
+        let mut updated = previous;
+        updated.storage_path = target.configured_path.clone();
+        if let Err(error) = settings::set_managed_data_dir(target.root.clone()) {
+            let rollback = storage::rollback_published(&published).err();
+            return Err(match rollback {
+                Some(rollback) => {
+                    format!("{error}; additionally could not remove the copied storage: {rollback}")
+                }
+                None => error.to_string(),
+            });
+        }
+        if let Err(error) = settings::save(&updated) {
+            let root_rollback = settings::set_managed_data_dir(current_root.clone()).err();
+            let storage_rollback = storage::rollback_published(&published).err();
+            let mut message = error.to_string();
+            if let Some(rollback) = root_rollback {
+                message.push_str(&format!(
+                    "; additionally could not restore the active storage path: {rollback}"
+                ));
+            }
+            if let Some(rollback) = storage_rollback {
+                message.push_str(&format!(
+                    "; additionally could not remove the copied storage: {rollback}"
+                ));
+            }
+            return Err(message);
+        }
+
+        reporter.stage(
+            "finalizing",
+            "Switching Perfect Sync to the relocated storage",
+        );
+        let cleanup_errors = storage::cleanup_old_payload(&current_root, &current_cache);
+        let mut view = settings::view().map_err(|error| error.to_string())?;
+        if !cleanup_errors.is_empty() {
+            view.storage_warning = Some(format!(
+                "Storage moved successfully, but the old copy could not be removed completely: {}",
+                cleanup_errors.join("; ")
+            ));
+        }
+        Ok(view)
+    })
+    .await
+}
+
+fn copy_error_log(source: &Path, destination: &Path, expected: u64) -> Result<(), String> {
+    let mut input = File::open(source)
+        .map_err(|error| format!("Could not open the BepInEx error log: {error}"))?;
+    AtomicFile::new(destination, AllowOverwrite)
+        .write(|output| {
+            let copied = io::copy(
+                &mut Read::by_ref(&mut input).take(MAX_ERROR_LOG_BYTES + 1),
+                output,
+            )?;
+            if copied != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "BepInEx error log changed while it was being exported",
+                ));
+            }
+            output.flush()?;
+            output.sync_all()
+        })
+        .map_err(|error| format!("Could not save the BepInEx error log: {error}"))
+}
+
+#[tauri::command]
+pub async fn export_error_log(destination: String) -> Result<String, String> {
+    blocking(move || {
+        let destination_path = PathBuf::from(&destination);
+        if !destination_path.is_absolute()
+            || destination_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_none_or(|extension| !extension.eq_ignore_ascii_case("log"))
+        {
+            return Err("Choose an absolute .log destination for the BepInEx error log.".into());
+        }
+        let parent = destination_path
+            .parent()
+            .ok_or("The error log destination has no parent folder.")?;
+        let parent_metadata = fs::symlink_metadata(parent)
+            .map_err(|error| format!("Could not open the error log destination: {error}"))?;
+        if is_reparse(&parent_metadata) || !parent_metadata.is_dir() {
+            return Err("Choose a regular non-linked destination folder for the error log.".into());
+        }
+        if let Ok(metadata) = fs::symlink_metadata(&destination_path) {
+            if is_reparse(&metadata) || !metadata.is_file() {
+                return Err("The error log destination is not a regular file.".into());
+            }
+        }
+
+        let _guard = lock_mutations()?;
+        let source = managed_instance::active_game_dir()
+            .join("BepInEx")
+            .join("LogOutput.log");
+        let metadata = fs::symlink_metadata(&source).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                "No BepInEx error log is available yet. Launch a managed profile, then try again."
+                    .to_string()
+            } else {
+                format!("Could not inspect the BepInEx error log: {error}")
+            }
+        })?;
+        if is_reparse(&metadata) || !metadata.is_file() || metadata.len() == 0 {
+            return Err("No usable BepInEx error log is available yet. Launch a managed profile, then try again.".into());
+        }
+        if metadata.len() > MAX_ERROR_LOG_BYTES {
+            return Err("The BepInEx error log is too large to export safely.".into());
+        }
+        if destination_path == source
+            || (destination_path.exists()
+                && fs::canonicalize(&destination_path).ok() == fs::canonicalize(&source).ok())
+        {
+            return Err("Choose a destination outside the managed game workspace.".into());
+        }
+
+        copy_error_log(&source, &destination_path, metadata.len())?;
+        Ok(destination)
     })
     .await
 }
@@ -2962,6 +2813,15 @@ impl ProgressReporter {
     fn download(&self, message: &str, bytes_received: u64, bytes_total: Option<u64>) {
         let _ = self.channel.send(OperationProgress {
             phase: "downloading".into(),
+            message: message.to_string(),
+            bytes_received: Some(bytes_received),
+            bytes_total,
+        });
+    }
+
+    fn transfer(&self, phase: &str, message: &str, bytes_received: u64, bytes_total: Option<u64>) {
+        let _ = self.channel.send(OperationProgress {
+            phase: phase.to_string(),
             message: message.to_string(),
             bytes_received: Some(bytes_received),
             bytes_total,
@@ -5467,6 +5327,9 @@ pub async fn list_unmanaged_plugins(
     blocking(move || {
         let _guard = lock_mutations()?;
         validate_profile_id(&profile_id)?;
+        if managed_instance::active_marker()?.is_some() {
+            return Ok(Vec::new());
+        }
         let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
         with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
             loader::unmanaged_plugins(&settings::profiles_root(), &profile_id, &game_dir)
@@ -5588,22 +5451,31 @@ pub async fn ensure_loader(
     blocking(move || {
         let _guard = lock_mutations()?;
         let reporter = ProgressReporter::new(on_progress);
-        let http = ProgressHttp::new(http()?, reporter.clone());
-        with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
-            ensure_loader_impl(
-                &game_path,
-                &profile_id,
-                &arch,
-                apply_doorstop_fix,
-                &http,
-                Some(&reporter),
-            )?;
-            reporter.stage("finalizing", "Configuring the game runtime");
-            let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
-            let context = runtime_context(&game_dir)?;
-            game_is_stopped()?;
-            Ok(configure_runtime_override(&context).err())
-        })
+        let profiles_root = settings::profiles_root();
+        let profile_store = recovered_profile_store(&profiles_root)?;
+        let profile = profile_store
+            .load(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("profile not found")?;
+        let instance = profile_game_instance(&game_path, &profile)?;
+        if arch_str(instance.arch) != arch {
+            return Err("requested loader architecture does not match the game source".into());
+        }
+        if profile_uses_tou_mira(&profile) && apply_doorstop_fix {
+            return Err(
+                "Town of Us includes its own UnityDoorstop build; the separate compatibility fix cannot be applied."
+                    .into(),
+            );
+        }
+        let profile_root = profile_store
+            .profile_dir(&profile_id)
+            .map_err(|error| error.to_string())?;
+        managed_instance::save_loader_preference(
+            &profile_root,
+            apply_doorstop_fix,
+            Some(PINNED_LOADER_VERSION.to_string()),
+        )?;
+        prepare_profile(&game_path, &profile_id, Some(&reporter), false)
     })
     .await
 }
@@ -5618,19 +5490,42 @@ pub async fn reinstall_loader(
 ) -> Result<Option<String>, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        with_existing_profile_layout(&settings::profiles_root(), &profile_id, || {
-            reinstall_loader_impl(
-                &game_path,
-                &profile_id,
-                &arch,
-                apply_doorstop_fix,
-                use_latest_loader,
-            )?;
-            let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
-            let context = runtime_context(&game_dir)?;
-            game_is_stopped()?;
-            Ok(configure_runtime_override(&context).err())
-        })
+        game_is_stopped()?;
+        let profiles_root = settings::profiles_root();
+        let profile_store = recovered_profile_store(&profiles_root)?;
+        let profile = profile_store
+            .load(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("profile not found")?;
+        let instance = profile_game_instance(&game_path, &profile)?;
+        if arch_str(instance.arch) != arch {
+            return Err("requested loader architecture does not match the game source".into());
+        }
+        if profile_uses_tou_mira(&profile) {
+            return Err(
+                "Town of Us owns this profile's BepInEx build. Reinstall or change the Town of Us release instead."
+                    .into(),
+            );
+        }
+        let http = http()?;
+        let (version, url) = if use_latest_loader {
+            resolve_loader(&http, &arch)?
+        } else {
+            pinned_loader(&arch)?
+        };
+        let bytes = http.get_bytes(&url).map_err(|error| error.to_string())?;
+        let cache = loader::loader_cache_dir(&settings::cache_dir(), &version, &arch)
+            .map_err(|error| error.to_string())?;
+        loader::publish_pack_cache(&bytes, &cache).map_err(|error| error.to_string())?;
+        let profile_root = profile_store
+            .profile_dir(&profile_id)
+            .map_err(|error| error.to_string())?;
+        managed_instance::save_loader_preference(
+            &profile_root,
+            apply_doorstop_fix,
+            Some(version),
+        )?;
+        prepare_profile(&game_path, &profile_id, None, true)
     })
     .await
 }
@@ -5650,6 +5545,8 @@ pub struct LoaderStatus {
     pub game_plugins: usize,
     pub runtime: Runtime,
     pub runtime_ready: bool,
+    pub workspace_ready: bool,
+    pub workspace_path: Option<String>,
 }
 
 #[tauri::command]
@@ -5657,18 +5554,18 @@ pub async fn loader_status(game_path: String, profile_id: String) -> Result<Load
     blocking(move || {
         let _guard = lock_mutations()?;
         validate_profile_id(&profile_id)?;
-        let game = validate_game_target(&game_path, Some(&profile_id))?;
+        let source = validate_game_target(&game_path, Some(&profile_id))?;
         let root = settings::profiles_root();
-        let store = recovered_profile_store(&root)?;
-        store
+        let profile_store = recovered_profile_store(&root)?;
+        let profile = profile_store
             .load(&profile_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "profile not found".to_string())?;
-        let profile_plugins = store
+        let instance = profile_game_instance(&game_path, &profile)?;
+        let profile_root = profile_store
             .profile_dir(&profile_id)
-            .map_err(|error| error.to_string())?
-            .join("BepInEx")
-            .join("plugins");
+            .map_err(|error| error.to_string())?;
+        let profile_plugins = profile_root.join("BepInEx").join("plugins");
         let count_dll = |directory: PathBuf| -> Result<usize, String> {
             let entries = match fs::read_dir(directory) {
                 Ok(entries) => entries,
@@ -5691,47 +5588,49 @@ pub async fn loader_status(game_path: String, profile_id: String) -> Result<Load
             }
             Ok(count)
         };
-        let context = runtime_context(&game)?;
+        let context = compat::resolve_with_hint(&source, Some(instance.runtime));
         let runtime_ready = context.runtime == Runtime::Native
             || context
                 .prefix
                 .as_deref()
                 .is_some_and(compat::has_winhttp_override);
-        let arch = game::exe_arch(&game.join(process::GAME_EXE))
+        let arch = game::exe_arch(&source.join(process::GAME_EXE))
             .map(arch_str)
             .ok_or("Among Us executable architecture is unsupported")?;
+        let revision = managed_instance::profile_revision(&profile_root)?;
+        let workspace = managed_instance::active_game_dir();
+        let workspace_ready = managed_instance::active_marker()?.is_some_and(|marker| {
+            marker.game_instance_id == instance.id
+                && marker.profile_id == profile_id
+                && marker.profile_revision == revision
+        });
+        let inspected = workspace_ready.then_some(workspace.as_path());
         Ok(LoaderStatus {
             game_found: true,
-            winhttp: game.join("winhttp.dll").is_file(),
-            preloader: game
-                .join("BepInEx")
-                .join("core")
-                .join(loader::IL2CPP_PRELOADER)
-                .is_file(),
-            current: loader::has_loader(&game),
-            installed_version: loader::installed_version(&game),
-            doorstop_fix: doorstop_fix_is_current(&game, &arch),
-            dotnet: game.join("dotnet").join("coreclr.dll").is_file(),
-            steam_appid: game.join("steam_appid.txt").is_file(),
+            winhttp: inspected.is_some_and(|game| game.join("winhttp.dll").is_file()),
+            preloader: inspected.is_some_and(|game| {
+                game.join("BepInEx")
+                    .join("core")
+                    .join(loader::IL2CPP_PRELOADER)
+                    .is_file()
+            }),
+            current: inspected.is_some_and(loader::has_loader),
+            installed_version: inspected.and_then(loader::installed_version),
+            doorstop_fix: inspected.is_some_and(|game| doorstop_fix_is_current(game, &arch)),
+            dotnet: inspected.is_some_and(|game| game.join("dotnet").join("coreclr.dll").is_file()),
+            steam_appid: inspected.is_some_and(|game| game.join("steam_appid.txt").is_file()),
             profile_plugins: count_dll(profile_plugins)?,
-            game_plugins: count_dll(game.join("BepInEx").join("plugins"))?,
+            game_plugins: inspected
+                .map(|game| count_dll(game.join("BepInEx").join("plugins")))
+                .transpose()?
+                .unwrap_or(0),
             runtime: context.runtime,
             runtime_ready,
+            workspace_ready,
+            workspace_path: workspace_ready.then(|| workspace.to_string_lossy().into_owned()),
         })
     })
     .await
-}
-
-/// A game copy in a location apps can't write (Microsoft Store / Game Pass lives
-/// under the ACL-locked WindowsApps). Returns guidance instead of letting the
-/// install fail later with a raw permission error.
-fn protected_install_hint(game_dir: &Path) -> Option<String> {
-    let path = game_dir.to_string_lossy().replace('\\', "/").to_lowercase();
-    if path.contains("/windowsapps/") || path.ends_with("/windowsapps") {
-        Some("This Among Us copy is in the protected WindowsApps folder (Microsoft Store / Game Pass), which apps can't modify. Copy the \"Among Us\" folder to a normal location (e.g. your Documents), then point Perfect Sync at that copy.".to_string())
-    } else {
-        None
-    }
 }
 
 fn load_tou_package_bytes(
@@ -5782,49 +5681,117 @@ fn load_tou_package_bytes(
     Ok(bytes)
 }
 
-fn require_authoritative_plugin_set(
-    profiles_root: &Path,
-    profile_id: &str,
-    game_dir: &Path,
-) -> Result<(), String> {
-    let unmanaged = loader::unmanaged_plugins(profiles_root, profile_id, game_dir)
-        .map_err(|error| error.to_string())?;
-    if unmanaged.is_empty() {
-        return Ok(());
+fn profile_game_instance(
+    game_path: &str,
+    profile: &ProfileRecord,
+) -> Result<settings::GameInstance, String> {
+    let canonical = validate_game_target(game_path, Some(&profile.id))?;
+    let saved = settings::load().map_err(|error| error.to_string())?;
+    let instance = match profile.game_instance_id.as_deref() {
+        Some(instance_id) => saved
+            .game_instances
+            .iter()
+            .find(|instance| instance.id == instance_id),
+        None => saved.game_instances.first(),
     }
-    let names = unmanaged
-        .iter()
-        .take(3)
-        .map(|plugin| plugin.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let remaining = unmanaged.len().saturating_sub(3);
-    Err(format!(
-        "{} unmanaged plugin{} will also load: {}{}. Review or quarantine them before synchronizing this profile.",
-        unmanaged.len(),
-        if unmanaged.len() == 1 { "" } else { "s" },
-        names,
-        if remaining == 0 {
-            String::new()
-        } else {
-            format!(" and {remaining} more")
-        }
-    ))
+    .ok_or("profile refers to an unknown game instance")?;
+    if !same_path(Path::new(&instance.path), &canonical) {
+        return Err("game folder does not match the profile's saved source".into());
+    }
+    Ok(instance.clone())
 }
 
-fn prepare_profile(game_path: &str, profile_id: &str) -> Result<Option<String>, String> {
-    game_is_stopped()?;
-    let game_dir = validate_game_target(game_path, Some(profile_id))?;
-    let arch = game::exe_arch(&game_dir.join(process::GAME_EXE))
-        .map(arch_str)
-        .ok_or("Among Us executable architecture is unsupported")?;
-    let preserve_doorstop_fix = doorstop_fix_is_current(&game_dir, &arch);
+fn registered_game_instance(game_path: &str) -> Result<settings::GameInstance, String> {
+    let canonical = validate_game_target(game_path, None)?;
+    settings::load()
+        .map_err(|error| error.to_string())?
+        .game_instances
+        .into_iter()
+        .find(|instance| same_path(Path::new(&instance.path), &canonical))
+        .ok_or_else(|| "game source is not registered".to_string())
+}
+
+fn cached_loader_pack(
+    arch: &str,
+    preference: &managed_instance::LoaderPreference,
+) -> Result<(PathBuf, String), String> {
+    let version = preference
+        .loader_version
+        .clone()
+        .unwrap_or_else(|| PINNED_LOADER_VERSION.to_string());
+    let cache = loader::loader_cache_dir(&settings::cache_dir(), &version, arch)
+        .map_err(|error| error.to_string())?;
+    if let Some(root) = loader::locate_pack_root(&cache) {
+        return Ok((root, version));
+    }
+    if version != PINNED_LOADER_VERSION {
+        return Err(format!(
+            "The cached experimental BepInEx build {version} is unavailable. Reinstall it or use the pinned build."
+        ));
+    }
+    let (_, url) = pinned_loader(arch)?;
+    let bytes = http()?.get_bytes(&url).map_err(|error| error.to_string())?;
+    let root = loader::publish_pack_cache(&bytes, &cache).map_err(|error| error.to_string())?;
+    Ok((root, version))
+}
+
+fn prepare_profile(
+    game_path: &str,
+    profile_id: &str,
+    reporter: Option<&ProgressReporter>,
+    force_rebuild: bool,
+) -> Result<Option<String>, String> {
+    prepare_profile_with_guard(
+        game_path,
+        profile_id,
+        reporter,
+        force_rebuild,
+        game_is_stopped,
+    )
+}
+
+fn prepare_profile_with_guard(
+    game_path: &str,
+    profile_id: &str,
+    reporter: Option<&ProgressReporter>,
+    force_rebuild: bool,
+    process_guard: impl Fn() -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    process_guard()?;
     let profiles_root = settings::profiles_root();
-    let profile = recovered_profile_store(&profiles_root)?
+    let profile_store = recovered_profile_store(&profiles_root)?;
+    let profile = profile_store
         .load(profile_id)
         .map_err(|error| error.to_string())?
         .ok_or("profile not found")?;
-    require_authoritative_plugin_set(&profiles_root, profile_id, &game_dir)?;
+    let mut instance = profile_game_instance(game_path, &profile)?;
+    let source = canonical_game_path(Path::new(&instance.path))?;
+    instance.build = game::detect_build(&source);
+    let source_arch = game::exe_arch(&source.join(process::GAME_EXE))
+        .map(arch_str)
+        .ok_or("Among Us executable architecture is unsupported")?;
+    if source_arch != arch_str(instance.arch) {
+        return Err("saved game architecture no longer matches the selected source".into());
+    }
+
+    if let Some(reporter) = reporter {
+        reporter.stage(
+            "preparing",
+            "Creating or validating the private clean game base",
+        );
+    }
+    managed_instance::capture_active_config(&profiles_root)?;
+    let base = managed_instance::ensure_base(&instance, profile.game_build.as_deref())?;
+    let profile_root = profile_store
+        .profile_dir(profile_id)
+        .map_err(|error| error.to_string())?;
+    with_profile_layout(&profiles_root, profile_id, || Ok(()))?;
+    let revision = managed_instance::profile_revision(&profile_root)?;
+    if !force_rebuild && managed_instance::active_matches(&base, profile_id, &revision)? {
+        let context = compat::resolve_with_hint(&source, Some(instance.runtime));
+        return Ok(configure_runtime_override(&context).err());
+    }
+
     let active_tou = profile
         .mods
         .iter()
@@ -5838,71 +5805,104 @@ fn prepare_profile(game_path: &str, profile_id: &str) -> Result<Option<String>, 
                 .ok_or("Town of Us profile is missing its exact release asset")
         })
         .transpose()?;
-    let tou_current = !preserve_doorstop_fix
-        && tou_key
-            .as_deref()
-            .map(|key| loader::tou_package_is_current(&game_dir, key))
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .unwrap_or(false);
-    let tou_package = if let Some(installed) = active_tou.filter(|_| !tou_current) {
-        let (store, runtime) = profile_store_runtime(profile_id)?;
-        Some(load_tou_package_bytes(installed, &arch, store, runtime)?)
+    let tou_package = active_tou
+        .map(|installed| {
+            load_tou_package_bytes(installed, &source_arch, instance.store, instance.runtime)
+        })
+        .transpose()?;
+    let shadowed_plugin_files = tou_shadowed_plugin_files(&profile);
+    let preference = managed_instance::loader_preference(&profile_root)?;
+    let loader_pack = if active_tou.is_none() {
+        Some(cached_loader_pack(&source_arch, &preference)?)
     } else {
         None
     };
-    let shadowed_plugin_files = tou_shadowed_plugin_files(&profile);
+    let doorstop_fix = if active_tou.is_none() && preference.apply_doorstop_fix {
+        Some(download_doorstop_fix(&http()?)?)
+    } else {
+        None
+    };
 
-    with_profile_layout(&profiles_root, profile_id, || {
-        game_artifact_transaction(&game_dir, || {
-            restore_doorstop(&game_dir)?;
-            game_is_stopped()?;
-            if active_tou.is_some() {
-                if let Some(bytes) = tou_package.as_deref() {
-                    tou_cosmetics::remove_managed_files(&game_dir.join("BepInEx").join("plugins"))
-                        .map_err(|error| error.to_string())?;
-                    loader::install_tou_package(
-                        bytes,
-                        &game_dir,
-                        tou_key
-                            .as_deref()
-                            .ok_or("Town of Us package key is missing")?,
-                        PINNED_LOADER_VERSION,
-                    )
-                    .map_err(|error| error.to_string())?;
-                }
-            } else {
-                tou_cosmetics::remove_managed_files(&game_dir.join("BepInEx").join("plugins"))
-                    .map_err(|error| error.to_string())?;
-                loader::remove_tou_package(&game_dir).map_err(|error| error.to_string())?;
-            }
-            loader::sync_profile_plugins_shadowing(
-                &profiles_root,
-                profile_id,
-                &game_dir,
-                &shadowed_plugin_files,
+    if let Some(reporter) = reporter {
+        reporter.stage(
+            "preparing",
+            format!("Building an isolated {} workspace", profile.name),
+        );
+    }
+    process_guard()?;
+    let stage = managed_instance::begin_workspace(&base)?;
+    let result = (|| {
+        if let Some(bytes) = tou_package.as_deref() {
+            loader::install_tou_package(
+                bytes,
+                &stage,
+                tou_key
+                    .as_deref()
+                    .ok_or("Town of Us package key is missing")?,
+                PINNED_LOADER_VERSION,
             )
             .map_err(|error| error.to_string())?;
-            loader::sync_levelimposter_maps(&profiles_root, profile_id, &game_dir)
+        } else {
+            let (pack_root, version) = loader_pack
+                .as_ref()
+                .ok_or("BepInEx loader package is missing")?;
+            loader::install_pack(pack_root, &stage, version).map_err(|error| error.to_string())?;
+            if let Some(bytes) = doorstop_fix.as_deref() {
+                loader::install_windows_doorstop_patch(
+                    bytes,
+                    &stage,
+                    DOORSTOP_FIX_VERSION,
+                    &source_arch,
+                )
                 .map_err(|error| error.to_string())?;
-            let loader_http = http()?;
-            ensure_loader_impl(
-                game_path,
-                profile_id,
-                &arch,
-                active_tou.is_none() && preserve_doorstop_fix,
-                &loader_http,
-                None,
-            )?;
-            game_is_stopped()?;
-            loader::ensure_steam_appid(&game_dir).map_err(|error| error.to_string())?;
-            game_is_stopped()?;
-            loader::write_console_off(&game_dir).map_err(|error| error.to_string())?;
-            let context = runtime_context(&game_dir)?;
-            game_is_stopped()?;
-            Ok(configure_runtime_override(&context).err())
-        })
-    })
+            }
+        }
+        loader::sync_profile_plugins_shadowing(
+            &profiles_root,
+            profile_id,
+            &stage,
+            &shadowed_plugin_files,
+        )
+        .map_err(|error| error.to_string())?;
+        loader::sync_levelimposter_maps(&profiles_root, profile_id, &stage)
+            .map_err(|error| error.to_string())?;
+        managed_instance::overlay_profile_config(&profile_root, &stage)?;
+        loader::ensure_steam_appid(&stage).map_err(|error| error.to_string())?;
+        loader::write_console_off(&stage).map_err(|error| error.to_string())?;
+        process_guard()?;
+        if let Some(reporter) = reporter {
+            reporter.stage(
+                "finalizing",
+                "Verifying and publishing the isolated workspace",
+            );
+        }
+        managed_instance::publish_workspace(&stage, &base, profile_id, &revision)?;
+        let context = compat::resolve_with_hint(&source, Some(instance.runtime));
+        Ok(configure_runtime_override(&context).err())
+    })();
+    if result.is_err() && stage.exists() {
+        let _ = managed_instance::discard_workspace(&stage);
+    }
+    result
+}
+
+fn prepare_vanilla(game_path: &str) -> Result<(PathBuf, settings::GameInstance), String> {
+    game_is_stopped()?;
+    let mut instance = registered_game_instance(game_path)?;
+    let source = canonical_game_path(Path::new(&instance.path))?;
+    instance.build = game::detect_build(&source);
+    managed_instance::capture_active_config(&settings::profiles_root())?;
+    let base = managed_instance::ensure_base(&instance, None)?;
+    let revision = sha256_hex(format!("vanilla\\0{}", base.record.id).as_bytes());
+    if !managed_instance::active_matches(&base, "_vanilla", &revision)? {
+        let stage = managed_instance::begin_workspace(&base)?;
+        let result = managed_instance::publish_workspace(&stage, &base, "_vanilla", &revision);
+        if result.is_err() && stage.exists() {
+            let _ = managed_instance::discard_workspace(&stage);
+        }
+        result?;
+    }
+    Ok((managed_instance::active_game_dir(), instance))
 }
 
 fn require_launch_ready(guidance: Option<String>) -> Result<(), String> {
@@ -5913,39 +5913,17 @@ fn require_launch_ready(guidance: Option<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn sync_profile(game_path: String, profile_id: String) -> Result<Option<String>, String> {
+pub async fn sync_profile(
+    game_path: String,
+    profile_id: String,
+    on_progress: Channel<OperationProgress>,
+) -> Result<Option<String>, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        prepare_profile(&game_path, &profile_id)
+        let reporter = ProgressReporter::new(on_progress);
+        prepare_profile(&game_path, &profile_id, Some(&reporter), false)
     })
     .await
-}
-
-fn launch_store(game_path: &Path) -> Result<Store, String> {
-    Ok(settings::load()
-        .map_err(|error| error.to_string())?
-        .game_instances
-        .into_iter()
-        .find(|instance| same_path(Path::new(&instance.path), game_path))
-        .map(|instance| instance.store)
-        .unwrap_or_else(|| inferred_store(game_path)))
-}
-
-fn registered_steam_client(game_dir: &Path) -> Option<PathBuf> {
-    let client = game::native_steam_client_for_install(game_dir)?;
-    let metadata = fs::symlink_metadata(&client).ok()?;
-    (!is_reparse(&metadata) && metadata.is_file()).then_some(client)
-}
-
-fn launch_steam_app(client: &Path) -> Result<(), String> {
-    spawn_launch(|| {
-        process::command(client)
-            .args(["-applaunch", game::STEAM_APP_ID])
-            .stdin(std::process::Stdio::null())
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("couldn't launch the registered Steam install: {error}"))
-    })
 }
 
 const EPIC_STARTER_URL: &str =
@@ -6148,14 +6126,19 @@ fn prepare_epic_auth_stores(
     Ok(())
 }
 
-fn launch_prepared_game(game_dir: &Path) -> Result<(), String> {
-    let store = launch_store(game_dir)?;
-    if store == Store::Steam {
-        if let Some(client) = registered_steam_client(game_dir) {
-            return launch_steam_app(&client);
-        }
+fn validate_managed_launch_target(game_dir: &Path) -> Result<(), String> {
+    let active = managed_instance::active_game_dir();
+    if !same_path(game_dir, &active) {
+        return Err("refusing to launch outside the managed workspace".into());
     }
-    let context = runtime_context(game_dir)?;
+    managed_instance::active_marker()?.ok_or("the managed workspace has no validated marker")?;
+    validate_game_dir(game_dir)
+}
+
+fn launch_prepared_game(game_dir: &Path, instance: &settings::GameInstance) -> Result<(), String> {
+    validate_managed_launch_target(game_dir)?;
+    let store = instance.store;
+    let context = compat::resolve_with_hint(Path::new(&instance.path), Some(instance.runtime));
     if store == Store::Epic {
         let starter = ensure_epic_starter(&http()?, game_dir)?;
         prepare_epic_auth_stores(game_dir, &context)?;
@@ -6177,13 +6160,12 @@ fn launch_prepared_game(game_dir: &Path) -> Result<(), String> {
     if store == Store::Msstore {
         if !game::is_writable_game_dir(game_dir) {
             return Err(
-                "Microsoft Store/Game Pass installs must be launched from a writable managed copy. Create one in Settings first."
-                    .into(),
+                "Microsoft Store/Game Pass installs must use a writable managed workspace.".into(),
             );
         }
         if game::exe_arch(&game_dir.join(process::GAME_EXE)) != Some(Arch::X64) {
             return Err(
-                "This saved Microsoft Store instance is not the expected x64 Among Us build. Re-detect the game or create a fresh managed copy."
+                "The managed Microsoft Store workspace is not the expected x64 Among Us build."
                     .into(),
             );
         }
@@ -6200,10 +6182,15 @@ fn launch_prepared_game(game_dir: &Path) -> Result<(), String> {
 pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(), String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        require_launch_ready(prepare_profile(&game_path, &profile_id)?)?;
+        require_launch_ready(prepare_profile(&game_path, &profile_id, None, false)?)?;
         game_is_stopped()?;
-        let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
-        launch_prepared_game(&game_dir)
+        let profile = recovered_profile_store(&settings::profiles_root())?
+            .load(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("profile not found")?;
+        let instance = profile_game_instance(&game_path, &profile)?;
+        let game_dir = managed_instance::active_game_dir();
+        launch_prepared_game(&game_dir, &instance)
     })
     .await
 }
@@ -6212,9 +6199,9 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
 pub async fn launch_vanilla(game_path: String) -> Result<(), String> {
     blocking(move || {
         let _guard = lock_mutations()?;
+        let (game_dir, instance) = prepare_vanilla(&game_path)?;
         game_is_stopped()?;
-        let game_dir = validate_game_target(&game_path, None)?;
-        launch_without_doorstop(&game_dir, || launch_prepared_game(&game_dir))
+        launch_prepared_game(&game_dir, &instance)
     })
     .await
 }
@@ -6587,38 +6574,47 @@ fn diagnostics_report_impl(profile_id: Option<&str>) -> Result<DiagnosticsReport
     let mut warnings = Vec::new();
     let mut loader_status = None;
     let mut log_errors = Vec::new();
+    let active_marker = managed_instance::active_marker()?;
     let game_status = if let Some(instance) = instance {
         match canonical_game_path(Path::new(&instance.path)) {
             Ok(game_dir) => {
                 let build = game::detect_build(&game_dir);
                 let writable = game::is_writable_game_dir(&game_dir);
-                if !writable {
-                    warnings.push(
-                        "This game folder is not writable; create a managed Microsoft Store copy."
-                            .to_string(),
-                    );
-                }
+                let workspace_dir = profile.as_ref().and_then(|profile| {
+                    active_marker
+                        .as_ref()
+                        .filter(|marker| marker.profile_id == profile.id)
+                        .map(|_| managed_instance::active_game_dir())
+                });
                 if let Some(profile) = profile.as_ref() {
                     let profile_dir = profile_store
                         .profile_dir(&profile.id)
                         .map_err(|error| error.to_string())?;
-                    loader_status = Some(DiagnosticLoader {
-                        current: loader::has_loader(&game_dir),
-                        installed_version: loader::installed_version(&game_dir),
-                        winhttp: game_dir.join("winhttp.dll").is_file(),
-                        preloader: game_dir
-                            .join("BepInEx")
-                            .join("core")
-                            .join(loader::IL2CPP_PRELOADER)
-                            .is_file(),
-                        dotnet: game_dir.join("dotnet").join("coreclr.dll").is_file(),
-                        profile_plugins: count_dll_files(
-                            &profile_dir.join("BepInEx").join("plugins"),
-                        )?,
-                        game_plugins: count_dll_files(&game_dir.join("BepInEx").join("plugins"))?,
-                    });
+                    if let Some(workspace) = workspace_dir.as_ref() {
+                        loader_status = Some(DiagnosticLoader {
+                            current: loader::has_loader(workspace),
+                            installed_version: loader::installed_version(workspace),
+                            winhttp: workspace.join("winhttp.dll").is_file(),
+                            preloader: workspace
+                                .join("BepInEx")
+                                .join("core")
+                                .join(loader::IL2CPP_PRELOADER)
+                                .is_file(),
+                            dotnet: workspace.join("dotnet").join("coreclr.dll").is_file(),
+                            profile_plugins: count_dll_files(
+                                &profile_dir.join("BepInEx").join("plugins"),
+                            )?,
+                            game_plugins: count_dll_files(
+                                &workspace.join("BepInEx").join("plugins"),
+                            )?,
+                        });
+                        log_errors = recent_log_errors(workspace, &saved)?;
+                    } else {
+                        warnings.push(
+                            "This profile's isolated workspace has not been prepared.".to_string(),
+                        );
+                    }
                 }
-                log_errors = recent_log_errors(&game_dir, &saved)?;
                 Some(DiagnosticGame {
                     name: instance.name.clone(),
                     store: instance.store,
@@ -6639,7 +6635,9 @@ fn diagnostics_report_impl(profile_id: Option<&str>) -> Result<DiagnosticsReport
     };
     if let Some(loader) = loader_status.as_ref() {
         if !loader.current || !loader.winhttp || !loader.preloader || !loader.dotnet {
-            warnings.push("BepInEx is incomplete or not current for this game folder.".to_string());
+            warnings.push(
+                "BepInEx is incomplete or not current in the isolated workspace.".to_string(),
+            );
         }
     }
     let game_running = match process::try_is_running() {
@@ -6823,6 +6821,42 @@ mod tests {
         ) -> Result<Vec<u8>, perfect_sync_core::resolver::ResolveError> {
             Ok(self.bytes.to_vec())
         }
+    }
+
+    #[test]
+    fn automatic_detection_excludes_modded_game_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let clean = temp.path().join("clean");
+        let modded = temp.path().join("modded");
+        fs::create_dir_all(&clean).unwrap();
+        fs::create_dir_all(modded.join("BepInEx")).unwrap();
+        let install = |path: PathBuf| game::GameInstall {
+            path,
+            store: Store::Steam,
+            arch: Arch::X86,
+            runtime: Runtime::Native,
+            build: Some("test".into()),
+            writable: true,
+        };
+
+        assert!(fresh_game_install_view(install(clean)).unwrap().is_some());
+        assert!(fresh_game_install_view(install(modded)).unwrap().is_none());
+    }
+
+    #[test]
+    fn error_log_copy_replaces_destination_with_exact_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("LogOutput.log");
+        let destination = temp.path().join("export.log");
+        fs::write(&source, b"BepInEx failure details\n").unwrap();
+        fs::write(&destination, b"stale\n").unwrap();
+
+        copy_error_log(&source, &destination, fs::metadata(&source).unwrap().len()).unwrap();
+
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"BepInEx failure details\n"
+        );
     }
 
     #[test]
@@ -7455,83 +7489,6 @@ mod tests {
     }
 
     #[test]
-    fn vanilla_doorstop_move_is_reversible_and_owned() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(temp.path().join("BepInEx")).unwrap();
-        fs::write(
-            temp.path().join("BepInEx").join(APP_LOADER_MARKER),
-            b"owned",
-        )
-        .unwrap();
-        fs::write(temp.path().join("winhttp.dll"), b"doorstop").unwrap();
-        assert!(disable_doorstop(temp.path()).unwrap());
-        assert!(!temp.path().join("winhttp.dll").exists());
-        assert_eq!(
-            fs::read(temp.path().join(DISABLED_DOORSTOP)).unwrap(),
-            b"doorstop"
-        );
-        restore_doorstop(temp.path()).unwrap();
-        assert_eq!(
-            fs::read(temp.path().join("winhttp.dll")).unwrap(),
-            b"doorstop"
-        );
-    }
-
-    #[test]
-    fn vanilla_launch_blocks_unowned_loader_and_only_rolls_back_its_own_move() {
-        use std::cell::Cell;
-
-        let unowned = tempfile::tempdir().unwrap();
-        fs::write(unowned.path().join("winhttp.dll"), b"foreign").unwrap();
-        let launched = Cell::new(false);
-        let error = launch_without_doorstop(unowned.path(), || {
-            launched.set(true);
-            Ok(())
-        })
-        .unwrap_err();
-        assert!(error.contains("unowned winhttp.dll"));
-        assert!(!launched.get());
-
-        let already_disabled = tempfile::tempdir().unwrap();
-        fs::create_dir_all(already_disabled.path().join("BepInEx")).unwrap();
-        fs::write(
-            already_disabled
-                .path()
-                .join("BepInEx")
-                .join(APP_LOADER_MARKER),
-            b"owned",
-        )
-        .unwrap();
-        fs::write(already_disabled.path().join(DISABLED_DOORSTOP), b"disabled").unwrap();
-        assert_eq!(
-            launch_without_doorstop(already_disabled.path(), || Err("spawn failed".into()))
-                .unwrap_err(),
-            "spawn failed"
-        );
-        assert!(already_disabled.path().join(DISABLED_DOORSTOP).exists());
-        assert!(!already_disabled.path().join("winhttp.dll").exists());
-
-        let disabled_here = tempfile::tempdir().unwrap();
-        fs::create_dir_all(disabled_here.path().join("BepInEx")).unwrap();
-        fs::write(
-            disabled_here.path().join("BepInEx").join(APP_LOADER_MARKER),
-            b"owned",
-        )
-        .unwrap();
-        fs::write(disabled_here.path().join("winhttp.dll"), b"owned").unwrap();
-        assert_eq!(
-            launch_without_doorstop(disabled_here.path(), || Err("spawn failed".into()))
-                .unwrap_err(),
-            "spawn failed"
-        );
-        assert_eq!(
-            fs::read(disabled_here.path().join("winhttp.dll")).unwrap(),
-            b"owned"
-        );
-        assert!(!disabled_here.path().join(DISABLED_DOORSTOP).exists());
-    }
-
-    #[test]
     fn failed_game_prepare_restores_all_touched_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("BepInEx/config")).unwrap();
@@ -7833,38 +7790,6 @@ mod tests {
     }
 
     #[test]
-    fn publication_requires_unmanaged_plugins_to_be_resolved() {
-        let temp = tempfile::tempdir().unwrap();
-        let profiles = temp.path().join("profiles");
-        let game = temp.path().join("game");
-        let game_plugins = game.join("BepInEx/plugins");
-        fs::create_dir_all(&game_plugins).unwrap();
-        profile::install_plugin_bytes(&profiles, "authoritative", "Managed.dll", b"managed")
-            .unwrap();
-        fs::write(game_plugins.join("User.dll"), b"user").unwrap();
-
-        let error =
-            require_authoritative_plugin_set(&profiles, "authoritative", &game).unwrap_err();
-
-        assert!(error.contains("1 unmanaged plugin"));
-        assert!(error.contains("User.dll"));
-        loader::quarantine_unmanaged_plugins(
-            &profiles,
-            "authoritative",
-            &game,
-            &["User.dll".into()],
-        )
-        .unwrap();
-        require_authoritative_plugin_set(&profiles, "authoritative", &game).unwrap();
-        loader::sync_profile_plugins(&profiles, "authoritative", &game).unwrap();
-        assert_eq!(
-            fs::read(game_plugins.join("Managed.dll")).unwrap(),
-            b"managed"
-        );
-        assert!(!game_plugins.join("User.dll").exists());
-    }
-
-    #[test]
     fn recovers_a_registered_game_instance_after_its_folder_is_renamed() {
         let temp = tempfile::tempdir().unwrap();
         let original = temp.path().join("Among Us copy");
@@ -7913,9 +7838,14 @@ mod tests {
     }
 
     #[test]
-    fn writable_game_folder_validation_leaves_no_probe() {
+    fn source_validation_leaves_no_probe() {
         let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join(process::GAME_EXE), b"MZ").unwrap();
+        let mut executable = vec![0_u8; 72];
+        executable[0..2].copy_from_slice(b"MZ");
+        executable[0x3c..0x40].copy_from_slice(&(64_u32).to_le_bytes());
+        executable[64..68].copy_from_slice(b"PE\0\0");
+        executable[68..70].copy_from_slice(&(0x014c_u16).to_le_bytes());
+        fs::write(temp.path().join(process::GAME_EXE), executable).unwrap();
         validate_game_dir(temp.path()).unwrap();
         assert!(fs::read_dir(temp.path()).unwrap().flatten().all(|entry| {
             !entry
@@ -7926,7 +7856,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_game_copy_preserves_tree_and_skips_internal_work_files() {
+    fn recursive_game_copy_preserves_tree_and_skips_internal_work_files() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("managed");
@@ -7979,26 +7909,6 @@ mod tests {
         assert_eq!(
             require_launch_ready(Some("configure the runtime override first".into())).unwrap_err(),
             "configure the runtime override first"
-        );
-    }
-
-    #[test]
-    fn complete_owned_loader_survives_offline_acquisition() {
-        assert_eq!(
-            resolve_loader_for_ensure(true, || Err("offline".into())).unwrap(),
-            None
-        );
-        assert_eq!(
-            download_loader_for_ensure(true, || Err("offline".into())).unwrap(),
-            None
-        );
-        assert_eq!(
-            resolve_loader_for_ensure(false, || Err("offline".into())).unwrap_err(),
-            "offline"
-        );
-        assert_eq!(
-            download_loader_for_ensure(false, || Err("offline".into())).unwrap_err(),
-            "offline"
         );
     }
 
@@ -8374,5 +8284,109 @@ mod tests {
         assert!(require_manual_install_confirmation(true).is_ok());
         let error = require_manual_install_confirmation(false).unwrap_err();
         assert!(error.contains("repository, release tag, and asset"));
+    }
+    #[test]
+    #[ignore = "requires a local Among Us source and profile fixture"]
+    fn live_managed_workspace_smoke() {
+        let app_data = PathBuf::from(std::env::var("PERFECT_SYNC_SMOKE_APP_DATA").unwrap());
+        let managed_data = PathBuf::from(std::env::var("PERFECT_SYNC_SMOKE_MANAGED_DATA").unwrap());
+        let profile_id = std::env::var("PERFECT_SYNC_SMOKE_PROFILE").unwrap();
+        let source = std::env::var("PERFECT_SYNC_SMOKE_SOURCE").unwrap();
+        settings::initialize_app_data_dir(app_data).unwrap();
+        settings::initialize_managed_data_dir(managed_data).unwrap();
+
+        let source_mira = Path::new(&source).join("BepInEx/plugins/MiraAPI.dll");
+        let source_mira_before = fs::read(&source_mira).ok();
+        prepare_profile_with_guard(&source, &profile_id, None, true, || Ok(())).unwrap();
+
+        let marker = managed_instance::active_marker().unwrap().unwrap();
+        assert_eq!(marker.profile_id, profile_id);
+        assert_ne!(
+            fs::canonicalize(managed_instance::active_game_dir()).unwrap(),
+            fs::canonicalize(&source).unwrap()
+        );
+        assert!(loader::has_loader(&managed_instance::active_game_dir()));
+        validate_managed_launch_target(&managed_instance::active_game_dir()).unwrap();
+        assert!(validate_managed_launch_target(Path::new(&source)).is_err());
+
+        let profile_record = recovered_profile_store(&settings::profiles_root())
+            .unwrap()
+            .load(&profile_id)
+            .unwrap()
+            .unwrap();
+        if let Some(installed) = profile_record
+            .mods
+            .iter()
+            .find(|installed| installed.enabled && is_tou_mira(&installed.package_id))
+        {
+            let saved = settings::load().unwrap();
+            let instance = saved
+                .game_instances
+                .iter()
+                .find(|instance| instance.id == marker.game_instance_id)
+                .unwrap();
+            let arch = arch_str(instance.arch);
+            let package =
+                load_tou_package_bytes(installed, &arch, instance.store, instance.runtime).unwrap();
+            let mut archive = zip::ZipArchive::new(Cursor::new(package)).unwrap();
+            for name in ["MiraAPI.dll", "touhats.bundle", "touhats.catalog"] {
+                let mut expected = Vec::new();
+                let mut found = false;
+                for index in 0..archive.len() {
+                    let mut entry = archive.by_index(index).unwrap();
+                    if entry
+                        .name()
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|entry_name| entry_name.eq_ignore_ascii_case(name))
+                    {
+                        entry.read_to_end(&mut expected).unwrap();
+                        found = true;
+                        break;
+                    }
+                }
+                assert!(found, "{name} missing from release package");
+                assert_eq!(
+                    fs::read(
+                        managed_instance::active_game_dir()
+                            .join("BepInEx")
+                            .join("plugins")
+                            .join(name)
+                    )
+                    .unwrap(),
+                    expected,
+                    "{name} differs from the exact release package"
+                );
+            }
+        }
+        let active_config = managed_instance::active_game_dir()
+            .join("BepInEx")
+            .join("config")
+            .join("perfect-sync-smoke.cfg");
+        fs::write(&active_config, b"profile-specific setting").unwrap();
+        managed_instance::capture_active_config(&settings::profiles_root()).unwrap();
+        assert_eq!(
+            fs::read(
+                settings::profiles_root()
+                    .join(&profile_id)
+                    .join("BepInEx")
+                    .join("config")
+                    .join("perfect-sync-smoke.cfg")
+            )
+            .unwrap(),
+            b"profile-specific setting"
+        );
+        prepare_profile_with_guard(&source, &profile_id, None, true, || Ok(())).unwrap();
+        assert_eq!(
+            fs::read(
+                managed_instance::active_game_dir()
+                    .join("BepInEx")
+                    .join("config")
+                    .join("perfect-sync-smoke.cfg")
+            )
+            .unwrap(),
+            b"profile-specific setting"
+        );
+        assert_eq!(fs::read(source_mira).ok(), source_mira_before);
     }
 }

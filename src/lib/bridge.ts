@@ -54,6 +54,12 @@ type ProgressHandler = (progress: OperationProgress) => void;
 function progressChannel(onProgress?: ProgressHandler): Channel<OperationProgress> {
   return new Channel<OperationProgress>((progress) => onProgress?.(progress));
 }
+function delay(milliseconds: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  window.setTimeout(resolve, milliseconds);
+  return promise;
+}
+
 
 
 async function simulateBrowserTransfers(
@@ -62,15 +68,11 @@ async function simulateBrowserTransfers(
 ): Promise<void> {
   if (!onProgress) return;
   onProgress?.({ phase: "resolving", message: "Resolving exact releases and dependencies" });
-  await new Promise<void>((resolve) => {
-    window.setTimeout(resolve, 160);
-  });
+  await delay(160);
   for (const [fileIndex, file] of files.entries()) {
     const bytesTotal = (3 + fileIndex) * 1024 * 1024;
     for (let chunk = 0; chunk <= 5; chunk += 1) {
-      await new Promise<void>((resolve) => {
-        window.setTimeout(resolve, 90);
-      });
+      await delay(90);
       onProgress?.({
         phase: "downloading",
         message: `Downloading ${file}`,
@@ -80,9 +82,7 @@ async function simulateBrowserTransfers(
     }
   }
   onProgress?.({ phase: "finalizing", message: "Verifying files and saving the profile" });
-  await new Promise<void>((resolve) => {
-    window.setTimeout(resolve, 180);
-  });
+  await delay(180);
 }
 
 export interface Preview {
@@ -508,9 +508,9 @@ export async function removeLevelImposterMaps(
 }
 
 /** Native folder picker (Tauri only). Returns the chosen path or null. */
-export async function pickFolder(): Promise<string | null> {
-  if (!inTauri) return null;
-  const picked = await openDialog({ directory: true, multiple: false, title: "Select your Among Us folder" });
+export async function pickFolder(title = "Select your Among Us folder"): Promise<string | null> {
+  if (!inTauri) return title.toLowerCase().includes("storage") ? "D:/Perfect Sync Storage" : null;
+  const picked = await openDialog({ directory: true, multiple: false, title });
   return typeof picked === "string" ? picked : null;
 }
 
@@ -533,36 +533,6 @@ export async function inspectGame(gamePath: string): Promise<GameInstall> {
   return { path: gamePath.trim(), store: "manual", arch: "x86", runtime: "native" };
 }
 
-/** Create a writable, managed copy of an existing Among Us installation. */
-export async function createManagedGameCopy(
-  sourcePath: string,
-  destinationParent: string,
-): Promise<GameInstall> {
-  if (inTauri) {
-    return invoke<GameInstall>("create_managed_game_copy", { sourcePath, destinationParent });
-  }
-  if (!sourcePath.trim() || !destinationParent.trim()) {
-    throw new Error("Choose the source game and a destination folder.");
-  }
-  return {
-    path: `${destinationParent.replace(/[\\/]+$/u, "")}/Among Us - Perfect Sync`,
-    store: "msstore",
-    arch: "x64",
-    runtime: "native",
-    build: "2026.3.31",
-    writable: true,
-  };
-}
-
-export async function pickManagedCopyDestination(): Promise<string | null> {
-  if (!inTauri) return "C:/Games";
-  const picked = await openDialog({
-    directory: true,
-    multiple: false,
-    title: "Choose where to create the managed Among Us copy",
-  });
-  return typeof picked === "string" ? picked : null;
-}
 
 // ------------------------------------------------------------------ catalog
 let browserCatalog = structuredClone(CATALOG);
@@ -613,12 +583,15 @@ export async function detectGames(): Promise<GameInstall[]> {
       runtime: "native",
       build: "2026.3.31",
       writable: true,
+      sourceClean: true,
+      sourceModArtifacts: [],
     },
   ];
 }
 
 let browserSettings: Settings = {
   setupComplete: true,
+  freshSourceSetupComplete: true,
   gameInstances: [
     {
       id: "steam-demo",
@@ -633,16 +606,25 @@ let browserSettings: Settings = {
       name: "Epic Games",
       path: "C:/Program Files/Epic Games/AmongUs",
       store: "epic",
-      arch: "x86",
+      arch: "x64",
       runtime: "native",
     },
   ],
   personalMods: [],
   hasGithubToken: false,
+  activeStoragePath: "C:/Users/You/AppData/Local/Perfect-Sync",
+  defaultStoragePath: "C:/Users/You/AppData/Local/Perfect-Sync",
 };
 
 function settingsPayload(settings: Settings) {
-  const { hasGithubToken: _hasGithubToken, recoveryWarning: _recoveryWarning, ...payload } = settings;
+  const {
+    hasGithubToken: _hasGithubToken,
+    recoveryWarning: _recoveryWarning,
+    activeStoragePath: _activeStoragePath,
+    defaultStoragePath: _defaultStoragePath,
+    storageWarning: _storageWarning,
+    ...payload
+  } = settings;
   return payload;
 }
 
@@ -687,6 +669,54 @@ export async function saveSettings(
     hasGithubToken,
   };
   return structuredClone(browserSettings);
+}
+
+export async function moveStorage(
+  storagePath?: string,
+  onProgress?: (progress: OperationProgress) => void,
+): Promise<Settings> {
+  if (inTauri) {
+    return invoke<Settings>("move_storage", {
+      storagePath: storagePath?.trim() || null,
+      onProgress: progressChannel(onProgress),
+    });
+  }
+  const target = storagePath?.trim() || browserSettings.defaultStoragePath;
+  onProgress?.({ phase: "preparing", message: "Validating the new storage location" });
+  await delay(120);
+  onProgress?.({
+    phase: "copying",
+    message: "Copying managed game data and package caches",
+    bytesReceived: 12 * 1024 * 1024,
+    bytesTotal: 24 * 1024 * 1024,
+  });
+  await delay(180);
+  browserSettings = {
+    ...browserSettings,
+    storagePath: target === browserSettings.defaultStoragePath ? undefined : target,
+    activeStoragePath: target,
+    storageWarning: undefined,
+  };
+  onProgress?.({ phase: "finalizing", message: "Switching to the relocated storage" });
+  return structuredClone(browserSettings);
+}
+
+function errorLogDefaultName(): string {
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/u, "Z").replaceAll(":", "-");
+  return `Perfect-Sync-Error-Log-${timestamp}.log`;
+}
+
+/** Save LogOutput.log from the active managed profile workspace. */
+export async function exportErrorLog(): Promise<string | null> {
+  const defaultPath = errorLogDefaultName();
+  if (!inTauri) return defaultPath;
+  const destination = await saveDialog({
+    title: "Save BepInEx error log",
+    defaultPath,
+    filters: [{ name: "BepInEx log", extensions: ["log"] }],
+  });
+  if (typeof destination !== "string") return null;
+  return invoke<string>("export_error_log", { destination });
 }
 
 let browserBackups: SaveBackupInfo[] = [];
@@ -1317,6 +1347,8 @@ export interface LoaderStatus {
   gamePlugins: number;
   runtime: Runtime;
   runtimeReady: boolean;
+  workspaceReady: boolean;
+  workspacePath?: string | null;
 }
 
 export async function loaderStatus(gamePath: string, profileId: string): Promise<LoaderStatus> {
@@ -1335,6 +1367,8 @@ export async function loaderStatus(gamePath: string, profileId: string): Promise
     gamePlugins: 0,
     runtime: "native",
     runtimeReady: true,
+    workspaceReady: true,
+    workspacePath: "Browser preview workspace",
   };
 }
 
@@ -1404,10 +1438,21 @@ export async function launchVanilla(gamePath: string): Promise<void> {
   beginBrowserLaunch();
 }
 
-/** Synchronize the active profile into the game folder. Returns optional runtime guidance. */
-export async function syncProfile(gamePath: string, profileId: string): Promise<string | null> {
-  if (inTauri) return invoke<string | null>("sync_profile", { gamePath, profileId });
-  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+/** Prepare the active profile in the isolated managed workspace. */
+export async function syncProfile(
+  gamePath: string,
+  profileId: string,
+  onProgress?: ProgressHandler,
+): Promise<string | null> {
+  if (inTauri) {
+    return invoke<string | null>("sync_profile", {
+      gamePath,
+      profileId,
+      onProgress: progressChannel(onProgress),
+    });
+  }
+  if (!gamePath.trim()) throw new Error("Choose an Among Us source first.");
+  await simulateBrowserTransfers(["isolated game workspace"], onProgress);
   return null;
 }
 

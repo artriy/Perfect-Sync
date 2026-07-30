@@ -9,13 +9,15 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
 const KEYRING_SERVICE: &str = "com.artriy.perfectsync";
 const KEYRING_USER: &str = "github-token";
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 
 static APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+static DEFAULT_MANAGED_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+static MANAGED_DATA_DIR: OnceLock<RwLock<PathBuf>> = OnceLock::new();
 static SETTINGS_IO: Mutex<()> = Mutex::new(());
 
 /// A mod the user always wants merged into any lobby code they apply.
@@ -72,10 +74,17 @@ pub struct Settings {
     pub personal_local_mods: Vec<PersonalLocalMod>,
     #[serde(default)]
     pub setup_complete: bool,
+    /// True after the user has selected a fresh source under the exact-base workflow.
+    #[serde(default)]
+    pub fresh_source_setup_complete: bool,
     #[serde(default)]
     pub skip_launch_warning: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub active_profile: Option<String>,
+    /// Custom root for large managed game data and downloaded package caches.
+    /// `None` keeps the platform-local default.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub storage_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,6 +103,10 @@ pub struct SettingsView {
     pub has_github_token: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_warning: Option<String>,
+    pub active_storage_path: String,
+    pub default_storage_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_warning: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -235,9 +248,59 @@ pub fn initialize_app_data_dir(path: PathBuf) -> Result<(), SettingsError> {
         .set(path)
         .map_err(|_| SettingsError::AlreadyInitialized)
 }
+pub fn initialize_managed_data_dir(path: PathBuf) -> Result<(), SettingsError> {
+    if !path.is_absolute() {
+        return Err(SettingsError::InvalidDataDirectory);
+    }
+    if let Some(existing) = DEFAULT_MANAGED_DATA_DIR.get() {
+        return if existing == &path {
+            Ok(())
+        } else {
+            Err(SettingsError::AlreadyInitialized)
+        };
+    }
+    fs::create_dir_all(&path).map_err(|e| io_error("create the managed data directory", e))?;
+    DEFAULT_MANAGED_DATA_DIR
+        .set(path.clone())
+        .map_err(|_| SettingsError::AlreadyInitialized)?;
+    MANAGED_DATA_DIR
+        .set(RwLock::new(path))
+        .map_err(|_| SettingsError::AlreadyInitialized)
+}
+
+pub fn set_managed_data_dir(path: PathBuf) -> Result<(), SettingsError> {
+    if !path.is_absolute() {
+        return Err(SettingsError::InvalidDataDirectory);
+    }
+    fs::create_dir_all(&path).map_err(|e| io_error("create the managed data directory", e))?;
+    let active = MANAGED_DATA_DIR
+        .get()
+        .ok_or(SettingsError::NotInitialized)?;
+    *active.write().map_err(|_| SettingsError::LockPoisoned)? = path;
+    Ok(())
+}
+
+pub fn managed_data_dir() -> PathBuf {
+    MANAGED_DATA_DIR
+        .get()
+        .and_then(|path| path.read().ok().map(|path| path.clone()))
+        .unwrap_or_else(app_data_dir)
+}
+
+pub fn default_managed_data_dir() -> PathBuf {
+    DEFAULT_MANAGED_DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(app_data_dir)
+}
 
 pub fn cache_dir() -> PathBuf {
-    app_data_dir().join("cache")
+    let active = managed_data_dir();
+    if active == default_managed_data_dir() {
+        app_data_dir().join("cache")
+    } else {
+        active.join("cache")
+    }
 }
 
 pub fn catalog_cache_path() -> PathBuf {
@@ -597,6 +660,33 @@ where
     Ok(())
 }
 
+fn make_view(
+    settings: Settings,
+    has_github_token: bool,
+    recovery_warning: Option<String>,
+) -> SettingsView {
+    let active = managed_data_dir();
+    let default = default_managed_data_dir();
+    let configured = settings.storage_path.as_deref().map(Path::new);
+    let storage_warning = configured
+        .filter(|configured| *configured != active)
+        .map(|configured| {
+            format!(
+                "The configured storage folder {} is unavailable. Perfect Sync is using {} for this session.",
+                configured.display(),
+                active.display()
+            )
+        });
+    SettingsView {
+        settings,
+        has_github_token,
+        recovery_warning,
+        active_storage_path: active.to_string_lossy().into_owned(),
+        default_storage_path: default.to_string_lossy().into_owned(),
+        storage_warning,
+    }
+}
+
 pub fn apply_transaction(
     settings: &Settings,
     token_action: &TokenAction,
@@ -619,11 +709,11 @@ pub fn apply_transaction(
         TokenAction::Set { .. } => true,
         TokenAction::Clear => false,
     };
-    Ok(SettingsView {
-        settings: settings.clone(),
+    Ok(make_view(
+        settings.clone(),
         has_github_token,
         recovery_warning,
-    })
+    ))
 }
 
 fn finish_parsed_settings_with<Migrate, Write>(
@@ -684,11 +774,7 @@ pub fn view() -> Result<SettingsView, SettingsError> {
     let _guard = lock_settings()?;
     let (settings, recovery_warning) = load_unlocked()?;
     let has_github_token = github_token_unlocked()?.is_some();
-    Ok(SettingsView {
-        settings,
-        has_github_token,
-        recovery_warning,
-    })
+    Ok(make_view(settings, has_github_token, recovery_warning))
 }
 
 pub fn github_token() -> Result<Option<SecretString>, SettingsError> {
@@ -720,6 +806,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_settings_require_fresh_source_setup_once() {
+        let legacy: Settings = serde_json::from_str(r#"{"setupComplete":true}"#).unwrap();
+        assert!(legacy.setup_complete);
+        assert!(!legacy.fresh_source_setup_complete);
+
+        let migrated: Settings =
+            serde_json::from_str(r#"{"setupComplete":true,"freshSourceSetupComplete":true}"#)
+                .unwrap();
+        assert!(migrated.fresh_source_setup_complete);
+    }
+
+    #[test]
     fn migrates_the_legacy_single_game() {
         let text = r#"{"gamePath":"C:/Among Us","arch":"x64","store":"epic","runtime":"native"}"#;
         let game = migrate_legacy_game(text).unwrap();
@@ -746,6 +844,9 @@ mod tests {
             settings: Settings::default(),
             has_github_token: true,
             recovery_warning: None,
+            active_storage_path: "C:\\Perfect-Sync".into(),
+            default_storage_path: "C:\\Perfect-Sync".into(),
+            storage_warning: None,
         };
         let serialized = serde_json::to_string(&view).unwrap();
         assert!(serialized.contains("\"hasGithubToken\":true"));
