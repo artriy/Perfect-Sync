@@ -46,6 +46,9 @@
   persist completed validation across app restarts, skip unchanged config publication,
   and refresh the active revision after capturing runtime config so repeat launches do
   not recopy or rehash the clean game.
+- Treat the selected Town of Us ZIP as authoritative when installing, updating,
+  or switching storefront packages: replace and claim every managed payload file,
+  including the Region Install config, instead of rejecting an unowned collision.
 - Treat automatic update discovery as best-effort so a missing or temporarily
   unavailable release manifest cannot interrupt application startup.
 - Auto-detect only fresh Among Us sources without known loader or mod artifacts;

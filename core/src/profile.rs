@@ -996,30 +996,14 @@ pub fn install_tou_bundle_zip_bytes(
     }
 
     let bepinex = checked_profile_bepinex_dir(profiles_root, id, true)?;
-    let old_files = read_tou_bundle_manifest(&bepinex)?;
-    let old_names: HashSet<String> = old_files
-        .iter()
-        .map(|path| {
-            path.to_string_lossy()
-                .replace('\\', "/")
-                .to_ascii_lowercase()
-        })
-        .collect();
     for (_, relative, _) in &selected {
         let destination = bepinex.join(relative);
         reject_reparse(&destination)?;
-        if destination.exists()
-            && !old_names.contains(
-                &relative
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .to_ascii_lowercase(),
-            )
-        {
+        if destination.exists() && !fs::metadata(&destination)?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
-                    "Town of Us package would overwrite an unowned file {}",
+                    "Town of Us package path is not a regular file {}",
                     relative.display()
                 ),
             ));
@@ -1058,7 +1042,8 @@ pub fn install_tou_bundle_zip_bytes(
                 .parent()
                 .ok_or_else(|| invalid("Town of Us destination has no parent"))?;
             fs::create_dir_all(parent)?;
-            fs::rename(stage.join(relative), destination)?;
+            reject_reparse(&destination)?;
+            atomic_replace(&stage.join(relative), &destination)?;
         }
         let files: Vec<String> = selected
             .iter()
@@ -1496,6 +1481,25 @@ mod tests {
             b"standalone mira"
         );
         assert_eq!(fs::read(plugins.join("User.dll")).unwrap(), b"user");
+    }
+
+    #[test]
+    fn replaces_existing_tou_config_from_the_authoritative_zip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp
+            .path()
+            .join("p1/BepInEx/config/at.duikbo.regioninstall.cfg");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, b"unowned config").unwrap();
+
+        install_tou_bundle_zip_bytes(tmp.path(), "p1", &tou_profile_zip(b'1', false)).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), b"1");
+
+        install_tou_bundle_zip_bytes(tmp.path(), "p1", &tou_profile_zip(b'2', false)).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), b"2");
+
+        remove_tou_bundle(tmp.path(), "p1").unwrap();
+        assert!(!config.exists());
     }
 
     #[test]
