@@ -70,6 +70,7 @@ pub fn run() {
                     ),
                 }
             }
+            settings::reset_v016_profiles_once(&saved)?;
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;

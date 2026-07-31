@@ -8751,4 +8751,55 @@ mod tests {
             active.display()
         );
     }
+
+    #[test]
+    #[ignore = "launches the selected local Steam profile"]
+    fn live_steam_launch_smoke() {
+        let app_data = PathBuf::from(std::env::var("PERFECT_SYNC_SMOKE_APP_DATA").unwrap());
+        let managed_data = PathBuf::from(std::env::var("PERFECT_SYNC_SMOKE_MANAGED_DATA").unwrap());
+        let profile_id = std::env::var("PERFECT_SYNC_SMOKE_PROFILE").unwrap();
+        settings::initialize_app_data_dir(app_data).unwrap();
+        settings::initialize_managed_data_dir(managed_data).unwrap();
+
+        let profile_record = recovered_profile_store(&settings::profiles_root())
+            .unwrap()
+            .load(&profile_id)
+            .unwrap()
+            .unwrap();
+        let saved = settings::load().unwrap();
+        let instance = saved
+            .game_instances
+            .iter()
+            .find(|instance| {
+                profile_record.game_instance_id.as_deref() == Some(instance.id.as_str())
+            })
+            .unwrap();
+        assert_eq!(instance.store, Store::Steam);
+        let preparation_started = Instant::now();
+        prepare_profile_with_guard(&instance.path, &profile_id, None, false, || Ok(())).unwrap();
+        eprintln!(
+            "Steam profile preparation: {:.3}s",
+            preparation_started.elapsed().as_secs_f64()
+        );
+        let active = managed_instance::workspace_game_dir(&profile_id).unwrap();
+
+        let launch_started = Instant::now();
+        launch_prepared_game(&active, instance, &profile_id).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if process::try_is_game_dir_running(&active).unwrap() {
+                eprintln!(
+                    "Steam profile launch: {:.3}s",
+                    launch_started.elapsed().as_secs_f64()
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "Steam profile did not launch from the managed workspace at {}",
+            active.display()
+        );
+    }
 }

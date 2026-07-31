@@ -3,11 +3,11 @@
 ## v0.1.6 (experimental)
 
 > [!IMPORTANT]
-> **Action required after updating:** rerun first-time setup and select a fresh,
-> untouched Among Us installation. Verify or reinstall the game through Steam, Epic,
-> or Microsoft Store first if necessary. Perfect Sync v0.1.6 will prompt you on launch,
-> preserve your profiles and mods, import a private clean base, and never modify the
-> selected source folder.
+> **Action required after updating:** v0.1.6 performs a one-time reset of every
+> existing profile, personal mod selection, configured game source, immutable base,
+> and private workspace, then opens first-time setup. Select a fresh, untouched Among
+> Us installation; verify or reinstall it through Steam, Epic, or Microsoft Store first
+> if necessary. The chosen large-data storage location and GitHub credential are kept.
 
 - Treat every selected Among Us folder as a read-only source; reject known existing
   mod-loader artifacts rather than silently filtering them, then import every source
@@ -35,6 +35,9 @@
 - Launch Windows helpers and games with conventional Win32 paths instead of canonical
   `\\?\` paths so the Town of Us BepInEx/Cpp2IL build can read IL2CPP metadata from
   custom storage roots; require the game to remain alive before reporting success.
+- Give native background games explicit null standard streams instead of inheriting
+  stale handles from the console-less Windows app, fixing Steam launch failures with
+  `ERROR_INVALID_HANDLE`.
 - Switch the selected profile through a dedicated lightweight settings command instead of
   rebuilding its already-isolated workspace; launch still validates and repairs stale workspaces.
 - Reuse the same immutable base after storefront or architecture metadata is corrected,

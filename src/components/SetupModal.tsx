@@ -358,11 +358,11 @@ export function SetupModal({
                 <WarningCircle size={18} weight="fill" className="mt-0.5 shrink-0" />
                 <span>
                   <strong className="block font-semibold text-[#ffe4bd]">
-                    v0.1.6 requires a fresh source for the new exact-base workflow.
+                    v0.1.6 starts from a clean profile state for the new exact-base workflow.
                   </strong>
-                  Verify or reinstall Among Us, then select that untouched folder here. Perfect Sync
-                  will preserve your profiles and mods, import a private clean base, and leave the
-                  original game folder unchanged.
+                  Existing profiles and private managed workspaces were removed once. Verify or
+                  reinstall Among Us, then select that untouched folder here. Perfect Sync will
+                  import a private clean base and leave the original game folder unchanged.
                 </span>
               </div>
             )}

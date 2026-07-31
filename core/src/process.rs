@@ -9,7 +9,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 
 pub const GAME_EXE: &str = "Among Us.exe";
 
@@ -416,6 +416,12 @@ pub fn launch(spec: &LaunchSpec) -> io::Result<Child> {
     cmd.current_dir(win32_conventional_path(&spec.cwd));
     #[cfg(not(windows))]
     cmd.current_dir(&spec.cwd);
+    // The Tauri Windows executable has no console and can retain stale standard
+    // handle values. Never ask CreateProcess to inherit those handles for a
+    // background game; doing so fails before startup with ERROR_INVALID_HANDLE.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     cmd.args(&spec.args);
     for (k, v) in &spec.env {
         cmd.env(k, v);
@@ -464,10 +470,60 @@ mod tests {
     const NO_CONSOLE_CHILD: &str = "PERFECT_SYNC_NO_CONSOLE_CHILD";
     const INTERACTIVE_CONSOLE_CHILD: &str = "PERFECT_SYNC_INTERACTIVE_CONSOLE_CHILD";
     const PATH_QUERY_CHILD: &str = "PERFECT_SYNC_PATH_QUERY_CHILD";
+    const INVALID_STDIO_PARENT: &str = "PERFECT_SYNC_INVALID_STDIO_PARENT";
+    const LAUNCH_TARGET: &str = "PERFECT_SYNC_LAUNCH_TARGET";
 
     #[link(name = "Kernel32")]
     extern "system" {
         fn GetConsoleWindow() -> isize;
+        fn SetStdHandle(standard_handle: u32, handle: isize) -> i32;
+    }
+
+    #[test]
+    fn game_launch_survives_parent_with_invalid_standard_handles() {
+        const TEST_NAME: &str =
+            "process::tests::game_launch_survives_parent_with_invalid_standard_handles";
+        if std::env::var_os(LAUNCH_TARGET).is_some() {
+            return;
+        }
+        if std::env::var_os(INVALID_STDIO_PARENT).is_some() {
+            const STD_INPUT_HANDLE: u32 = -10_i32 as u32;
+            const STD_OUTPUT_HANDLE: u32 = -11_i32 as u32;
+            const STD_ERROR_HANDLE: u32 = -12_i32 as u32;
+            const CLOSED_HANDLE_VALUE: isize = 0x1234;
+            // SAFETY: this branch runs in an isolated subprocess created below.
+            // Replacing its process-wide standard handles cannot affect the test
+            // harness or another test process. The non-null values model stale
+            // GUI-parent handles which cannot be inherited by a new child.
+            unsafe {
+                assert_ne!(SetStdHandle(STD_INPUT_HANDLE, CLOSED_HANDLE_VALUE), 0);
+                assert_ne!(SetStdHandle(STD_OUTPUT_HANDLE, CLOSED_HANDLE_VALUE), 0);
+                assert_ne!(SetStdHandle(STD_ERROR_HANDLE, CLOSED_HANDLE_VALUE), 0);
+            }
+            let executable = std::env::current_exe().unwrap();
+            let mut child = launch(&LaunchSpec {
+                program: executable,
+                args: vec![OsString::from("--exact"), OsString::from(TEST_NAME)],
+                cwd: std::env::current_dir().unwrap(),
+                env: vec![(OsString::from(LAUNCH_TARGET), OsString::from("1"))],
+                error: None,
+            })
+            .unwrap();
+            assert!(child.wait().unwrap().success());
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env(INVALID_STDIO_PARENT, "1")
+            .args(["--exact", TEST_NAME])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 const KEYRING_SERVICE: &str = "com.artriy.perfectsync";
 const KEYRING_USER: &str = "github-token";
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+const V016_PROFILE_RESET_MARKER: &str = ".perfectsync-v0.1.6-profile-reset";
 
 static APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 static DEFAULT_MANAGED_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -598,6 +599,115 @@ fn write_settings_unlocked(settings: &Settings) -> Result<(), SettingsError> {
     write_settings_at(&path, settings, sync_parent)
 }
 
+fn remove_profile_reset_tree(path: &Path) -> Result<(), SettingsError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("inspect profile data for the v0.1.6 reset", error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return fs::remove_file(path)
+            .map_err(|error| io_error("remove linked profile data for the v0.1.6 reset", error));
+    }
+    if !metadata.is_dir() {
+        return Err(io_error(
+            "validate profile data for the v0.1.6 reset",
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "profile data path is not a directory",
+            ),
+        ));
+    }
+    fs::remove_dir_all(path)
+        .map_err(|error| io_error("remove profile data for the v0.1.6 reset", error))
+}
+
+fn write_profile_reset_marker(path: &Path) -> Result<(), SettingsError> {
+    AtomicFile::new(path, AllowOverwrite)
+        .write(|file| {
+            file.write_all(b"v0.1.6\n")?;
+            file.flush()?;
+            file.sync_all()
+        })
+        .map_err(|error| io_error("record the v0.1.6 profile reset", error.into()))?;
+    sync_parent(path)
+}
+
+fn reset_v016_profiles_at(
+    app_data: &Path,
+    managed_roots: &[PathBuf],
+    saved: &Settings,
+) -> Result<Settings, SettingsError> {
+    let marker = app_data.join(V016_PROFILE_RESET_MARKER);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() => return Ok(saved.clone()),
+        Ok(_) => {
+            return Err(io_error(
+                "validate the v0.1.6 profile reset marker",
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "profile reset marker is not a regular file",
+                ),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io_error("inspect the v0.1.6 profile reset marker", error));
+        }
+    }
+
+    for root in managed_roots {
+        let metadata = fs::symlink_metadata(root)
+            .map_err(|error| io_error("access managed data for the v0.1.6 reset", error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io_error(
+                "validate managed data for the v0.1.6 reset",
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed data root is not a regular directory",
+                ),
+            ));
+        }
+    }
+
+    remove_profile_reset_tree(&app_data.join("profiles"))?;
+    for root in managed_roots {
+        remove_profile_reset_tree(&root.join("managed-games"))?;
+    }
+
+    let reset = Settings {
+        storage_path: saved.storage_path.clone(),
+        ..Settings::default()
+    };
+    write_settings_at(&app_data.join("settings.json"), &reset, sync_parent)?;
+    write_profile_reset_marker(&marker)?;
+    Ok(reset)
+}
+
+/// Delete every pre-v0.1.6 profile and managed game artifact exactly once.
+/// The selected large-data root remains configured, while setup, sources,
+/// personal mods, and profile selection return to first-run defaults.
+pub fn reset_v016_profiles_once(saved: &Settings) -> Result<Settings, SettingsError> {
+    let _guard = lock_settings()?;
+    let app_data = app_data_dir();
+    let mut managed_roots = vec![
+        managed_data_dir(),
+        default_managed_data_dir(),
+        app_data.clone(),
+    ];
+    if let Some(configured) = saved.storage_path.as_deref() {
+        managed_roots.push(PathBuf::from(configured));
+    }
+    let reset = reset_v016_profiles_at(&app_data, &managed_roots, saved)?;
+    if reset.setup_complete != saved.setup_complete
+        || reset.active_profile != saved.active_profile
+        || reset.game_instances.len() != saved.game_instances.len()
+    {
+        log::info!("completed the one-time v0.1.6 profile reset");
+    }
+    Ok(reset)
+}
+
 fn replace_github_token_unlocked(token: Option<&SecretString>) -> Result<(), SettingsError> {
     match token {
         Some(token) => set_github_token_unlocked(token.clone()),
@@ -785,6 +895,102 @@ pub fn github_token() -> Result<Option<SecretString>, SettingsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v016_profile_reset_is_complete_and_idempotent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let app_data = temporary.path().join("app-data");
+        let local_data = temporary.path().join("local-data");
+        let custom_data = temporary.path().join("custom-data");
+        let managed_roots = [custom_data.clone(), local_data.clone(), app_data.clone()];
+        for root in &managed_roots {
+            fs::create_dir_all(root.join("managed-games/workspace/old-profile")).unwrap();
+            fs::create_dir_all(root.join("cache")).unwrap();
+            fs::write(root.join("cache/keep.bin"), b"cache").unwrap();
+        }
+        fs::create_dir_all(app_data.join("profiles/old-profile/BepInEx/plugins")).unwrap();
+        fs::write(
+            app_data.join("profiles/old-profile/profile.json"),
+            b"old profile",
+        )
+        .unwrap();
+        fs::write(app_data.join("catalog.json"), b"catalog").unwrap();
+
+        let saved = Settings {
+            game_instances: vec![GameInstance {
+                id: "steam".into(),
+                name: "Steam".into(),
+                path: "C:/Among Us".into(),
+                executable_identity: Some("identity".into()),
+                arch: Arch::X86,
+                store: Store::Steam,
+                runtime: Runtime::Native,
+                build: Some("2026.3.31".into()),
+                writable: true,
+            }],
+            personal_mods: vec![PersonalMod {
+                repo: "owner/mod".into(),
+                tag: "v1".into(),
+                asset: "mod.dll".into(),
+                name: Some("Mod".into()),
+                enabled: true,
+            }],
+            personal_local_mods: vec![PersonalLocalMod {
+                path: "C:/mods/local.dll".into(),
+                name: "Local".into(),
+                enabled: true,
+            }],
+            setup_complete: true,
+            fresh_source_setup_complete: true,
+            skip_launch_warning: true,
+            active_profile: Some("old-profile".into()),
+            storage_path: Some(custom_data.to_string_lossy().into_owned()),
+        };
+        write_settings_at(&app_data.join("settings.json"), &saved, |_| Ok(())).unwrap();
+
+        let reset = reset_v016_profiles_at(&app_data, &managed_roots, &saved).unwrap();
+        assert!(reset.game_instances.is_empty());
+        assert!(reset.personal_mods.is_empty());
+        assert!(reset.personal_local_mods.is_empty());
+        assert!(!reset.setup_complete);
+        assert!(!reset.fresh_source_setup_complete);
+        assert!(!reset.skip_launch_warning);
+        assert!(reset.active_profile.is_none());
+        assert_eq!(reset.storage_path, saved.storage_path);
+        assert!(!app_data.join("profiles").exists());
+        for root in &managed_roots {
+            assert!(!root.join("managed-games").exists());
+            assert_eq!(fs::read(root.join("cache/keep.bin")).unwrap(), b"cache");
+        }
+        assert_eq!(fs::read(app_data.join("catalog.json")).unwrap(), b"catalog");
+        assert_eq!(
+            fs::read(app_data.join(V016_PROFILE_RESET_MARKER)).unwrap(),
+            b"v0.1.6\n"
+        );
+        let persisted: Settings =
+            serde_json::from_slice(&fs::read(app_data.join("settings.json")).unwrap()).unwrap();
+        assert!(!persisted.setup_complete);
+        assert!(persisted.game_instances.is_empty());
+        assert_eq!(persisted.storage_path, saved.storage_path);
+
+        fs::create_dir_all(app_data.join("profiles/new-profile")).unwrap();
+        fs::create_dir_all(custom_data.join("managed-games/workspace/new-profile")).unwrap();
+        let mut completed = reset;
+        completed.setup_complete = true;
+        completed.active_profile = Some("new-profile".into());
+        write_settings_at(&app_data.join("settings.json"), &completed, |_| Ok(())).unwrap();
+        let unchanged = reset_v016_profiles_at(&app_data, &managed_roots, &completed).unwrap();
+        assert!(unchanged.setup_complete);
+        assert_eq!(unchanged.active_profile.as_deref(), Some("new-profile"));
+        assert!(app_data.join("profiles/new-profile").is_dir());
+        assert!(custom_data
+            .join("managed-games/workspace/new-profile")
+            .is_dir());
+        let persisted: Settings =
+            serde_json::from_slice(&fs::read(app_data.join("settings.json")).unwrap()).unwrap();
+        assert!(persisted.setup_complete);
+        assert_eq!(persisted.active_profile.as_deref(), Some("new-profile"));
+    }
 
     #[test]
     fn personal_mod_without_enabled_defaults_on() {
