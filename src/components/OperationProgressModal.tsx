@@ -4,7 +4,7 @@ import { Check, CircleNotch, Clock, DownloadSimple, ShieldCheck } from "@phospho
 import type { OperationProgress } from "../lib/types";
 import { useModalFocus } from "../lib/useModalFocus";
 
-export type OperationScope = "lobby" | "mods" | "release" | "maps" | "setup" | "profile" | "storage";
+export type OperationScope = "lobby" | "mods" | "release" | "maps" | "setup" | "profile" | "storage" | "launch";
 
 export interface OperationActivity extends OperationProgress {
   id: number;

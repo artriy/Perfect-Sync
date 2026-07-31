@@ -29,6 +29,9 @@
 - Download and SHA-256-verify the pinned EpicGamesStarter helper, launch it with a usable
   interactive console, dismiss its success prompt automatically, and preserve concurrently
   running Steam profiles while the authenticated Epic workspace starts.
+- Keep launch progress visible until the exact managed Epic process starts; never submit
+  helper input because an unrelated Among Us session is running, and surface early helper
+  exits or authentication timeouts instead of reporting a false launch success.
 - Switch the selected profile through a dedicated lightweight settings command instead of
   rebuilding its already-isolated workspace; launch still validates and repairs stale workspaces.
 - Reuse the same immutable base after storefront or architecture metadata is corrected,

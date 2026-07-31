@@ -6296,8 +6296,12 @@ fn launch_prepared_game(
             return spawn_launch(workspace_id, || {
                 let helper_pid = process::launch_console_interactive(&starter, game_dir)
                     .map_err(|error| format!("couldn't run EpicGamesStarter: {error}"))?;
-                crate::console_monitor::start(helper_pid)
-                    .map_err(|error| format!("couldn't monitor EpicGamesStarter: {error}"))
+                crate::console_monitor::wait_for_game_and_submit_enter(
+                    helper_pid,
+                    game_dir,
+                    Duration::from_secs(300),
+                )
+                .map_err(|error| format!("Epic launch failed: {error}"))
             });
         }
         let specification = compat::build_program_spec(&starter, game_dir, &context);
@@ -6329,10 +6333,20 @@ fn launch_prepared_game(
 }
 
 #[tauri::command]
-pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(), String> {
+pub async fn launch_profile(
+    game_path: String,
+    profile_id: String,
+    on_progress: Channel<OperationProgress>,
+) -> Result<(), String> {
     blocking(move || {
         let _guard = lock_mutations()?;
-        require_launch_ready(prepare_profile(&game_path, &profile_id, None, false)?)?;
+        let reporter = ProgressReporter::new(on_progress);
+        require_launch_ready(prepare_profile(
+            &game_path,
+            &profile_id,
+            Some(&reporter),
+            false,
+        )?)?;
         workspace_is_stopped(&profile_id)?;
         let profile = recovered_profile_store(&settings::profiles_root())?
             .load(&profile_id)
@@ -6340,18 +6354,43 @@ pub async fn launch_profile(game_path: String, profile_id: String) -> Result<(),
             .ok_or("profile not found")?;
         let instance = profile_game_instance(&game_path, &profile)?;
         let game_dir = managed_instance::workspace_game_dir(&profile_id)?;
+        reporter.stage(
+            "finalizing",
+            if instance.store == Store::Epic {
+                "Waiting for Epic authentication and Among Us startup. Complete sign-in in EpicGamesStarter if prompted."
+            } else {
+                "Starting Among Us"
+            },
+        );
         launch_prepared_game(&game_dir, &instance, &profile_id)
     })
     .await
 }
 
 #[tauri::command]
-pub async fn launch_vanilla(game_path: String, profile_id: String) -> Result<(), String> {
+pub async fn launch_vanilla(
+    game_path: String,
+    profile_id: String,
+    on_progress: Channel<OperationProgress>,
+) -> Result<(), String> {
     blocking(move || {
         let _guard = lock_mutations()?;
+        let reporter = ProgressReporter::new(on_progress);
         validate_profile_id(&profile_id)?;
+        reporter.stage(
+            "preparing",
+            "Creating or validating the private vanilla workspace",
+        );
         let (game_dir, instance) = prepare_vanilla(&game_path, &profile_id)?;
         workspace_is_stopped(&profile_id)?;
+        reporter.stage(
+            "finalizing",
+            if instance.store == Store::Epic {
+                "Waiting for Epic authentication and vanilla Among Us startup. Complete sign-in in EpicGamesStarter if prompted."
+            } else {
+                "Starting vanilla Among Us"
+            },
+        );
         launch_prepared_game(&game_dir, &instance, &profile_id)
     })
     .await

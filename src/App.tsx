@@ -747,10 +747,13 @@ export function App() {
     return bridge.checkModUpdates(profile.id, instance.arch);
   };
 
-  const ensureLoaderInternal = async (profile: Profile): Promise<string | null> => {
+  const ensureLoaderInternal = async (
+    profile: Profile,
+    onProgress?: (progress: OperationProgress) => void,
+  ): Promise<string | null> => {
     const instance = gameForProfile(profile);
     if (!instance) throw new Error("Add an Among Us folder in Settings before installing BepInEx.");
-    return bridge.ensureLoader(instance.path, profile.id, instance.arch);
+    return bridge.ensureLoader(instance.path, profile.id, instance.arch, false, onProgress);
   };
 
   const selectProfile = async (id: string) => {
@@ -1287,16 +1290,17 @@ export function App() {
   };
 
 
-  const launchInternal = async (profile: Profile, vanilla: boolean) => {
+  const launchInternal = async (
+    profile: Profile,
+    vanilla: boolean,
+    onProgress?: (progress: OperationProgress) => void,
+  ) => {
     const instance = gameForProfile(profile);
     if (!instance) throw new Error("No Among Us source is assigned to this profile.");
-    if (!vanilla && !await requestUnmanagedPluginResolution(profile, true, instance)) {
-      throw UNMANAGED_REVIEW_CANCELLED;
-    }
     setRunningStatus({ profileId: profile.id, running: true, known: true });
     try {
-      if (vanilla) await bridge.launchVanilla(instance.path, profile.id);
-      else await bridge.launchProfile(instance.path, profile.id);
+      if (vanilla) await bridge.launchVanilla(instance.path, profile.id, onProgress);
+      else await bridge.launchProfile(instance.path, profile.id, onProgress);
       notify(
         instance.store === "epic"
           ? `Launching ${vanilla ? "vanilla Among Us" : profile.name}. Epic may ask you to sign in the first time, that's normal.`
@@ -1310,19 +1314,34 @@ export function App() {
 
   const doLaunchProfile = async (profile: Profile) => {
     try {
-      await exclusive(async () => {
-        const current = profiles.find((candidate) => candidate.id === profile.id);
-        const instance = gameForProfile(current);
-        if (!current || !instance) throw new Error("No Among Us source is assigned. Add one in Settings.");
-        if (!settings.skipLaunchWarning) {
-          const status = await bridge.loaderStatus(instance.path, current.id);
-          if (!status.current || !status.runtimeReady) {
-            setLaunchWarn(current);
-            return;
+      const preflightProfile = profiles.find((candidate) => candidate.id === profile.id);
+      const preflightInstance = gameForProfile(preflightProfile);
+      if (!preflightProfile || !preflightInstance) {
+        throw new Error("No Among Us source is assigned. Add one in Settings.");
+      }
+      if (!await requestUnmanagedPluginResolution(preflightProfile, true, preflightInstance)) return;
+      await trackedExclusive(
+        {
+          scope: "launch",
+          title: `Launching ${preflightProfile.name}`,
+          message: "Checking the isolated workspace and BepInEx loader",
+        },
+        async (report) => {
+          const current = profiles.find((candidate) => candidate.id === profile.id);
+          const instance = gameForProfile(current);
+          if (!current || !instance) {
+            throw new Error("No Among Us source is assigned. Add one in Settings.");
           }
-        }
-        await launchInternal(current, false);
-      });
+          if (!settings.skipLaunchWarning) {
+            const status = await bridge.loaderStatus(instance.path, current.id);
+            if (!status.current || !status.runtimeReady) {
+              setLaunchWarn(current);
+              return;
+            }
+          }
+          await launchInternal(current, false, report);
+        },
+      );
     } catch (error) {
       if (error !== OPERATION_BUSY && error !== UNMANAGED_REVIEW_CANCELLED) notify(messageFrom(error), "error");
     }
@@ -1332,12 +1351,22 @@ export function App() {
     const profile = launchWarn;
     if (!profile) return;
     try {
-      await exclusive(async () => {
-        const warning = await ensureLoaderInternal(profile);
-        if (warning) throw new Error(warning);
-        setLaunchWarn(null);
-        await launchInternal(profile, false);
-      });
+      const instance = gameForProfile(profile);
+      if (!instance) throw new Error("No Among Us source is assigned. Add one in Settings.");
+      if (!await requestUnmanagedPluginResolution(profile, true, instance)) return;
+      await trackedExclusive(
+        {
+          scope: "launch",
+          title: `Preparing ${profile.name}`,
+          message: "Installing the BepInEx loader",
+        },
+        async (report) => {
+          const warning = await ensureLoaderInternal(profile, report);
+          if (warning) throw new Error(warning);
+          setLaunchWarn(null);
+          await launchInternal(profile, false, report);
+        },
+      );
     } catch (error) {
       if (error !== OPERATION_BUSY && error !== UNMANAGED_REVIEW_CANCELLED) notify(messageFrom(error), "error");
     }
@@ -1347,14 +1376,21 @@ export function App() {
     const profile = launchWarn;
     if (!profile) return;
     try {
-      await exclusive(async () => {
-        if (dontWarnAgain) {
-          const normalized = await bridge.saveSettings({ ...settings, skipLaunchWarning: true });
-          setSettings(normalized);
-        }
-        setLaunchWarn(null);
-        await launchInternal(profile, true);
-      });
+      await trackedExclusive(
+        {
+          scope: "launch",
+          title: "Launching vanilla Among Us",
+          message: "Preparing the private vanilla workspace",
+        },
+        async (report) => {
+          if (dontWarnAgain) {
+            const normalized = await bridge.saveSettings({ ...settings, skipLaunchWarning: true });
+            setSettings(normalized);
+          }
+          setLaunchWarn(null);
+          await launchInternal(profile, true, report);
+        },
+      );
     } catch (error) {
       if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
     }
@@ -1406,7 +1442,7 @@ export function App() {
           if (doLaunch) {
             if (loaderWarning) throw new Error(loaderWarning);
             report({ phase: "finalizing", message: `Starting ${built.name}` });
-            await launchInternal(built, false);
+            await launchInternal(built, false, report);
             setLobbyOpen(false);
             if (warnings.length > 0) notify(`Lobby launched. ${warnings.join(" ")}`, "error");
           } else {

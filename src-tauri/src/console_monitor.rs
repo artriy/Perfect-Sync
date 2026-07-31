@@ -1,54 +1,17 @@
+#[cfg(windows)]
 use std::ffi::OsStr;
 use std::io;
-
-const MONITOR_ARG: &str = "--perfect-sync-monitor-epic-console";
-
-pub fn run_if_requested() -> bool {
-    let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() != Some(OsStr::new(MONITOR_ARG)) {
-        return false;
-    }
-
-    #[cfg(windows)]
-    if let Some(pid) = args
-        .next()
-        .and_then(|value| value.to_str().and_then(|value| value.parse::<u32>().ok()))
-        .filter(|pid| *pid != 0)
-    {
-        let _ = wait_for_game_and_submit_enter(pid);
-    }
-    true
-}
+use std::path::Path;
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 #[cfg(windows)]
-pub fn start(helper_pid: u32) -> io::Result<()> {
-    #[cfg(test)]
-    {
-        std::thread::Builder::new()
-            .name("epic-console-monitor".into())
-            .spawn(move || {
-                let _ = wait_for_game_and_submit_enter(helper_pid);
-            })
-            .map(|_| ())
-    }
-    #[cfg(not(test))]
-    {
-        let executable = std::env::current_exe()?;
-        perfect_sync_core::process::command(executable)
-            .arg(MONITOR_ARG)
-            .arg(helper_pid.to_string())
-            .spawn()
-            .map(|_| ())
-    }
-}
-
-#[cfg(not(windows))]
-pub fn start(_helper_pid: u32) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(windows)]
-fn wait_for_game_and_submit_enter(helper_pid: u32) -> io::Result<()> {
+pub fn wait_for_game_and_submit_enter(
+    helper_pid: u32,
+    game_dir: &Path,
+    timeout: Duration,
+) -> io::Result<()> {
     type Handle = *mut std::ffi::c_void;
 
     #[link(name = "kernel32")]
@@ -70,11 +33,57 @@ fn wait_for_game_and_submit_enter(helper_pid: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
+    let deadline = Instant::now() + timeout;
     let result = loop {
-        // Waiting first avoids a busy loop while still noticing helper exit.
+        match perfect_sync_core::process::try_is_game_dir_running(game_dir) {
+            Ok(true) => {
+                // Process.Start returns just before EpicGamesStarter reaches its
+                // final ReadKey. Queue Enter only after this workspace's game
+                // exists; another profile or Steam session must not satisfy it.
+                let mut last_error = None;
+                let mut submitted = false;
+                for _ in 0..20 {
+                    match submit_enter(helper_pid) {
+                        Ok(()) => {
+                            submitted = true;
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = Some(error);
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                }
+                break if submitted {
+                    Ok(())
+                } else {
+                    Err(last_error
+                        .unwrap_or_else(|| io::Error::other("console input was not submitted")))
+                };
+            }
+            Ok(false) => {}
+            Err(error) => {
+                break Err(io::Error::other(format!(
+                    "couldn't verify the Epic Among Us process: {error}"
+                )))
+            }
+        }
+
+        if Instant::now() >= deadline {
+            break Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Epic authentication did not start the managed Among Us game. Complete any sign-in shown by EpicGamesStarter, then retry.",
+            ));
+        }
+
+        // Waiting avoids a busy loop while still noticing helper exit.
         let wait = unsafe { WaitForSingleObject(helper, 250) };
         match wait {
-            WAIT_OBJECT_0 => break Ok(()),
+            WAIT_OBJECT_0 => {
+                break Err(io::Error::other(
+                    "EpicGamesStarter closed before the managed Among Us game started. Retry and follow any sign-in or error shown in its console.",
+                ))
+            }
             WAIT_FAILED => break Err(io::Error::last_os_error()),
             WAIT_TIMEOUT => {}
             status => {
@@ -83,32 +92,6 @@ fn wait_for_game_and_submit_enter(helper_pid: u32) -> io::Result<()> {
                 )))
             }
         }
-
-        if matches!(perfect_sync_core::process::try_is_running(), Ok(true)) {
-            // Process.Start returns just before EpicGamesStarter reaches
-            // Console.ReadKey. A queued Enter is safe and will be consumed as
-            // soon as that final success prompt begins waiting.
-            let mut last_error = None;
-            let mut submitted = false;
-            for _ in 0..20 {
-                match submit_enter(helper_pid) {
-                    Ok(()) => {
-                        submitted = true;
-                        break;
-                    }
-                    Err(error) => {
-                        last_error = Some(error);
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                }
-            }
-            break if submitted {
-                Ok(())
-            } else {
-                Err(last_error
-                    .unwrap_or_else(|| io::Error::other("console input was not submitted")))
-            };
-        }
     };
 
     // SAFETY: helper is a live handle returned by OpenProcess above.
@@ -116,6 +99,18 @@ fn wait_for_game_and_submit_enter(helper_pid: u32) -> io::Result<()> {
         CloseHandle(helper);
     }
     result
+}
+
+#[cfg(not(windows))]
+pub fn wait_for_game_and_submit_enter(
+    _helper_pid: u32,
+    _game_dir: &Path,
+    _timeout: Duration,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "EpicGamesStarter console monitoring is only available on Windows",
+    ))
 }
 
 #[cfg(windows)]
@@ -253,10 +248,12 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     const CONSOLE_TARGET: &str = "PERFECT_SYNC_CONSOLE_TARGET";
     const CONSOLE_INJECTOR: &str = "PERFECT_SYNC_CONSOLE_INJECTOR";
+    const CONSOLE_GAME_DIR: &str = "PERFECT_SYNC_CONSOLE_GAME_DIR";
     const READY_FILE: &str = "PERFECT_SYNC_CONSOLE_READY_FILE";
     const FAKE_GAME: &str = "PERFECT_SYNC_FAKE_GAME";
 
@@ -325,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn game_start_submits_enter_and_releases_console_reader() {
+    fn only_target_game_start_submits_enter_and_releases_console_reader() {
         if std::env::var_os(FAKE_GAME).is_some() {
             std::thread::sleep(Duration::from_secs(10));
             return;
@@ -339,14 +336,15 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
         {
-            wait_for_game_and_submit_enter(pid).unwrap();
+            let game_dir = PathBuf::from(std::env::var_os(CONSOLE_GAME_DIR).unwrap());
+            wait_for_game_and_submit_enter(pid, &game_dir, Duration::from_secs(5)).unwrap();
             return;
         }
 
         let temporary = tempfile::tempdir().unwrap();
         let ready = temporary.path().join("ready");
         let test_name =
-            "console_monitor::tests::game_start_submits_enter_and_releases_console_reader";
+            "console_monitor::tests::only_target_game_start_submits_enter_and_releases_console_reader";
         let executable = std::env::current_exe().unwrap();
         let mut target = perfect_sync_core::process::interactive_command(&executable)
             .env(CONSOLE_TARGET, "1")
@@ -364,6 +362,47 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(ready.is_file(), "console target did not become ready");
+
+        let unrelated_dir = temporary.path().join("unrelated");
+        fs::create_dir(&unrelated_dir).unwrap();
+        let unrelated_path = unrelated_dir.join(perfect_sync_core::process::GAME_EXE);
+        fs::copy(&executable, &unrelated_path).unwrap();
+        let mut unrelated_game = perfect_sync_core::process::command(&unrelated_path)
+            .env(FAKE_GAME, "1")
+            .args(["--exact", test_name])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            perfect_sync_core::process::try_is_game_dir_running(&unrelated_dir),
+            Ok(true)
+        ) && Instant::now() < deadline
+        {
+            assert!(
+                unrelated_game.try_wait().unwrap().is_none(),
+                "unrelated game exited before detection"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        let mut injector = perfect_sync_core::process::command(&executable)
+            .env(CONSOLE_INJECTOR, target.id().to_string())
+            .env(CONSOLE_GAME_DIR, temporary.path())
+            .args(["--exact", test_name])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            injector.try_wait().unwrap().is_none(),
+            "an unrelated Among Us process incorrectly completed the monitor"
+        );
+        assert!(
+            target.try_wait().unwrap().is_none(),
+            "an unrelated Among Us process incorrectly submitted Enter"
+        );
+
         let fake_game = temporary.path().join(perfect_sync_core::process::GAME_EXE);
         fs::copy(&executable, &fake_game).unwrap();
         let mut game = perfect_sync_core::process::command(&fake_game)
@@ -372,32 +411,35 @@ mod tests {
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !matches!(perfect_sync_core::process::try_is_running(), Ok(true))
-            && Instant::now() < deadline
+        while !matches!(
+            perfect_sync_core::process::try_is_game_dir_running(temporary.path()),
+            Ok(true)
+        ) && Instant::now() < deadline
         {
             assert!(
                 game.try_wait().unwrap().is_none(),
-                "fake game exited before detection"
+                "target game exited before detection"
             );
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(
-            matches!(perfect_sync_core::process::try_is_running(), Ok(true)),
-            "fake game was not detected"
+            matches!(
+                perfect_sync_core::process::try_is_game_dir_running(temporary.path()),
+                Ok(true)
+            ),
+            "target game was not detected in its exact directory"
         );
 
-        let injector = perfect_sync_core::process::command(&executable)
-            .env(CONSOLE_INJECTOR, target.id().to_string())
-            .args(["--exact", test_name])
-            .output()
-            .unwrap();
+        let injector_output = injector.wait_with_output().unwrap();
         let _ = game.kill();
         let _ = game.wait();
+        let _ = unrelated_game.kill();
+        let _ = unrelated_game.wait();
         assert!(
-            injector.status.success(),
+            injector_output.status.success(),
             "{}{}",
-            String::from_utf8_lossy(&injector.stdout),
-            String::from_utf8_lossy(&injector.stderr)
+            String::from_utf8_lossy(&injector_output.stdout),
+            String::from_utf8_lossy(&injector_output.stderr)
         );
 
         let deadline = Instant::now() + Duration::from_secs(5);

@@ -1429,21 +1429,39 @@ function beginBrowserLaunch(profileId: string): void {
   }, 2800);
 }
 
-export async function launchProfile(gamePath: string, profileId: string): Promise<void> {
+export async function launchProfile(
+  gamePath: string,
+  profileId: string,
+  onProgress?: ProgressHandler,
+): Promise<void> {
   if (inTauri) {
-    await invoke<void>("launch_profile", { gamePath, profileId });
+    await invoke<void>("launch_profile", {
+      gamePath,
+      profileId,
+      onProgress: progressChannel(onProgress),
+    });
     return;
   }
   if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  await simulateBrowserTransfers(["isolated profile workspace"], onProgress);
   beginBrowserLaunch(profileId);
 }
 
-export async function launchVanilla(gamePath: string, profileId: string): Promise<void> {
+export async function launchVanilla(
+  gamePath: string,
+  profileId: string,
+  onProgress?: ProgressHandler,
+): Promise<void> {
   if (inTauri) {
-    await invoke<void>("launch_vanilla", { gamePath, profileId });
+    await invoke<void>("launch_vanilla", {
+      gamePath,
+      profileId,
+      onProgress: progressChannel(onProgress),
+    });
     return;
   }
   if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  await simulateBrowserTransfers(["private vanilla workspace"], onProgress);
   beginBrowserLaunch(profileId);
 }
 

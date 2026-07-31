@@ -7,11 +7,6 @@ mod storage;
 use tauri::Manager;
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 
-#[doc(hidden)]
-pub fn run_console_monitor_if_requested() -> bool {
-    console_monitor::run_if_requested()
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
