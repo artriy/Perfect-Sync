@@ -1219,6 +1219,42 @@ mod tests {
     }
 
     #[test]
+    fn profiles_persist_independent_game_instances() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(tmp.path());
+        let mut steam = sample_profile();
+        steam.id = "steam-profile".into();
+        steam.name = "Steam profile".into();
+        steam.game_instance_id = Some("steam".into());
+        let mut epic = sample_profile();
+        epic.id = "epic-profile".into();
+        epic.name = "Epic profile".into();
+        epic.game_instance_id = Some("epic".into());
+
+        store.save(&steam).unwrap();
+        store.save(&epic).unwrap();
+
+        assert_eq!(
+            store
+                .load("steam-profile")
+                .unwrap()
+                .unwrap()
+                .game_instance_id
+                .as_deref(),
+            Some("steam")
+        );
+        assert_eq!(
+            store
+                .load("epic-profile")
+                .unwrap()
+                .unwrap()
+                .game_instance_id
+                .as_deref(),
+            Some("epic")
+        );
+    }
+
+    #[test]
     fn failed_first_save_removes_the_profile_directory_it_created() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(tmp.path());

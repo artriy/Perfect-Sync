@@ -321,9 +321,9 @@ export function App() {
 
         const refreshedProfiles: Profile[] = [];
         for (const profile of nextProfiles) {
-          const instance =
-            loadedSettings.gameInstances.find((candidate) => candidate.id === profile.gameInstanceId) ??
-            loadedSettings.gameInstances[0];
+          const instance = loadedSettings.gameInstances.find(
+            (candidate) => candidate.id === profile.gameInstanceId,
+          );
           if (!instance) {
             refreshedProfiles.push(profile);
             continue;
@@ -466,7 +466,7 @@ export function App() {
   );
   const gameInstances = settings.gameInstances;
   const gameForProfile = (profile: Profile | undefined): GameInstance | null =>
-    gameInstances.find((instance) => instance.id === profile?.gameInstanceId) ?? gameInstances[0] ?? null;
+    gameInstances.find((instance) => instance.id === profile?.gameInstanceId) ?? null;
   const activeGame = gameForProfile(active);
   const arch: Arch = activeGame?.arch ?? "x86";
   const gameStatus = { store: activeGame?.store ?? "manual", arch, running };

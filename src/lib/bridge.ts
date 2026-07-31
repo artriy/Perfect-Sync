@@ -216,9 +216,9 @@ export async function listInstallOptions(repo: string, profileId: string): Promi
   if (inTauri) return invoke<ModInstallOption[]>("list_install_options", { repo, profileId });
   if (repo.toLowerCase() === TOWN_OF_US_ID) {
     const profile = browserProfiles.find((candidate) => candidate.id === profileId);
-    const instance =
-      browserSettings.gameInstances.find((candidate) => candidate.id === profile?.gameInstanceId) ??
-      browserSettings.gameInstances[0];
+    const instance = browserSettings.gameInstances.find(
+      (candidate) => candidate.id === profile?.gameInstanceId,
+    );
     return listTouSetupOptions(
       instance?.arch ?? "x86",
       instance?.store ?? "manual",
@@ -755,9 +755,11 @@ export async function collectDiagnostics(profileId?: string): Promise<Diagnostic
   const profile = profileId
     ? browserProfiles.find((candidate) => candidate.id === profileId)
     : browserProfiles[0];
-  const instance = browserSettings.gameInstances.find(
-    (candidate) => candidate.id === profile?.gameInstanceId,
-  ) ?? browserSettings.gameInstances[0];
+  const instance = profile
+    ? browserSettings.gameInstances.find(
+        (candidate) => candidate.id === profile.gameInstanceId,
+      )
+    : browserSettings.gameInstances[0];
   return {
     generatedAt: Date.now(),
     appVersion: "0.1.3",
@@ -827,6 +829,13 @@ export async function saveProfile(profile: Profile): Promise<Profile> {
   if (inTauri) return invoke<Profile>("save_profile", { profile });
   const saved = { ...structuredClone(profile), name: profile.name.trim(), crewColor: profile.crewColor.trim() };
   if (!saved.id || !saved.name || !saved.crewColor) throw new Error("Profile name and crew color are required.");
+  if (saved.gameInstanceId) {
+    if (!browserSettings.gameInstances.some((instance) => instance.id === saved.gameInstanceId)) {
+      throw new Error("Profile refers to an unknown Among Us instance.");
+    }
+  } else if (browserSettings.gameInstances.length > 0) {
+    throw new Error("Choose and save an Among Us instance for this profile.");
+  }
   return replaceBrowserProfile(saved);
 }
 

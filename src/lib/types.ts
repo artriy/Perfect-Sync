@@ -45,7 +45,7 @@ export interface Profile {
   crewColor: string;
   /** reference info only; the app does not change the game version in v1 */
   gameBuild?: string;
-  /** globally configured Among Us instance used by this profile */
+  /** exact configured Among Us instance selected and persisted for this profile */
   gameInstanceId?: string;
   mods: ProfileMod[];
   /** exact LevelImposter maps installed for this profile */

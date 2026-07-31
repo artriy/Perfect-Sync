@@ -1226,19 +1226,21 @@ fn default_rules() -> AssetRules {
     }
 }
 
+fn selected_profile_instance<'a>(
+    saved: &'a Settings,
+    instance_id: Option<&str>,
+) -> Result<&'a settings::GameInstance, String> {
+    let instance_id = instance_id.ok_or("profile has no saved game instance")?;
+    saved
+        .game_instances
+        .iter()
+        .find(|instance| instance.id == instance_id)
+        .ok_or_else(|| format!("profile refers to unknown game instance {instance_id}"))
+}
+
 fn saved_game_arch(instance_id: Option<&str>) -> Result<String, String> {
     let saved = settings::load().map_err(|error| error.to_string())?;
-    let instance = match instance_id {
-        Some(id) => saved
-            .game_instances
-            .iter()
-            .find(|instance| instance.id == id)
-            .ok_or("unknown game instance")?,
-        None => saved
-            .game_instances
-            .first()
-            .ok_or("save a game instance before resolving mod assets")?,
-    };
+    let instance = selected_profile_instance(&saved, instance_id)?;
     let game_dir = canonical_game_path(Path::new(&instance.path))?;
     game::exe_arch(&game_dir.join(process::GAME_EXE))
         .map(arch_str)
@@ -1261,17 +1263,7 @@ fn profile_store_runtime(profile_id: &str) -> Result<(Store, Runtime), String> {
         .map_err(|error| error.to_string())?
         .ok_or("profile not found")?;
     let saved = settings::load().map_err(|error| error.to_string())?;
-    let instance = match record.game_instance_id.as_deref() {
-        Some(id) => saved
-            .game_instances
-            .iter()
-            .find(|instance| instance.id == id)
-            .ok_or("unknown game instance")?,
-        None => saved
-            .game_instances
-            .first()
-            .ok_or("save a game instance before resolving Town of Us assets")?,
-    };
+    let instance = selected_profile_instance(&saved, record.game_instance_id.as_deref())?;
     Ok((instance.store, instance.runtime))
 }
 
@@ -1632,17 +1624,7 @@ fn validate_game_target(game_path: &str, profile_id: Option<&str>) -> Result<Pat
             .load(profile_id)
             .map_err(|error| error.to_string())?
             .ok_or("profile not found")?;
-        let instance = match record.game_instance_id {
-            Some(instance_id) => saved
-                .game_instances
-                .iter()
-                .find(|instance| instance.id == instance_id)
-                .ok_or("profile refers to an unknown game instance")?,
-            None => saved
-                .game_instances
-                .first()
-                .ok_or("profile has no saved game instance")?,
-        };
+        let instance = selected_profile_instance(&saved, record.game_instance_id.as_deref())?;
         if !same_path(Path::new(&instance.path), &canonical) {
             return Err("game folder does not match the profile's saved instance".into());
         }
@@ -2015,36 +1997,29 @@ pub async fn save_settings(
                 .to_string();
         }
         for profile in store()?.list().map_err(|error| error.to_string())? {
-            let (replacement, previous) = match profile.game_instance_id.as_deref() {
-                Some(instance_id) => {
-                    let replacement = settings
-                        .game_instances
-                        .iter()
-                        .find(|instance| instance.id == instance_id)
-                        .ok_or_else(|| {
-                            format!(
-                                "Game instance {instance_id} is still used by profile {}. Reassign or delete that profile first.",
-                                profile.name
-                            )
-                        })?;
-                    let previous = previous_settings
-                        .game_instances
-                        .iter()
-                        .find(|instance| instance.id == instance_id);
-                    (Some(replacement), previous)
+            let Some(instance_id) = profile.game_instance_id.as_deref() else {
+                if profile.mods.is_empty() {
+                    continue;
                 }
-                None if profile.mods.is_empty() => continue,
-                None => (
-                    settings.game_instances.first(),
-                    previous_settings.game_instances.first(),
-                ),
-            };
-            let replacement = replacement.ok_or_else(|| {
-                format!(
-                    "Profile {} uses the default game instance. Save a compatible instance or reassign the profile first.",
+                return Err(format!(
+                    "Profile {} has no saved game instance. Select an instance for that profile first.",
                     profile.name
-                )
-            })?;
+                ));
+            };
+            let replacement = settings
+                .game_instances
+                .iter()
+                .find(|instance| instance.id == instance_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Game instance {instance_id} is still used by profile {}. Reassign or delete that profile first.",
+                        profile.name
+                    )
+                })?;
+            let previous = previous_settings
+                .game_instances
+                .iter()
+                .find(|instance| instance.id == instance_id);
             if !profile.mods.is_empty() {
                 let previous = previous.ok_or_else(|| {
                     format!(
@@ -2701,16 +2676,16 @@ pub async fn save_profile(mut profile: ProfileRecord) -> Result<ProfileRecord, S
             return Err("profile name and crew color are required".into());
         }
         let saved = settings::load().map_err(|error| error.to_string())?;
-        let proposed_instance = match profile.game_instance_id.as_deref() {
-            Some(instance_id) => Some(
-                saved
-                    .game_instances
-                    .iter()
-                    .find(|instance| instance.id == instance_id)
-                    .ok_or("profile refers to an unknown game instance")?,
-            ),
-            None => saved.game_instances.first(),
-        };
+        if profile.game_instance_id.is_none() && !saved.game_instances.is_empty() {
+            return Err("choose and save an Among Us instance for this profile".into());
+        }
+        let proposed_instance = profile
+            .game_instance_id
+            .as_deref()
+            .map(|instance_id| {
+                selected_profile_instance(&saved, Some(instance_id))
+            })
+            .transpose()?;
         if let Some(existing) = store()?
             .load(&profile.id)
             .map_err(|error| error.to_string())?
@@ -2719,16 +2694,12 @@ pub async fn save_profile(mut profile: ProfileRecord) -> Result<ProfileRecord, S
                 let proposed_instance = proposed_instance.ok_or(
                     "This populated profile needs a saved compatible Among Us instance before it can be changed.",
                 )?;
-                let existing_instance = match existing.game_instance_id.as_deref() {
-                    Some(instance_id) => saved
-                        .game_instances
-                        .iter()
-                        .find(|instance| instance.id == instance_id),
-                    None => saved.game_instances.first(),
-                };
-                let existing_instance = existing_instance.ok_or(
-                    "The populated profile's prior game instance is missing, so its asset architecture cannot be verified. Create a new profile and re-resolve its mods.",
-                )?;
+                let existing_instance =
+                    selected_profile_instance(&saved, existing.game_instance_id.as_deref())
+                        .map_err(|_| {
+                            "The populated profile's prior game instance is missing, so its asset architecture cannot be verified. Create a new profile and re-resolve its mods."
+                                .to_string()
+                        })?;
                 if existing_instance.arch != proposed_instance.arch
                     || existing_instance.store != proposed_instance.store
                 {
@@ -2793,18 +2764,9 @@ pub async fn encode_lobby_code(profile: ProfileRecord) -> Result<String, String>
             .map_err(|error| error.to_string())?
             .ok_or("profile not found")?;
         let saved = settings::load().map_err(|error| error.to_string())?;
-        let instance = authoritative
-            .game_instance_id
-            .as_deref()
-            .and_then(|id| {
-                saved
-                    .game_instances
-                    .iter()
-                    .find(|instance| instance.id == id)
-            })
-            .or_else(|| saved.game_instances.first());
-        authoritative.game_build =
-            instance.and_then(|instance| game::detect_build(Path::new(&instance.path)));
+        let instance =
+            selected_profile_instance(&saved, authoritative.game_instance_id.as_deref())?;
+        authoritative.game_build = game::detect_build(Path::new(&instance.path));
         authoritative.levelimposter_maps = list_levelimposter_maps_impl(&authoritative.id)?;
         profile_store
             .save(&authoritative)
@@ -5206,28 +5168,16 @@ fn apply_lobby_code_impl(
         ),
     );
     let settings = settings::load().map_err(|error| error.to_string())?;
-    if let Some(instance_id) = game_instance_id.as_deref() {
-        if !settings
-            .game_instances
-            .iter()
-            .any(|instance| instance.id == instance_id)
-        {
-            return Err("lobby profile refers to an unknown game instance".into());
-        }
-    }
+    let instance_id = game_instance_id
+        .as_deref()
+        .ok_or("choose an Among Us instance before applying a lobby")?;
+    let target_instance = settings
+        .game_instances
+        .iter()
+        .find(|instance| instance.id == instance_id)
+        .ok_or("lobby profile refers to an unknown game instance")?;
     let _ = arch;
-    let arch = saved_game_arch(game_instance_id.as_deref())?;
-    let target_instance = match game_instance_id.as_deref() {
-        Some(instance_id) => settings
-            .game_instances
-            .iter()
-            .find(|instance| instance.id == instance_id)
-            .ok_or("lobby profile refers to an unknown game instance")?,
-        None => settings
-            .game_instances
-            .first()
-            .ok_or("save a game instance before applying a lobby")?,
-    };
+    let arch = saved_game_arch(Some(instance_id))?;
     let store = target_instance.store;
     let runtime = target_instance.runtime;
     let display = manifest
@@ -5810,14 +5760,7 @@ fn profile_game_instance(
 ) -> Result<settings::GameInstance, String> {
     let canonical = validate_game_target(game_path, Some(&profile.id))?;
     let saved = settings::load().map_err(|error| error.to_string())?;
-    let instance = match profile.game_instance_id.as_deref() {
-        Some(instance_id) => saved
-            .game_instances
-            .iter()
-            .find(|instance| instance.id == instance_id),
-        None => saved.game_instances.first(),
-    }
-    .ok_or("profile refers to an unknown game instance")?;
+    let instance = selected_profile_instance(&saved, profile.game_instance_id.as_deref())?;
     if !same_path(Path::new(&instance.path), &canonical) {
         return Err("game folder does not match the profile's saved source".into());
     }
@@ -6751,16 +6694,15 @@ fn diagnostics_report_impl(profile_id: Option<&str>) -> Result<DiagnosticsReport
             .map_err(|error| error.to_string())?,
         None => None,
     };
-    let instance = profile
-        .as_ref()
-        .and_then(|profile| profile.game_instance_id.as_deref())
-        .and_then(|id| {
+    let instance = match profile.as_ref() {
+        Some(profile) => profile.game_instance_id.as_deref().and_then(|id| {
             saved
                 .game_instances
                 .iter()
                 .find(|instance| instance.id == id)
-        })
-        .or_else(|| saved.game_instances.first());
+        }),
+        None => saved.game_instances.first(),
+    };
     let mut warnings = Vec::new();
     let mut loader_status = None;
     let mut log_errors = Vec::new();
@@ -7012,6 +6954,38 @@ mod tests {
         ) -> Result<Vec<u8>, perfect_sync_core::resolver::ResolveError> {
             Ok(self.bytes.to_vec())
         }
+    }
+
+    #[test]
+    fn profiles_resolve_only_their_explicit_game_instance() {
+        let instance = |id: &str, name: &str, store: Store, arch: Arch| settings::GameInstance {
+            id: id.into(),
+            name: name.into(),
+            path: format!("C:/{name}/Among Us"),
+            executable_identity: None,
+            arch,
+            store,
+            runtime: Runtime::Native,
+            build: Some("2026.3.31".into()),
+            writable: true,
+        };
+        let saved = Settings {
+            game_instances: vec![
+                instance("steam", "Steam", Store::Steam, Arch::X86),
+                instance("epic", "Epic", Store::Epic, Arch::X64),
+            ],
+            ..Settings::default()
+        };
+
+        let steam = selected_profile_instance(&saved, Some("steam")).unwrap();
+        let epic = selected_profile_instance(&saved, Some("epic")).unwrap();
+        assert_eq!((steam.store, steam.arch), (Store::Steam, Arch::X86));
+        assert_eq!((epic.store, epic.arch), (Store::Epic, Arch::X64));
+        assert_eq!(
+            selected_profile_instance(&saved, None).unwrap_err(),
+            "profile has no saved game instance"
+        );
+        assert!(selected_profile_instance(&saved, Some("missing")).is_err());
     }
 
     #[test]

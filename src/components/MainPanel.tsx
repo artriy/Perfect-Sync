@@ -58,9 +58,7 @@ export function MainPanel(props: MainPanelProps) {
   );
   const updates = userMods.filter((m) => m.update).length;
   const selectedGame =
-    props.gameInstances.find((instance) => instance.id === profile.gameInstanceId) ??
-    props.gameInstances[0] ??
-    null;
+    props.gameInstances.find((instance) => instance.id === profile.gameInstanceId) ?? null;
 
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);

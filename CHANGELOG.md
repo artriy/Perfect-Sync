@@ -38,6 +38,8 @@
 - Give native background games explicit null standard streams instead of inheriting
   stale handles from the console-less Windows app, fixing Steam launch failures with
   `ERROR_INVALID_HANDLE`.
+- Persist the exact selected Among Us instance ID in each profile and restore it on
+  profile switches; never silently substitute the first global Steam or Epic source.
 - Switch the selected profile through a dedicated lightweight settings command instead of
   rebuilding its already-isolated workspace; launch still validates and repairs stale workspaces.
 - Reuse the same immutable base after storefront or architecture metadata is corrected,
