@@ -48,32 +48,43 @@ pub fn interactive_command<S: AsRef<OsStr>>(program: S) -> Command {
 }
 
 #[cfg(windows)]
-fn win32_current_directory(path: &std::path::Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
+fn win32_conventional_path(path: &std::path::Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     let verbatim = [
         u16::from(b'\\'),
         u16::from(b'\\'),
         u16::from(b'?'),
         u16::from(b'\\'),
     ];
-    if wide.starts_with(&verbatim) {
-        let unc = wide.len() >= 8
-            && matches!(wide[4], value if value == u16::from(b'U') || value == u16::from(b'u'))
-            && matches!(wide[5], value if value == u16::from(b'N') || value == u16::from(b'n'))
-            && matches!(wide[6], value if value == u16::from(b'C') || value == u16::from(b'c'))
-            && wide[7] == u16::from(b'\\');
-        if unc {
-            let mut conventional = vec![u16::from(b'\\'), u16::from(b'\\')];
-            conventional.extend_from_slice(&wide[8..]);
-            wide = conventional;
-        } else {
-            wide.drain(..verbatim.len());
-        }
+    if !wide.starts_with(&verbatim) {
+        return path.to_path_buf();
     }
-    wide.push(0);
-    wide
+    let unc = wide.len() >= 8
+        && matches!(wide[4], value if value == u16::from(b'U') || value == u16::from(b'u'))
+        && matches!(wide[5], value if value == u16::from(b'N') || value == u16::from(b'n'))
+        && matches!(wide[6], value if value == u16::from(b'C') || value == u16::from(b'c'))
+        && wide[7] == u16::from(b'\\');
+    let conventional = if unc {
+        let mut conventional = vec![u16::from(b'\\'), u16::from(b'\\')];
+        conventional.extend_from_slice(&wide[8..]);
+        conventional
+    } else {
+        wide[verbatim.len()..].to_vec()
+    };
+    PathBuf::from(OsString::from_wide(&conventional))
+}
+
+#[cfg(windows)]
+fn win32_current_directory(path: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    win32_conventional_path(path)
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect()
 }
 
 /// Launch a console helper with usable standard handles. Windows must bypass
@@ -137,6 +148,7 @@ pub fn launch_console_interactive(
         }
 
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let program = win32_conventional_path(program);
         let application_name: Vec<u16> = program.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut command_line = Vec::with_capacity(application_name.len() + 2);
         command_line.push(u16::from(b'"'));
@@ -148,10 +160,10 @@ pub fn launch_console_interactive(
         );
         command_line.push(u16::from(b'"'));
         command_line.push(0);
-        // .NET and Unity preserve a verbatim current-directory prefix in their
-        // runtime paths. Addressables then loads Town of Us's catalog but fails
-        // to resolve its `touhats` key. Keep verbatim syntax for file access,
-        // but give launched processes the equivalent conventional Win32 path.
+        // BepInEx and .NET preserve a verbatim prefix from either the helper
+        // image or its current directory. Older Cpp2IL builds then reject valid
+        // game files below that path, so both process paths cross the Win32
+        // boundary in equivalent conventional syntax.
         let current_directory = win32_current_directory(cwd);
         let mut startup_info: StartupInfoW = unsafe { std::mem::zeroed() };
         startup_info.cb = std::mem::size_of::<StartupInfoW>() as u32;
@@ -396,7 +408,13 @@ pub fn launch(spec: &LaunchSpec) -> io::Result<Child> {
     if let Some(message) = &spec.error {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, message.clone()));
     }
+    #[cfg(windows)]
+    let mut cmd = command(win32_conventional_path(&spec.program));
+    #[cfg(not(windows))]
     let mut cmd = command(&spec.program);
+    #[cfg(windows)]
+    cmd.current_dir(win32_conventional_path(&spec.cwd));
+    #[cfg(not(windows))]
     cmd.current_dir(&spec.cwd);
     cmd.args(&spec.args);
     for (k, v) in &spec.env {
@@ -411,7 +429,13 @@ pub fn launch_interactive(spec: &LaunchSpec) -> io::Result<Child> {
     if let Some(message) = &spec.error {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, message.clone()));
     }
+    #[cfg(windows)]
+    let mut cmd = interactive_command(win32_conventional_path(&spec.program));
+    #[cfg(not(windows))]
     let mut cmd = interactive_command(&spec.program);
+    #[cfg(windows)]
+    cmd.current_dir(win32_conventional_path(&spec.cwd));
+    #[cfg(not(windows))]
     cmd.current_dir(&spec.cwd);
     cmd.args(&spec.args);
     for (key, value) in &spec.env {
@@ -447,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn process_current_directory_removes_verbatim_syntax() {
+    fn process_paths_remove_verbatim_syntax() {
         use std::os::windows::ffi::OsStringExt;
 
         let decoded = |path| {
@@ -455,6 +479,12 @@ mod tests {
             assert_eq!(wide.pop(), Some(0));
             OsString::from_wide(&wide)
         };
+        assert_eq!(
+            win32_conventional_path(std::path::Path::new(
+                r"\\?\D:\Epic Games Games\AmongUs - TOU\EpicGamesStarter.exe"
+            )),
+            PathBuf::from(r"D:\Epic Games Games\AmongUs - TOU\EpicGamesStarter.exe")
+        );
         assert_eq!(
             decoded(r"\\?\D:\Epic Games Games\AmongUs - TOU"),
             OsString::from(r"D:\Epic Games Games\AmongUs - TOU")

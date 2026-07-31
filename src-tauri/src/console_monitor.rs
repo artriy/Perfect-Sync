@@ -34,32 +34,24 @@ pub fn wait_for_game_and_submit_enter(
     }
 
     let deadline = Instant::now() + timeout;
+    let mut game_seen_at = None;
     let result = loop {
         match perfect_sync_core::process::try_is_game_dir_running(game_dir) {
             Ok(true) => {
-                // Process.Start returns just before EpicGamesStarter reaches its
-                // final ReadKey. Queue Enter only after this workspace's game
-                // exists; another profile or Steam session must not satisfy it.
-                let mut last_error = None;
-                let mut submitted = false;
-                for _ in 0..20 {
-                    match submit_enter(helper_pid) {
-                        Ok(()) => {
-                            submitted = true;
-                            break;
-                        }
-                        Err(error) => {
-                            last_error = Some(error);
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                    }
+                let seen_at = game_seen_at.get_or_insert_with(Instant::now);
+                if seen_at.elapsed() >= Duration::from_secs(3) {
+                    // Process.Start reaches the final helper prompt before this
+                    // stability window elapses. Queue Enter only after this
+                    // workspace's game remains alive; another profile or a
+                    // crash during BepInEx startup must not satisfy launch.
+                    break submit_enter_with_retry(helper_pid);
                 }
-                break if submitted {
-                    Ok(())
-                } else {
-                    Err(last_error
-                        .unwrap_or_else(|| io::Error::other("console input was not submitted")))
-                };
+            }
+            Ok(false) if game_seen_at.is_some() => {
+                let _ = submit_enter_with_retry(helper_pid);
+                break Err(io::Error::other(
+                    "The managed Among Us process exited during startup. Check BepInEx/LogOutput.log and BepInEx/ErrorLog.log for the loader failure.",
+                ));
             }
             Ok(false) => {}
             Err(error) => {
@@ -99,6 +91,21 @@ pub fn wait_for_game_and_submit_enter(
         CloseHandle(helper);
     }
     result
+}
+
+#[cfg(windows)]
+fn submit_enter_with_retry(helper_pid: u32) -> io::Result<()> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match submit_enter(helper_pid) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("console input was not submitted")))
 }
 
 #[cfg(not(windows))]
@@ -256,6 +263,8 @@ mod tests {
     const CONSOLE_GAME_DIR: &str = "PERFECT_SYNC_CONSOLE_GAME_DIR";
     const READY_FILE: &str = "PERFECT_SYNC_CONSOLE_READY_FILE";
     const FAKE_GAME: &str = "PERFECT_SYNC_FAKE_GAME";
+    const TRANSIENT_GAME: &str = "PERFECT_SYNC_TRANSIENT_GAME";
+    const FAILURE_MONITOR: &str = "PERFECT_SYNC_FAILURE_MONITOR";
 
     fn read_console_enter(ready: &std::path::Path) {
         type Handle = *mut std::ffi::c_void;
@@ -451,6 +460,82 @@ mod tests {
             if Instant::now() >= deadline {
                 target.kill().unwrap();
                 panic!("console target did not consume injected Enter");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    #[test]
+    fn transient_target_game_is_a_launch_failure() {
+        if std::env::var_os(TRANSIENT_GAME).is_some() {
+            std::thread::sleep(Duration::from_secs(1));
+            return;
+        }
+        if std::env::var_os(CONSOLE_TARGET).is_some() {
+            let ready = PathBuf::from(std::env::var_os(READY_FILE).unwrap());
+            read_console_enter(&ready);
+            return;
+        }
+        if let Some(pid) = std::env::var(FAILURE_MONITOR)
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            let game_dir = PathBuf::from(std::env::var_os(CONSOLE_GAME_DIR).unwrap());
+            let error =
+                wait_for_game_and_submit_enter(pid, &game_dir, Duration::from_secs(5)).unwrap_err();
+            assert!(error.to_string().contains("exited during startup"));
+            return;
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let ready = temporary.path().join("ready");
+        let test_name = "console_monitor::tests::transient_target_game_is_a_launch_failure";
+        let executable = std::env::current_exe().unwrap();
+        let mut target = perfect_sync_core::process::interactive_command(&executable)
+            .env(CONSOLE_TARGET, "1")
+            .env(READY_FILE, &ready)
+            .args(["--exact", test_name])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.is_file() && Instant::now() < deadline {
+            assert!(target.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(ready.is_file(), "console target did not become ready");
+
+        let monitor = perfect_sync_core::process::command(&executable)
+            .env(FAILURE_MONITOR, target.id().to_string())
+            .env(CONSOLE_GAME_DIR, temporary.path())
+            .args(["--exact", test_name])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let fake_game = temporary.path().join(perfect_sync_core::process::GAME_EXE);
+        fs::copy(&executable, &fake_game).unwrap();
+        let mut game = perfect_sync_core::process::command(&fake_game)
+            .env(TRANSIENT_GAME, "1")
+            .args(["--exact", test_name])
+            .spawn()
+            .unwrap();
+
+        let monitor_output = monitor.wait_with_output().unwrap();
+        let _ = game.wait();
+        assert!(
+            monitor_output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&monitor_output.stdout),
+            String::from_utf8_lossy(&monitor_output.stderr)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = target.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                target.kill().unwrap();
+                panic!("console target did not consume injected Enter after the game crash");
             }
             std::thread::sleep(Duration::from_millis(25));
         }

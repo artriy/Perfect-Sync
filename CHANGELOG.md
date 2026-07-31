@@ -32,6 +32,9 @@
 - Keep launch progress visible until the exact managed Epic process starts; never submit
   helper input because an unrelated Among Us session is running, and surface early helper
   exits or authentication timeouts instead of reporting a false launch success.
+- Launch Windows helpers and games with conventional Win32 paths instead of canonical
+  `\\?\` paths so the Town of Us BepInEx/Cpp2IL build can read IL2CPP metadata from
+  custom storage roots; require the game to remain alive before reporting success.
 - Switch the selected profile through a dedicated lightweight settings command instead of
   rebuilding its already-isolated workspace; launch still validates and repairs stale workspaces.
 - Reuse the same immutable base after storefront or architecture metadata is corrected,
