@@ -5,7 +5,7 @@
 <br>
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-9b7bff?style=flat-square)](#platform-support)
-[![Version](https://img.shields.io/badge/version-0.1.6%20experimental-7a5bff?style=flat-square)](https://github.com/artriy/Perfect-Sync/releases)
+[![Version](https://img.shields.io/badge/version-0.1.7%20experimental-7a5bff?style=flat-square)](https://github.com/artriy/Perfect-Sync/releases)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-5bc0ff?style=flat-square)](https://tauri.app)
 [![License](https://img.shields.io/badge/license-MIT-5bc0ff?style=flat-square)](LICENSE)
 

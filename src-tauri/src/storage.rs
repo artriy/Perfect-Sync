@@ -657,8 +657,7 @@ fn validate_managed_layout(
             WORKSPACE_DIRECTORY,
             OBSOLETE_BASE_DIRECTORY,
         ]
-        .iter()
-        .any(|allowed| name == *allowed)
+        .contains(&name)
         {
             return Err(format!(
                 "managed package storage contains an unexpected entry: {name}"
@@ -968,16 +967,20 @@ fn copy_file_verified(
     Ok(())
 }
 
+struct VerifiedStorageCopy<'a, F> {
+    token: &'a str,
+    protected_sources: &'a [PathBuf],
+    copied: &'a mut u64,
+    total: u64,
+    buffer: &'a mut [u8],
+    progress: &'a mut F,
+}
+
 fn copy_tree_verified<F>(
     source: &Path,
     destination: &Path,
     manifest: &TreeManifest,
-    token: &str,
-    protected_sources: &[PathBuf],
-    copied: &mut u64,
-    total: u64,
-    buffer: &mut [u8],
-    progress: &mut F,
+    copy: &mut VerifiedStorageCopy<'_, F>,
 ) -> Result<(), String>
 where
     F: FnMut(u64, u64, &str),
@@ -985,15 +988,15 @@ where
     let parent = destination
         .parent()
         .ok_or_else(|| invalid("storage staging directory has no parent"))?;
-    validate_source_separation(parent, protected_sources, "The storage staging parent")?;
+    validate_source_separation(parent, copy.protected_sources, "The storage staging parent")?;
     fs::create_dir(destination)
         .map_err(|error| format!("could not create storage staging directory: {error}"))?;
     validate_source_separation(
         destination,
-        protected_sources,
+        copy.protected_sources,
         "The storage staging directory",
     )?;
-    create_cleanup_marker(destination, token)?;
+    create_cleanup_marker(destination, copy.token)?;
     for relative in &manifest.directories {
         fs::create_dir(destination.join(relative))
             .map_err(|error| format!("could not create storage directory: {error}"))?;
@@ -1002,12 +1005,13 @@ where
         let source_file = source.join(&file.relative);
         let destination_file = destination.join(&file.relative);
         let message = format!("Copying {}", file.relative.display());
-        progress(*copied, total, &message);
-        copy_file_verified(&source_file, &destination_file, file.size, buffer)?;
-        *copied = copied
+        (copy.progress)(*copy.copied, copy.total, &message);
+        copy_file_verified(&source_file, &destination_file, file.size, copy.buffer)?;
+        *copy.copied = copy
+            .copied
             .checked_add(file.size)
             .ok_or_else(|| invalid("storage size overflow"))?;
-        progress(*copied, total, &message);
+        (copy.progress)(*copy.copied, copy.total, &message);
     }
     let after = collect_tree(source)?
         .ok_or_else(|| invalid("managed storage disappeared during relocation"))?;
@@ -1336,6 +1340,14 @@ where
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     let result = (|| {
+        let mut copy = VerifiedStorageCopy {
+            token: &token,
+            protected_sources: &target.protected_sources,
+            copied: &mut copied,
+            total,
+            buffer: &mut buffer,
+            progress: &mut progress,
+        };
         if source_records.is_some() || workspaces.is_some() {
             fs::create_dir(&managed_stage)
                 .map_err(|error| format!("could not create managed storage stage: {error}"))?;
@@ -1350,12 +1362,7 @@ where
                     &managed_source.join(SOURCE_RECORD_DIRECTORY),
                     &managed_stage.join(SOURCE_RECORD_DIRECTORY),
                     manifest,
-                    &token,
-                    &target.protected_sources,
-                    &mut copied,
-                    total,
-                    &mut buffer,
-                    &mut progress,
+                    &mut copy,
                 )?;
             }
             if let Some(manifest) = &workspaces {
@@ -1363,12 +1370,7 @@ where
                     &managed_source.join(WORKSPACE_DIRECTORY),
                     &managed_stage.join(WORKSPACE_DIRECTORY),
                     manifest,
-                    &token,
-                    &target.protected_sources,
-                    &mut copied,
-                    total,
-                    &mut buffer,
-                    &mut progress,
+                    &mut copy,
                 )?;
             }
             validate_managed_layout(&managed_stage, &target.protected_sources)?;
@@ -1382,17 +1384,7 @@ where
             validate_managed_layout(&managed_final, &target.protected_sources)?;
         }
         if let Some(manifest) = &cache_manifest {
-            copy_tree_verified(
-                current_cache,
-                &cache_stage,
-                manifest,
-                &token,
-                &target.protected_sources,
-                &mut copied,
-                total,
-                &mut buffer,
-                &mut progress,
-            )?;
+            copy_tree_verified(current_cache, &cache_stage, manifest, &mut copy)?;
             validate_source_separation(
                 cache_parent,
                 &target.protected_sources,
@@ -1406,7 +1398,11 @@ where
                 "The published package cache directory",
             )?;
         }
-        progress(total, total, "Verified the relocated storage copy");
+        (copy.progress)(
+            copy.total,
+            copy.total,
+            "Verified the relocated storage copy",
+        );
         Ok(PublishedStorage {
             root: target.root.clone(),
             marker_created: !target.marker_existed,

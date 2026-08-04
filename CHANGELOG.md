@@ -1,9 +1,9 @@
 # Changelog
 
-## v0.1.6 (experimental)
+## v0.1.7 (experimental)
 
 > [!IMPORTANT]
-> v0.1.6 migrates managed storage schemas 1 through 5 to the direct-source schema 6
+> v0.1.7 migrates managed storage schemas 1 through 5 to the direct-source schema 6
 > in place. Profiles, personal mod selections, configured original sources, and valid
 > published profile instances are preserved. Obsolete immutable-base data is removed
 > only after canonical containment and reparse checks.
@@ -100,6 +100,69 @@
 - Refresh a changed but build-compatible clean original source automatically before mod
   installs and updates, preserving unrelated Settings fields. Continue blocking actual
   build, architecture, storefront, unavailable-source, and contaminated-source changes.
+- Keep all five live operation stages aligned in one progress row.
+
+## v0.1.6 (experimental)
+
+> [!IMPORTANT]
+> **Action required after updating:** v0.1.6 performs a one-time reset of every
+> existing profile, personal mod selection, configured game source, immutable base,
+> and private workspace, then opens first-time setup. Select a fresh, untouched Among
+> Us installation; verify or reinstall it through Steam, Epic, or Microsoft Store first
+> if necessary. The chosen large-data storage location and GitHub credential are kept.
+
+- Treat every selected Among Us folder as a read-only source; reject known existing
+  mod-loader artifacts rather than silently filtering them, then import every source
+  file into an exact SHA-256-manifested immutable base under local app data.
+- Version immutable bases by source identity, executable, build, and content; retain
+  historical generations required by profiles, migrate compatible legacy bases, and
+  garbage-collect unreferenced generations after successful use.
+- Materialize every prepared profile into its own disposable private workspace with
+  verified file copies, profile-specific config persistence, crash recovery, and atomic
+  replacement that preserves both the immutable base and previous working instance.
+- Launch only validated managed workspaces across native Windows, Proton, Wine,
+  CrossOver, Whisky, and Bottles; track running processes by exact workspace path so
+  Steam, Epic, and other profiles can run concurrently without locking the rest of the
+  app, while file-changing actions remain blocked only for the affected profile.
+- Verify both x86 Steam and x64 Epic Town of Us workspaces against the exact release ZIP,
+  including `MiraAPI.dll`, `touhats.bundle`, and `touhats.catalog`.
+- Repair relocated Epic source metadata from durable folder evidence, expose an explicit
+  storefront picker during setup, and fall back to the current x64 Epic architecture.
+- Download and SHA-256-verify the pinned EpicGamesStarter helper, launch it with a usable
+  interactive console, dismiss its success prompt automatically, and preserve concurrently
+  running Steam profiles while the authenticated Epic workspace starts.
+- Keep launch progress visible until the exact managed Epic process starts; never submit
+  helper input because an unrelated Among Us session is running, and surface early helper
+  exits or authentication timeouts instead of reporting a false launch success.
+- Launch Windows helpers and games with conventional Win32 paths instead of canonical
+  `\\?\` paths so the Town of Us BepInEx/Cpp2IL build can read IL2CPP metadata from
+  custom storage roots; require the game to remain alive before reporting success.
+- Give native background games explicit null standard streams instead of inheriting
+  stale handles from the console-less Windows app, fixing Steam launch failures with
+  `ERROR_INVALID_HANDLE`.
+- Persist the exact selected Among Us instance ID in each profile and restore it on
+  profile switches; never silently substitute the first global Steam or Epic source.
+- Switch the selected profile through a dedicated lightweight settings command instead of
+  rebuilding its already-isolated workspace; launch still validates and repairs stale workspaces.
+- Reuse the same immutable base after storefront or architecture metadata is corrected,
+  persist completed validation across app restarts, skip unchanged config publication,
+  and refresh the active revision after capturing runtime config so repeat launches do
+  not recopy or rehash the clean game.
+- Treat the selected Town of Us ZIP as authoritative when installing, updating,
+  or switching storefront packages: replace and claim every managed payload file,
+  including the Region Install config, instead of rejecting an unowned collision.
+- Treat automatic update discovery as best-effort so a missing or temporarily
+  unavailable release manifest cannot interrupt application startup.
+- Auto-detect only fresh Among Us sources without known loader or mod artifacts;
+  manually inspected sources still report their exact contamination warning.
+- Let first-time setup and Settings place managed bases, profile workspaces, and package
+  caches in an empty custom folder. Relocation copies and SHA-256-verifies every file
+  before switching, rejects source-path aliases across platforms, and preserves the
+  previous location on failure.
+- Add a Settings action that exports the selected profile workspace's bounded,
+  non-linked BepInEx `LogOutput.log` through the native save dialog.
+- Prompt existing users to rerun setup until a fresh source has been selected for the
+  exact immutable-base workflow.
 - Keep all five live operation stages aligned in one progress row.
 
 ## v0.1.5 (experimental)

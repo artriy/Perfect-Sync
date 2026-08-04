@@ -9611,7 +9611,7 @@ mod tests {
                 ..Settings::default()
             })
             .unwrap();
-            ProfileStore::new(&settings::profiles_root())
+            ProfileStore::new(settings::profiles_root())
                 .save(&ProfileRecord {
                     id: "profile-1".into(),
                     name: "Profile".into(),

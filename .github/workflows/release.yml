@@ -139,26 +139,38 @@ jobs:
         id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_NOTES: ${{ runner.temp }}/release-notes.md
         run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
+          const heading = `## ${process.env.RELEASE_TAG} (experimental)`;
+          const start = changelog.indexOf(heading);
+          if (start < 0) throw new Error(`Missing ${heading} in CHANGELOG.md`);
+          const bodyStart = start + heading.length;
+          const next = changelog.indexOf("\n## ", bodyStart);
+          const body = changelog.slice(bodyStart, next < 0 ? undefined : next).trim();
+          if (!body) throw new Error(`Missing release notes for ${process.env.RELEASE_TAG}`);
+          fs.writeFileSync(process.env.RELEASE_NOTES, `${body}\n`);
+          NODE
+
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft --prerelease=false
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --prerelease=false \
+              --title "Perfect Sync $RELEASE_TAG" \
+              --notes-file "$RELEASE_NOTES"
             test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease --jq '[.isDraft, .isPrerelease] | @tsv')" = $'true\tfalse'
           else
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
+              --prerelease=false \
               --title "Perfect Sync $RELEASE_TAG" \
-              --notes-file - <<'NOTES'
-          IMPORTANT: v0.1.6 performs a one-time reset of existing profiles,
-          personal mod selections, configured game sources, immutable bases, and
-          private workspaces, then opens first-time setup. Select a fresh, untouched
-          Among Us installation; verify or reinstall the game first if needed. The
-          chosen large-data storage location and GitHub credential are kept.
-
-          Experimental release, nothing official or stable yet. Expect rough edges
-          and breaking changes. See CHANGELOG.md for details and known limitations.
-          NOTES
+              --notes-file "$RELEASE_NOTES"
           fi
 
           release_id="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)"
