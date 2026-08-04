@@ -141,19 +141,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_NOTES: ${{ runner.temp }}/release-notes.md
         run: |
-          node --input-type=module <<'NODE'
-          import fs from "node:fs";
+          cat > "$RELEASE_NOTES" <<'NOTES'
+          IMPORTANT: v0.1.7 migrates managed storage schemas 1 through 5 to the
+          direct-source schema 6 in place. Profiles, personal mod selections,
+          configured original sources, and valid published profile instances are
+          preserved. Obsolete immutable-base data is removed only after canonical
+          containment and reparse checks.
 
-          const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
-          const heading = `## ${process.env.RELEASE_TAG} (experimental)`;
-          const start = changelog.indexOf(heading);
-          if (start < 0) throw new Error(`Missing ${heading} in CHANGELOG.md`);
-          const bodyStart = start + heading.length;
-          const next = changelog.indexOf("\n## ", bodyStart);
-          const body = changelog.slice(bodyStart, next < 0 ? undefined : next).trim();
-          if (!body) throw new Error(`Missing release notes for ${process.env.RELEASE_TAG}`);
-          fs.writeFileSync(process.env.RELEASE_NOTES, `${body}\n`);
-          NODE
+          Experimental release, nothing official or stable yet. Expect rough edges
+          and breaking changes. See CHANGELOG.md for details and known limitations.
+          NOTES
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$RELEASE_TAG" \
