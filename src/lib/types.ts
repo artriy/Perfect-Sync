@@ -45,7 +45,7 @@ export interface Profile {
   crewColor: string;
   /** reference info only; the app does not change the game version in v1 */
   gameBuild?: string;
-  /** exact configured Among Us instance selected and persisted for this profile */
+  /** exact configured original Among Us source selected and persisted for this profile */
   gameInstanceId?: string;
   mods: ProfileMod[];
   /** exact LevelImposter maps installed for this profile */
@@ -133,12 +133,15 @@ export interface GameInstall {
   runtime?: Runtime;
   /** detected Among Us build/version when readable */
   build?: string;
-  /** legacy writability diagnostic; Perfect Sync never writes to the source */
+  /** legacy writability diagnostic; Perfect Sync never writes to the original source */
   writable?: boolean;
-  /** true when no known mod-loader artifacts are present in the source root */
+  /** true when no known mod-loader artifacts are present in the original source */
   sourceClean?: boolean;
-  /** existing root artifacts that prevent a new exact source snapshot */
+  /** existing root artifacts that prevent using this folder as an original source */
   sourceModArtifacts?: string[];
+  sourceFingerprint?: string;
+  sourceFileCount?: number;
+  sourceByteCount?: number;
 }
 
 export interface GameInstance extends GameInstall {
@@ -179,13 +182,13 @@ export interface Settings {
   /** local DLLs that should be installed into every profile */
   personalLocalMods?: PersonalLocalMod[];
   setupComplete: boolean;
-  /** true after setup has selected a fresh source for the exact immutable-base workflow */
+  /** true after setup has recorded an exact original Among Us source */
   freshSourceSetupComplete?: boolean;
   /** don't warn on launch when BepInEx isn't fully installed */
   skipLaunchWarning?: boolean;
   /** id of the profile to re-select on startup */
   activeProfile?: string;
-  /** custom root for managed game data and package caches; omitted for the platform default */
+  /** custom root for direct profile instances and package caches; omitted for the platform default */
   storagePath?: string;
   /** whether a GitHub token is stored in the native credential store */
   hasGithubToken: boolean;

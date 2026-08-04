@@ -57,12 +57,12 @@ export function LaunchWarning({ open, onInstall, onLaunchAnyway, onCancel }: Lau
             <div className="flex items-center gap-2.5">
               <Warning size={20} weight="fill" className="text-[#ffe49a]" />
               <h2 id="launch-warning-title" className="text-[18px] font-semibold text-ink">
-                Isolated workspace isn't ready
+                Direct profile instance isn't ready
               </h2>
             </div>
             <p id="launch-warning-description" className="mt-2 text-[13px] leading-relaxed text-ink-dim">
-              BepInEx and this profile's mods have not been verified in the private workspace. You can prepare it,
-              or launch a clean workspace without changing the original game source.
+              BepInEx and this profile's mods have not been verified in its direct instance. You can prepare it,
+              or launch a direct vanilla instance without changing the original game source.
             </p>
 
             <label className="mt-4 flex cursor-pointer items-center gap-2 text-[12.5px] text-ink-dim">
@@ -96,7 +96,7 @@ export function LaunchWarning({ open, onInstall, onLaunchAnyway, onCancel }: Lau
                 onClick={onInstall}
                 className="ring-focus accent-grad rounded-xl px-4 py-2.5 text-[13.5px] font-bold text-[#0d0820]"
               >
-                Prepare workspace
+                Prepare instance
               </button>
             </div>
           </motion.div>

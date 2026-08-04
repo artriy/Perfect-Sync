@@ -26,7 +26,7 @@ import {
 import { useModalFocus } from "../lib/useModalFocus";
 import { TrustBadge } from "./TrustBadge";
 import { ReleasePicker } from "./ReleasePicker";
-import type { GameInstance, GithubTokenAction, Settings, Store, Trust } from "../lib/types";
+import type { GameInstall, GameInstance, GithubTokenAction, Settings, Store, Trust } from "../lib/types";
 import { displayPath } from "../lib/displayPath";
 
 interface SettingsModalProps {
@@ -54,6 +54,32 @@ type LoaderView =
 type RequestIdentity = { session: number; path: string; profileId: string };
 
 const MAX_INSTANCE_NAME = 64;
+
+function normalizedSourcePath(path: string): string {
+  return path.trim().replaceAll("\\", "/").replace(/\/+$/u, "").toLocaleLowerCase();
+}
+
+function refreshedInstance(instance: GameInstance, game: GameInstall): GameInstance {
+  const sameSource = normalizedSourcePath(instance.path) === normalizedSourcePath(game.path);
+  return {
+    ...instance,
+    path: game.path,
+    arch: game.arch,
+    store: game.store,
+    runtime: game.runtime ?? "native",
+    build: game.build ?? (sameSource ? instance.build : undefined),
+    writable: game.writable ?? (sameSource ? instance.writable : undefined),
+    sourceClean: game.sourceClean ?? (sameSource ? instance.sourceClean : undefined),
+    sourceModArtifacts:
+      game.sourceModArtifacts ?? (sameSource ? instance.sourceModArtifacts : undefined),
+    sourceFingerprint:
+      game.sourceFingerprint ?? (sameSource ? instance.sourceFingerprint : undefined),
+    sourceFileCount:
+      game.sourceFileCount ?? (sameSource ? instance.sourceFileCount : undefined),
+    sourceByteCount:
+      game.sourceByteCount ?? (sameSource ? instance.sourceByteCount : undefined),
+  };
+}
 
 export function SettingsModal({
   open,
@@ -90,6 +116,7 @@ export function SettingsModal({
   const [storagePending, setStoragePending] = useState(false);
   const [errorLogSaving, setErrorLogSaving] = useState(false);
   const [draftError, setDraftError] = useState("");
+  const [sourceMessage, setSourceMessage] = useState("");
   const [personalError, setPersonalError] = useState("");
   const [loaderNotice, setLoaderNotice] = useState<{ path: string; profileId: string; text: string } | null>(null);
   const [applyDoorstopFix, setApplyDoorstopFix] = useState(false);
@@ -157,6 +184,7 @@ export function SettingsModal({
       setStoragePending(false);
       setErrorLogSaving(false);
       setDraftError("");
+      setSourceMessage("");
       setPersonalError("");
       setLoaderNotice(null);
       setApplyDoorstopFix(false);
@@ -211,6 +239,7 @@ export function SettingsModal({
     folderPendingRef.current = true;
     setFolderPending(true);
     setDraftError("");
+    setSourceMessage("");
     return true;
   };
 
@@ -278,24 +307,35 @@ export function SettingsModal({
       const game = await inspectGame(path);
       if (!sameOpenSession(session, requestProfileId, openRef, sessionRef, profileIdRef)) return;
 
-      setInstances((current) => {
+      const existing = instances.find(
+        (instance) => normalizedSourcePath(instance.path) === normalizedSourcePath(game.path),
+      );
+      if (existing) {
+        setInstances((current) =>
+          current.map((instance) =>
+            instance.id === existing.id ? refreshedInstance(instance, game) : instance,
+          ),
+        );
+        setSelectedId(existing.id);
+        setSourceMessage("Original source checked. Save Settings to keep its refreshed source record.");
+      } else {
+        const id = `game-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
         const baseName = STORE_NAMES[game.store];
-        const instance: GameInstance = {
-          id: `game-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-          name: uniqueInstanceName(baseName, current),
-          path: game.path,
-          arch: game.arch,
-          store: game.store,
-          runtime: game.runtime ?? "native",
-          build: game.build,
-          writable: game.writable,
-        };
-        setSelectedId(instance.id);
-        return [...current, instance];
-      });
+        setInstances((current) => [
+          ...current,
+          {
+            ...game,
+            id,
+            name: uniqueInstanceName(baseName, current),
+            runtime: game.runtime ?? "native",
+          },
+        ]);
+        setSelectedId(id);
+        setSourceMessage("Original source inspected. Save Settings to add its source record.");
+      }
     } catch (error) {
       if (sameOpenSession(session, requestProfileId, openRef, sessionRef, profileIdRef)) {
-        setDraftError(errorMessage(error));
+        setDraftError(actionableSettingsError(error));
       }
     } finally {
       endFolderWork(session);
@@ -314,24 +354,52 @@ export function SettingsModal({
       if (!path || !sameSelectedSession(session, requestProfileId, targetId, originalPath, openRef, sessionRef, profileIdRef, selectedRef)) return;
       const game = await inspectGame(path);
       if (!sameSelectedSession(session, requestProfileId, targetId, originalPath, openRef, sessionRef, profileIdRef, selectedRef)) return;
+      const duplicate = instances.find(
+        (instance) =>
+          instance.id !== targetId &&
+          normalizedSourcePath(instance.path) === normalizedSourcePath(game.path),
+      );
+      if (duplicate) {
+        throw new Error(`That original source is already saved as “${duplicate.name}”.`);
+      }
       setInstances((current) =>
         current.map((instance) =>
-          instance.id === targetId
-            ? {
-                ...instance,
-                path: game.path,
-                arch: game.arch,
-                store: game.store,
-                runtime: game.runtime ?? "native",
-                build: game.build,
-                writable: game.writable,
-              }
-            : instance,
+          instance.id === targetId ? refreshedInstance(instance, game) : instance,
         ),
+      );
+      setSourceMessage(
+        normalizedSourcePath(originalPath) === normalizedSourcePath(game.path)
+          ? "Original source checked. Save Settings to keep its refreshed source record."
+          : "Original source changed. Save Settings to bind this direct instance to the new source record.",
       );
     } catch (error) {
       if (sameSelectedSession(session, requestProfileId, targetId, originalPath, openRef, sessionRef, profileIdRef, selectedRef)) {
-        setDraftError(errorMessage(error));
+        setDraftError(actionableSettingsError(error));
+      }
+    } finally {
+      endFolderWork(session);
+    }
+  };
+
+  const refreshSelectedSource = async () => {
+    const target = selectedRef.current;
+    if (!target || !beginFolderWork()) return;
+    const session = sessionRef.current;
+    const requestProfileId = profileIdRef.current;
+    const targetId = target.id;
+    const originalPath = target.path;
+    try {
+      const game = await inspectGame(originalPath);
+      if (!sameSelectedSession(session, requestProfileId, targetId, originalPath, openRef, sessionRef, profileIdRef, selectedRef)) return;
+      setInstances((current) =>
+        current.map((instance) =>
+          instance.id === targetId ? refreshedInstance(instance, game) : instance,
+        ),
+      );
+      setSourceMessage("Original source checked. Save Settings to keep its refreshed source record.");
+    } catch (error) {
+      if (sameSelectedSession(session, requestProfileId, targetId, originalPath, openRef, sessionRef, profileIdRef, selectedRef)) {
+        setDraftError(actionableSettingsError(error));
       }
     } finally {
       endFolderWork(session);
@@ -584,11 +652,11 @@ export function SettingsModal({
                   </div>
                 </div>
                 <p className="mt-2.5 text-[11.5px] leading-relaxed text-ink-faint">
-                  Clean bases, the active isolated workspace, and downloaded packages use this folder. Profiles and settings remain in AppData.
+                  Direct profile instances and downloaded packages use this folder. Source records, profiles, and settings remain in AppData.
                 </p>
                 {settings.storageWarning && (
                   <p role="alert" className="mt-2 text-[11.5px] leading-relaxed text-[#ffb4b4]">
-                    {settings.storageWarning}
+                    {actionableSettingsError(settings.storageWarning)}
                   </p>
                 )}
                 <div className="mt-3 flex flex-wrap gap-2">
@@ -718,6 +786,15 @@ export function SettingsModal({
                     </div>
                     <button
                       type="button"
+                      onClick={() => void refreshSelectedSource()}
+                      disabled={hasPendingWork}
+                      className="ring-focus glass flex items-center gap-1.5 rounded-xl px-3 py-2.5 text-[12.5px] text-ink-dim hover:text-ink disabled:opacity-50"
+                    >
+                      <ArrowsClockwise size={14} className={folderPending ? "animate-spin" : undefined} />
+                      Check original
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => void changeSelectedFolder()}
                       disabled={hasPendingWork}
                       className="ring-focus glass rounded-xl px-3 py-2.5 text-[12.5px] text-ink-dim hover:text-ink disabled:opacity-50"
@@ -725,10 +802,42 @@ export function SettingsModal({
                       Change
                     </button>
                   </div>
+                  {sourceMessage && (
+                    <p role="status" className="px-1 text-[11.5px] leading-relaxed text-[#aef3d8]">
+                      {sourceMessage}
+                    </p>
+                  )}
+                  {selected.sourceFingerprint ? (
+                    <div className="rounded-xl border border-white/9 bg-white/[0.035] px-3.5 py-3 text-[11.5px] leading-relaxed text-ink-faint">
+                      <p className="font-semibold text-ink-dim">Recorded original source</p>
+                      <p className="mt-1 font-mono">
+                        {selected.build ? `Build ${selected.build} · ` : ""}
+                        {selected.sourceFileCount?.toLocaleString() ?? "Unknown"} files
+                        {selected.sourceByteCount !== undefined
+                          ? ` · ${selected.sourceByteCount.toLocaleString()} bytes`
+                          : ""}
+                      </p>
+                      <p className="mt-0.5 truncate font-mono" title={selected.sourceFingerprint}>
+                        {selected.sourceFingerprint}
+                      </p>
+                    </div>
+                  ) : (
+                    <div role="alert" className="rounded-xl border border-[#ffd23f]/25 bg-[#ffd23f]/8 px-3.5 py-3 text-[12px] leading-relaxed text-[#ffe49a]">
+                      This source has no complete source record. Check the original folder, then save Settings before building or repairing a direct instance.
+                    </div>
+                  )}
                   {selected.id === profileGameInstanceId && (
                     <p className="px-1 text-[11.5px] leading-relaxed text-ink-faint">
-                      This profile uses this source. Changing it creates a new private base while keeping the profile connected.
+                      This profile uses this source. Checking the same original folder refreshes its source record without changing the profile, selected instance, or installed mods.
                     </p>
+                  )}
+                  {selected.sourceClean === false && (
+                    <div role="alert" className="rounded-xl border border-[#ff8a8a]/30 bg-[#ff8a8a]/10 px-3.5 py-3 text-[12px] leading-relaxed text-[#ffb4b4]">
+                      This original source is invalid because it contains mod-loader files
+                      {selected.sourceModArtifacts?.length
+                        ? ` (${selected.sourceModArtifacts.slice(0, 4).join(", ")}${selected.sourceModArtifacts.length > 4 ? ", …" : ""})`
+                        : ""}. Verify or repair Among Us in its store, then check the original folder again.
+                    </div>
                   )}
                   {selected.store === "msstore" && selected.writable === false && (
                     <div className="rounded-xl border border-[#ffd23f]/25 bg-[#ffd23f]/8 px-3.5 py-3">
@@ -739,7 +848,7 @@ export function SettingsModal({
                             This Microsoft Store source is read-only
                           </p>
                           <p className="mt-1 text-[12px] leading-relaxed text-ink-dim">
-                            Supported. Perfect Sync imports it into a writable private workspace automatically and leaves this source untouched.
+                            Supported. Perfect Sync builds writable direct profile instances from this source and never modifies the original folder.
                           </p>
                         </div>
                       </div>
@@ -1106,14 +1215,14 @@ export function SettingsModal({
                 <div>
                   <p className="text-[12.5px] text-ink">BepInEx error log</p>
                   <p className="mt-0.5 text-[11px] leading-relaxed text-ink-faint">
-                    Save LogOutput.log from the active isolated workspace for troubleshooting.
+                    Save LogOutput.log from the active direct profile instance for troubleshooting.
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={() => void saveErrorLog()}
                   disabled={hasPendingWork}
-                  title="Save LogOutput.log from the active managed profile workspace"
+                  title="Save LogOutput.log from the active direct profile instance"
                   className="ring-focus glass-2 flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-[12px] font-semibold text-ink-dim hover:text-ink disabled:opacity-50"
                 >
                   <FileArrowDown size={15} />
@@ -1197,7 +1306,7 @@ const STORE_NAMES: Record<Store, string> = {
 
 function LoaderStatusView({ state, selected }: { state: LoaderView; selected: boolean }) {
   if (state.kind === "idle") {
-    return <div className="text-ink-faint">{selected ? "Workspace status has not been checked." : "Select a source above to check the workspace."}</div>;
+    return <div className="text-ink-faint">{selected ? "Direct instance status has not been checked." : "Select a source above to check its direct instance."}</div>;
   }
   if (state.kind === "loading") {
     return <div role="status" className="text-ink-faint">Checking loader status</div>;
@@ -1213,7 +1322,7 @@ function LoaderStatusView({ state, selected }: { state: LoaderView; selected: bo
     return state.value ? (
       <LoaderDetails status={state.value} incomplete />
     ) : (
-      <div className="text-[#ffe49a]">This profile has not prepared an isolated workspace yet.</div>
+      <div className="text-[#ffe49a]">This profile has not prepared a direct instance yet.</div>
     );
   }
   return <LoaderDetails status={state.value} />;
@@ -1223,9 +1332,9 @@ function LoaderDetails({ status, incomplete = false }: { status: LoaderStatus; i
   return (
     <div className="flex flex-col gap-1">
       {incomplete && (
-        <div className="mb-1 text-[#ffe49a]">The isolated workspace needs to be prepared or repaired.</div>
+        <div className="mb-1 text-[#ffe49a]">The direct profile instance needs to be prepared or repaired.</div>
       )}
-      <StatusRow ok={status.workspaceReady} label="Isolated profile workspace" />
+      <StatusRow ok={status.workspaceReady} label="Direct profile instance" />
       <StatusRow ok={status.winhttp} label="Doorstop (winhttp.dll)" />
       <StatusRow ok={status.preloader} label="BepInEx core" />
       <StatusRow
@@ -1237,7 +1346,7 @@ function LoaderDetails({ status, incomplete = false }: { status: LoaderStatus; i
       <StatusRow ok={status.steamAppid} label="Steam launch fix" />
       {status.runtime !== "native" && <StatusRow ok={status.runtimeReady} label={`${status.runtime} winhttp override`} />}
       <div className="mt-1 text-ink-faint">
-        plugins: {status.profilePlugins} in profile · {status.gamePlugins} in private workspace
+        plugins: {status.profilePlugins} in profile · {status.gamePlugins} in direct instance
         {status.workspacePath ? <span className="mt-0.5 block truncate font-mono">{displayPath(status.workspacePath)}</span> : null}
       </div>
     </div>
@@ -1290,10 +1399,22 @@ function errorMessage(error: unknown): string {
 function actionableSettingsError(error: unknown): string {
   const message = errorMessage(error);
   if (/unique folder/i.test(message)) {
-    return `${message} Choose a different folder for one instance, or remove the duplicate before saving.`;
+    return `${message} Choose a different original folder for one instance, or remove the duplicate source record before saving.`;
   }
   if (/unique id/i.test(message)) {
-    return `${message} Remove the duplicate instance and add its folder again.`;
+    return `${message} Remove the duplicate instance and add its original folder again.`;
+  }
+  if (/(source|original).*(unavailable|not found|does not exist|cannot be reached)|cannot access.*(source|original)/i.test(message)) {
+    return `The recorded original Among Us source is unavailable. Reconnect its drive or use Change to choose the exact original folder again. ${message}`;
+  }
+  if (/(source.*(fingerprint|build).*(changed|differ|mismatch)|source changed)/i.test(message)) {
+    return `The original Among Us source changed since its source record was saved. Check the original folder and save Settings to accept its new fingerprint and build. ${message}`;
+  }
+  if (/(storage.*(inside|overlap|contain).*(source|among us)|(source|among us).*(inside|overlap|contain).*storage|storage.*(source|among us).*cannot contain|cannot contain one another|unsafe storage)/i.test(message)) {
+    return `Perfect Sync storage overlaps the original Among Us source. Move storage to the recommended or another non-overlapping location before building a direct instance. ${message}`;
+  }
+  if (/(invalid.*(source|among us)|(source|among us).*(invalid|not (?:a )?valid)|mod-loader artifacts|among us executable|non-link directory|regular.*directory)/i.test(message)) {
+    return `The selected original Among Us source is invalid. Verify or repair the game in its store, then check the original folder again. ${message}`;
   }
   return message;
 }

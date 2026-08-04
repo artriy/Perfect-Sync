@@ -343,12 +343,12 @@ export function SetupModal({
             className="glass-strong relative flex max-h-[90vh] w-[560px] max-w-full flex-col rounded-3xl p-6 max-[600px]:h-[100dvh] max-[600px]:max-h-none max-[600px]:w-full max-[600px]:rounded-none max-[600px]:p-4"
           >
             <h2 className="text-[20px] font-semibold text-ink">
-              {migrationRequired ? "Select a fresh Among Us installation" : "Welcome to Perfect Sync"}
+              {migrationRequired ? "Record your original Among Us installation" : "Welcome to Perfect Sync"}
             </h2>
             <p className="mt-0.5 text-[13px] text-ink-dim">
               {chosen
                 ? "Step 2 of 2: choose storage and your isolated mod setup."
-                : "Step 1 of 2: find your fresh Among Us source."}
+                : "Step 1 of 2: find your original Among Us source."}
             </p>
             {migrationRequired && (
               <div
@@ -358,11 +358,11 @@ export function SetupModal({
                 <WarningCircle size={18} weight="fill" className="mt-0.5 shrink-0" />
                 <span>
                   <strong className="block font-semibold text-[#ffe4bd]">
-                    v0.1.6 starts from a clean profile state for the new exact-base workflow.
+                    Perfect Sync needs an exact source record for your original game.
                   </strong>
-                  Existing profiles and private managed workspaces were removed once. Verify or
-                  reinstall Among Us, then select that untouched folder here. Perfect Sync will
-                  import a private clean base and leave the original game folder unchanged.
+                  Existing profiles, installed mods, and valid direct instances are preserved. Verify
+                  or repair Among Us if needed, then select its original folder so Perfect Sync can
+                  record the canonical path, complete fingerprint, file count, size, and build.
                 </span>
               </div>
             )}
@@ -487,17 +487,17 @@ export function SetupModal({
                     <CheckCircle size={17} weight="fill" className="mt-0.5 shrink-0 text-[#5be3b0]" />
                     <span>
                       {selectedInstall?.sourceClean === false
-                        ? "Perfect Sync leaves this folder untouched. Setup can only reuse a compatible private base that was created earlier."
-                        : "Perfect Sync leaves this folder untouched. The first setup imports an exact private base, and every profile runs from one disposable isolated workspace."}
+                        ? "Perfect Sync leaves this folder untouched, but it must be repaired before a direct profile instance can be built from it."
+                        : "Perfect Sync records this original source exactly and leaves it untouched. Each profile runs from its own isolated direct instance."}
                     </span>
                   </div>
                   {selectedInstall?.sourceClean === false && (
                     <div role="alert" className="mt-2 flex items-start gap-2 rounded-xl border border-[#ff8a8a]/30 bg-[#ff8a8a]/10 px-3.5 py-3 text-[12px] leading-relaxed text-[#ffb4b4]">
                       <WarningCircle size={17} weight="fill" className="mt-0.5 shrink-0" />
                       <span>
-                        This source contains existing mod-loader files (
+                        This original source is invalid because it contains mod-loader files (
                         {selectedInstall.sourceModArtifacts?.slice(0, 4).join(", ") || "unknown artifacts"}
-                        {(selectedInstall.sourceModArtifacts?.length ?? 0) > 4 ? ", …" : ""}). Perfect Sync will not remove them or call this a fresh base. Verify or reinstall a clean game first, unless this source already has a compatible private base.
+                        {(selectedInstall.sourceModArtifacts?.length ?? 0) > 4 ? ", …" : ""}). Perfect Sync will not remove them. Verify or repair Among Us in its store, then inspect this original folder again.
                       </span>
                     </div>
                   )}
@@ -518,7 +518,7 @@ export function SetupModal({
                       </div>
                     </div>
                     <p className="mt-2.5 text-[11.5px] leading-relaxed text-ink-faint">
-                      The clean game base, isolated workspace, and download cache live here. Profiles and settings stay in AppData.
+                      Direct profile instances and the download cache live here. Profiles, source records, and settings stay in AppData.
                     </p>
                     <div className="mt-3 flex flex-wrap gap-2">
                       <button
@@ -623,7 +623,7 @@ export function SetupModal({
                       <div className="glass mt-3 flex items-start gap-2 rounded-xl px-3.5 py-3 text-[12px] leading-relaxed text-ink-dim">
                         <CheckCircle size={16} weight="fill" className="mt-0.5 shrink-0 text-[#5be3b0]" />
                         <span>
-                          Continue to import the clean game base, install BepInEx, and verify the private workspace.
+                          Continue to record the original source, build the direct profile instance, install BepInEx, and verify it.
                         </span>
                       </div>
                       {visibleMessage && (
@@ -716,7 +716,7 @@ export function SetupModal({
                 {installing
                   ? setupKind === "tou"
                     ? "Installing Town of Us…"
-                    : "Preparing workspace…"
+                    : "Preparing direct instance…"
                   : setupKind === "tou"
                     ? "Install Town of Us"
                     : "Set up BepInEx"}

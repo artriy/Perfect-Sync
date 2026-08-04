@@ -8,10 +8,11 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::io::Read;
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
@@ -54,6 +55,10 @@ impl AssetSize {
 
     pub const fn bytes(self) -> u64 {
         self.bytes
+    }
+
+    pub const fn sha256(self) -> Option<[u8; 32]> {
+        self.sha256
     }
 }
 
@@ -203,11 +208,19 @@ pub struct HeadResponse {
 pub trait Http {
     fn get_text(&self, url: &str) -> Result<String, ResolveError>;
 
+    fn get_text_fresh(&self, url: &str) -> Result<String, ResolveError> {
+        Ok(self.get_text_with_url_fresh(url)?.body)
+    }
+
     fn get_text_with_url(&self, url: &str) -> Result<TextResponse, ResolveError> {
         Ok(TextResponse {
             body: self.get_text(url)?,
             final_url: url.to_string(),
         })
+    }
+
+    fn get_text_with_url_fresh(&self, url: &str) -> Result<TextResponse, ResolveError> {
+        self.get_text_with_url(url)
     }
 
     fn head(&self, _url: &str) -> Result<HeadResponse, ResolveError> {
@@ -227,13 +240,48 @@ pub trait Http {
         on_progress(size, Some(size));
         Ok(bytes)
     }
+
+    fn download_to(
+        &self,
+        url: &str,
+        output: &mut dyn Write,
+        on_progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<u64, ResolveError> {
+        let bytes = self.get_bytes(url)?;
+        output
+            .write_all(&bytes)
+            .map_err(|error| ResolveError::Http(error.to_string()))?;
+        let size = bytes.len() as u64;
+        on_progress(size, Some(size));
+        Ok(size)
+    }
 }
 
 /// Real HTTPS client (blocking) used at runtime.
+#[derive(Clone)]
 pub struct UreqHttp {
     agent: ureq::Agent,
     download_agent: ureq::Agent,
     authorization: Option<String>,
+    metadata_cache: Arc<MetadataCache>,
+}
+
+#[derive(Default)]
+struct MetadataCacheState {
+    responses: HashMap<String, CachedTextResponse>,
+    in_flight: HashSet<String>,
+    active_requests: usize,
+}
+
+struct CachedTextResponse {
+    response: TextResponse,
+    cached_at: Instant,
+}
+
+#[derive(Default)]
+struct MetadataCache {
+    state: Mutex<MetadataCacheState>,
+    ready: Condvar,
 }
 
 const MAX_DOWNLOAD: u64 = 300 * 1024 * 1024;
@@ -243,6 +291,8 @@ const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const METADATA_OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_IO_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const METADATA_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_METADATA_CACHE_ENTRIES: usize = 256;
 fn parsed_https_url(value: &str) -> Result<url::Url, ResolveError> {
     let parsed =
         url::Url::parse(value).map_err(|_| ResolveError::InsecureUrl(value.to_string()))?;
@@ -292,6 +342,7 @@ impl UreqHttp {
             agent: build_agent(METADATA_IO_TIMEOUT, METADATA_OVERALL_TIMEOUT),
             download_agent: build_download_agent(),
             authorization: token.map(|token| format!("Bearer {token}")),
+            metadata_cache: Arc::new(MetadataCache::default()),
         }
     }
 
@@ -341,14 +392,8 @@ impl UreqHttp {
                 ureq::Error::Transport(error) => ResolveError::Http(error.to_string()),
             })
     }
-}
 
-impl Http for UreqHttp {
-    fn get_text(&self, url: &str) -> Result<String, ResolveError> {
-        Ok(self.get_text_with_url(url)?.body)
-    }
-
-    fn get_text_with_url(&self, url: &str) -> Result<TextResponse, ResolveError> {
+    fn fetch_text(&self, url: &str) -> Result<TextResponse, ResolveError> {
         let response = self.call(url)?;
         let final_url = response.get_url().to_string();
         let mut bytes = Vec::new();
@@ -363,6 +408,102 @@ impl Http for UreqHttp {
         let body =
             String::from_utf8(bytes).map_err(|error| ResolveError::Parse(error.to_string()))?;
         Ok(TextResponse { body, final_url })
+    }
+
+    fn cached_text(
+        &self,
+        url: &str,
+        fresh_after: Option<Instant>,
+    ) -> Result<TextResponse, ResolveError> {
+        loop {
+            let mut state = self
+                .metadata_cache
+                .state
+                .lock()
+                .map_err(|_| ResolveError::Http("metadata cache lock is poisoned".into()))?;
+            if let Some(cached) = state.responses.get(url) {
+                let current = fresh_after.map_or_else(
+                    || cached.cached_at.elapsed() < METADATA_CACHE_TTL,
+                    |started| cached.cached_at >= started,
+                );
+                if current {
+                    return Ok(cached.response.clone());
+                }
+            }
+            state.responses.remove(url);
+            if state.in_flight.insert(url.to_string()) {
+                break;
+            }
+            drop(
+                self.metadata_cache
+                    .ready
+                    .wait(state)
+                    .map_err(|_| ResolveError::Http("metadata cache lock is poisoned".into()))?,
+            );
+        }
+
+        {
+            let mut state = self
+                .metadata_cache
+                .state
+                .lock()
+                .map_err(|_| ResolveError::Http("metadata cache lock is poisoned".into()))?;
+            while state.active_requests >= 4 {
+                state =
+                    self.metadata_cache.ready.wait(state).map_err(|_| {
+                        ResolveError::Http("metadata cache lock is poisoned".into())
+                    })?;
+            }
+            state.active_requests += 1;
+        }
+        let result = self.fetch_text(url);
+        let mut state = self
+            .metadata_cache
+            .state
+            .lock()
+            .map_err(|_| ResolveError::Http("metadata cache lock is poisoned".into()))?;
+        state.in_flight.remove(url);
+        state.active_requests = state.active_requests.saturating_sub(1);
+        if let Ok(response) = &result {
+            state
+                .responses
+                .retain(|_, cached| cached.cached_at.elapsed() < METADATA_CACHE_TTL);
+            if state.responses.len() >= MAX_METADATA_CACHE_ENTRIES {
+                if let Some(oldest) = state
+                    .responses
+                    .iter()
+                    .max_by_key(|(_, cached)| cached.cached_at.elapsed())
+                    .map(|(key, _)| key.clone())
+                {
+                    state.responses.remove(&oldest);
+                }
+            }
+            state.responses.insert(
+                url.to_string(),
+                CachedTextResponse {
+                    response: response.clone(),
+                    cached_at: Instant::now(),
+                },
+            );
+        }
+        self.metadata_cache.ready.notify_all();
+        result
+    }
+}
+
+impl Http for UreqHttp {
+    fn get_text(&self, url: &str) -> Result<String, ResolveError> {
+        Ok(self.get_text_with_url(url)?.body)
+    }
+
+    fn get_text_with_url(&self, url: &str) -> Result<TextResponse, ResolveError> {
+        parsed_https_url(url)?;
+        self.cached_text(url, None)
+    }
+
+    fn get_text_with_url_fresh(&self, url: &str) -> Result<TextResponse, ResolveError> {
+        parsed_https_url(url)?;
+        self.cached_text(url, Some(Instant::now()))
     }
 
     fn head(&self, url: &str) -> Result<HeadResponse, ResolveError> {
@@ -386,13 +527,24 @@ impl Http for UreqHttp {
         url: &str,
         on_progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<Vec<u8>, ResolveError> {
+        let mut bytes = Vec::new();
+        self.download_to(url, &mut bytes, on_progress)?;
+        Ok(bytes)
+    }
+
+    fn download_to(
+        &self,
+        url: &str,
+        output: &mut dyn Write,
+        on_progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<u64, ResolveError> {
         let response = self.call_download(url)?;
         let total = response
             .header("Content-Length")
             .and_then(|value| value.parse::<u64>().ok());
         let mut reader = response.into_reader().take(MAX_DOWNLOAD + 1);
-        let mut bytes = Vec::new();
         let mut buffer = [0_u8; 64 * 1024];
+        let mut received = 0_u64;
         on_progress(0, total);
         loop {
             let count = reader
@@ -401,13 +553,16 @@ impl Http for UreqHttp {
             if count == 0 {
                 break;
             }
-            bytes.extend_from_slice(&buffer[..count]);
-            on_progress(bytes.len() as u64, total);
+            received += count as u64;
+            if received > MAX_DOWNLOAD {
+                return Err(ResolveError::Http("download too large".into()));
+            }
+            output
+                .write_all(&buffer[..count])
+                .map_err(|error| ResolveError::Http(error.to_string()))?;
+            on_progress(received, total);
         }
-        if bytes.len() as u64 > MAX_DOWNLOAD {
-            return Err(ResolveError::Http("download too large".into()));
-        }
-        Ok(bytes)
+        Ok(received)
     }
 }
 
@@ -433,6 +588,53 @@ pub fn download_resolved(
         }
     }
     Ok(bytes)
+}
+
+struct VerifyingWriter<'a> {
+    output: &'a mut dyn Write,
+    hasher: Sha256,
+    bytes: u64,
+}
+
+impl Write for VerifyingWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.output.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        self.bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+
+pub fn download_resolved_to_writer(
+    http: &dyn Http,
+    resolved: &ResolvedDownload,
+    output: &mut dyn Write,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<(), ResolveError> {
+    parsed_https_url(&resolved.url)?;
+    let mut verifying = VerifyingWriter {
+        output,
+        hasher: Sha256::new(),
+        bytes: 0,
+    };
+    let actual = http.download_to(&resolved.url, &mut verifying, on_progress)?;
+    if actual != verifying.bytes || actual != resolved.size.bytes {
+        return Err(ResolveError::SizeMismatch {
+            expected: resolved.size.bytes,
+            actual,
+        });
+    }
+    if let Some(expected) = resolved.size.sha256 {
+        let actual: [u8; 32] = verifying.hasher.finalize().into();
+        if actual != expected {
+            return Err(ResolveError::DigestMismatch);
+        }
+    }
+    Ok(())
 }
 
 pub fn parse_release(json: &str) -> Result<Release, ResolveError> {
@@ -624,11 +826,21 @@ fn parse_expanded_assets(repo: &str, tag: &str, html: &str) -> Result<Vec<Asset>
     Ok(assets)
 }
 
-fn fetch_expanded_release(http: &dyn Http, repo: &str, tag: &str) -> Result<Release, ResolveError> {
+fn fetch_expanded_release(
+    http: &dyn Http,
+    repo: &str,
+    tag: &str,
+    fresh: bool,
+) -> Result<Release, ResolveError> {
     validate_tag(tag)?;
     let encoded = utf8_percent_encode(tag, NON_ALPHANUMERIC);
     let url = format!("https://github.com/{repo}/releases/expanded_assets/{encoded}");
-    let assets = parse_expanded_assets(repo, tag, &http.get_text(&url)?)?;
+    let html = if fresh {
+        http.get_text_fresh(&url)?
+    } else {
+        http.get_text(&url)?
+    };
+    let assets = parse_expanded_assets(repo, tag, &html)?;
     Ok(Release {
         tag: tag.to_string(),
         assets,
@@ -637,19 +849,26 @@ fn fetch_expanded_release(http: &dyn Http, repo: &str, tag: &str) -> Result<Rele
     })
 }
 
-/// Resolve GitHub's stable "latest" redirect without consuming REST API quota.
-/// If that route is unavailable, the repository's Atom feed supplies the newest release.
-pub fn fetch_latest_release(http: &dyn Http, repo: &str) -> Result<Release, ResolveError> {
+fn fetch_latest_release_with_freshness(
+    http: &dyn Http,
+    repo: &str,
+    fresh: bool,
+) -> Result<Release, ResolveError> {
     let repo = canonical_repo(repo)?;
     let latest = format!("https://github.com/{repo}/releases/latest");
-    match http.get_text_with_url(&latest) {
+    let response = if fresh {
+        http.get_text_with_url_fresh(&latest)
+    } else {
+        http.get_text_with_url(&latest)
+    };
+    match response {
         Ok(response) => {
             let tag = release_tag_from_response(&repo, &response).ok_or_else(|| {
                 ResolveError::Parse(format!(
                     "GitHub's latest release page did not identify a tag for {repo}"
                 ))
             })?;
-            fetch_expanded_release(http, &repo, &tag)
+            fetch_expanded_release(http, &repo, &tag, fresh)
         }
         Err(primary_error) => {
             let no_stable_release = matches!(primary_error, ResolveError::HttpStatus(404));
@@ -667,13 +886,21 @@ pub fn fetch_latest_release(http: &dyn Http, repo: &str) -> Result<Release, Reso
     }
 }
 
+pub fn fetch_latest_release(http: &dyn Http, repo: &str) -> Result<Release, ResolveError> {
+    fetch_latest_release_with_freshness(http, repo, false)
+}
+
+pub fn fetch_latest_release_fresh(http: &dyn Http, repo: &str) -> Result<Release, ResolveError> {
+    fetch_latest_release_with_freshness(http, repo, true)
+}
+
 pub fn fetch_release_by_tag(
     http: &dyn Http,
     repo: &str,
     tag: &str,
 ) -> Result<Release, ResolveError> {
     let repo = canonical_repo(repo)?;
-    fetch_expanded_release(http, &repo, tag)
+    fetch_expanded_release(http, &repo, tag, false)
 }
 
 pub fn resolved_asset(
@@ -766,12 +993,12 @@ fn no_asset_err(repo: &str, rel: &Release) -> ResolveError {
     }
 }
 
-/// List a repo's recent releases from its API-free Atom feed.
-pub fn fetch_releases(
+/// List a repo's recent release tags from its API-free Atom feed.
+pub fn fetch_release_tags(
     http: &dyn Http,
     repo: &str,
     per_page: u32,
-) -> Result<Vec<Release>, ResolveError> {
+) -> Result<Vec<String>, ResolveError> {
     if !(1..=100).contains(&per_page) {
         return Err(ResolveError::Parse(
             "per_page must be between 1 and 100".into(),
@@ -799,8 +1026,19 @@ pub fn fetch_releases(
             "GitHub's release feed contains no releases for {repo}"
         )));
     }
-    tags.into_iter()
-        .map(|tag| fetch_expanded_release(http, &repo, &tag))
+    Ok(tags)
+}
+
+/// List a repo's recent releases from its API-free Atom feed.
+pub fn fetch_releases(
+    http: &dyn Http,
+    repo: &str,
+    per_page: u32,
+) -> Result<Vec<Release>, ResolveError> {
+    let repo = canonical_repo(repo)?;
+    fetch_release_tags(http, &repo, per_page)?
+        .into_iter()
+        .map(|tag| fetch_expanded_release(http, &repo, &tag, false))
         .collect()
 }
 
@@ -965,6 +1203,62 @@ mod tests {
     }
 
     #[test]
+    fn fresh_latest_release_bypasses_cached_discovery_and_assets() {
+        struct FreshHttp(RefCell<Vec<&'static str>>);
+
+        impl Http for FreshHttp {
+            fn get_text(&self, _url: &str) -> Result<String, ResolveError> {
+                self.0.borrow_mut().push("cached assets");
+                Ok(r#"<a href="/A/Repo/releases/download/1.6.3-beta2/mod.dll">mod.dll</a>"#.into())
+            }
+
+            fn get_text_fresh(&self, _url: &str) -> Result<String, ResolveError> {
+                self.0.borrow_mut().push("fresh assets");
+                Ok(r#"<a href="/A/Repo/releases/download/1.7.0/mod.dll">mod.dll</a>"#.into())
+            }
+
+            fn get_text_with_url(&self, _url: &str) -> Result<TextResponse, ResolveError> {
+                self.0.borrow_mut().push("cached latest");
+                Ok(TextResponse {
+                    body: String::new(),
+                    final_url: "https://github.com/A/Repo/releases/tag/1.6.3-beta2".into(),
+                })
+            }
+
+            fn get_text_with_url_fresh(&self, _url: &str) -> Result<TextResponse, ResolveError> {
+                self.0.borrow_mut().push("fresh latest");
+                Ok(TextResponse {
+                    body: String::new(),
+                    final_url: "https://github.com/A/Repo/releases/tag/1.7.0".into(),
+                })
+            }
+
+            fn get_bytes(&self, _url: &str) -> Result<Vec<u8>, ResolveError> {
+                unreachable!()
+            }
+        }
+
+        let http = FreshHttp(RefCell::new(Vec::new()));
+        assert_eq!(
+            fetch_latest_release(&http, "A/Repo").unwrap().tag,
+            "1.6.3-beta2"
+        );
+        assert_eq!(
+            fetch_latest_release_fresh(&http, "A/Repo").unwrap().tag,
+            "1.7.0"
+        );
+        assert_eq!(
+            http.0.into_inner(),
+            [
+                "cached latest",
+                "cached assets",
+                "fresh latest",
+                "fresh assets"
+            ]
+        );
+    }
+
+    #[test]
     fn latest_uses_atom_fallback_and_preserves_primary_errors() {
         for status in [429, 500] {
             let http = RecordingHttp {
@@ -1051,6 +1345,14 @@ mod tests {
             body: "good".into(),
         };
         assert_eq!(download_resolved(&good, &resolved).unwrap(), b"good");
+        let mut streamed = Vec::new();
+        let mut progress = Vec::new();
+        download_resolved_to_writer(&good, &resolved, &mut streamed, &mut |received, total| {
+            progress.push((received, total))
+        })
+        .unwrap();
+        assert_eq!(streamed, b"good");
+        assert_eq!(progress, vec![(4, Some(4))]);
     }
 
     #[test]

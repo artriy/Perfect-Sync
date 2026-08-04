@@ -39,6 +39,7 @@ url = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
 regex = "1"
+reflink-copy = "0.1"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-updater = "2"

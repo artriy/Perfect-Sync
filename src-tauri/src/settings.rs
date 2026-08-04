@@ -55,6 +55,12 @@ pub struct GameInstance {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub executable_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_file_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_byte_count: Option<u64>,
     pub arch: Arch,
     pub store: Store,
     pub runtime: Runtime,
@@ -75,7 +81,7 @@ pub struct Settings {
     pub personal_local_mods: Vec<PersonalLocalMod>,
     #[serde(default)]
     pub setup_complete: bool,
-    /// True after the user has selected a fresh source under the exact-base workflow.
+    /// True after the user has selected and recorded an exact original source.
     #[serde(default)]
     pub fresh_source_setup_complete: bool,
     #[serde(default)]
@@ -225,6 +231,9 @@ fn migrate_legacy_game(text: &str) -> Option<GameInstance> {
         name: name.to_string(),
         path,
         executable_identity: None,
+        source_fingerprint: None,
+        source_file_count: None,
+        source_byte_count: None,
         arch,
         store,
         runtime,
@@ -302,6 +311,10 @@ pub fn cache_dir() -> PathBuf {
     } else {
         active.join("cache")
     }
+}
+
+pub fn cache_dir_if_initialized() -> Option<PathBuf> {
+    APP_DATA_DIR.get().map(|_| cache_dir())
 }
 
 pub fn catalog_cache_path() -> PathBuf {
@@ -880,6 +893,16 @@ pub fn save(settings: &Settings) -> Result<(), SettingsError> {
     write_settings_unlocked(settings)
 }
 
+pub fn set_active_profile(profile_id: &str) -> Result<(), SettingsError> {
+    let _guard = lock_settings()?;
+    let (mut settings, _) = load_unlocked()?;
+    if settings.active_profile.as_deref() == Some(profile_id) {
+        return Ok(());
+    }
+    settings.active_profile = Some(profile_id.to_string());
+    write_settings_unlocked(&settings)
+}
+
 pub fn view() -> Result<SettingsView, SettingsError> {
     let _guard = lock_settings()?;
     let (settings, recovery_warning) = load_unlocked()?;
@@ -922,6 +945,9 @@ mod tests {
                 name: "Steam".into(),
                 path: "C:/Among Us".into(),
                 executable_identity: Some("identity".into()),
+                source_fingerprint: None,
+                source_file_count: None,
+                source_byte_count: None,
                 arch: Arch::X86,
                 store: Store::Steam,
                 runtime: Runtime::Native,
@@ -1009,6 +1035,21 @@ mod tests {
         assert!(serde_json::to_string(&settings)
             .unwrap()
             .contains("\"gameInstances\""));
+    }
+
+    #[test]
+    fn source_record_fields_round_trip_with_game_instance() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"gameInstances":[{"id":"steam","name":"Steam","path":"C:/Among Us","sourceFingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sourceFileCount":42,"sourceByteCount":4096,"arch":"x86","store":"steam","runtime":"native","build":"2026.8.4"}]}"#,
+        )
+        .unwrap();
+        let instance = &settings.game_instances[0];
+        assert_eq!(instance.source_file_count, Some(42));
+        assert_eq!(instance.source_byte_count, Some(4096));
+        let serialized = serde_json::to_string(&settings).unwrap();
+        assert!(serialized.contains("\"sourceFingerprint\""));
+        assert!(serialized.contains("\"sourceFileCount\":42"));
+        assert!(serialized.contains("\"sourceByteCount\":4096"));
     }
 
     #[test]

@@ -95,6 +95,7 @@ dependencies = [
  "keyring",
  "log",
  "perfect-sync-core",
+ "reflink-copy",
  "regex",
  "secrecy",
  "serde",
@@ -3534,6 +3535,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "reflink-copy"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9dd7ab4af0363d5ccfd2838d782a28196cf32a5cc2e4fe3c5dc83f2be588b8b"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "rustix 1.1.4",
+ "windows",
 ]
 
 [[package]]

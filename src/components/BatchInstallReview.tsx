@@ -23,6 +23,9 @@ interface OptionState {
   loading: boolean;
   options: ModInstallOption[];
   error?: string;
+  fullyLoaded?: boolean;
+  loadingOlder?: boolean;
+  olderError?: string;
 }
 
 interface ReviewRow {
@@ -225,48 +228,104 @@ export function BatchInstallReview({
     setChosenVersion({});
     setChosenAsset({});
 
-    void Promise.all(
-      rows.map(async ({ item }) => {
+    let cancelled = false;
+    let nextRow = 0;
+    const rowsById = new Map(rows.map((row) => [row.item.id, row]));
+    const loadNext = async () => {
+      while (!cancelled && sessionRef.current === session) {
+        const index = nextRow++;
+        if (index >= rows.length) return;
+        const { item } = rows[index];
+        let options: ModInstallOption[] = [];
+        let loadError: string | undefined;
         try {
-          const options = await listInstallOptions(item.repo, profileId);
+          options = await listInstallOptions(item.repo, profileId);
           if (options.length === 0) throw new Error("No compatible release asset was found.");
-          return { id: item.id, options };
         } catch (reason: unknown) {
-          return { id: item.id, options: [], error: String(reason) };
+          loadError = reason instanceof Error ? reason.message : String(reason);
         }
-      }),
-    ).then((results) => {
-      if (sessionRef.current !== session) return;
-      const nextStates: Record<string, OptionState> = {};
-      const nextVersions: Record<string, string> = {};
-      const nextAssets: Record<string, string> = {};
-      const rowsById = new Map(rows.map((row) => [row.item.id, row]));
-      for (const result of results) {
-        const row = rowsById.get(result.id);
-        const compatible = result.options.find(
+        if (cancelled || sessionRef.current !== session) return;
+        const row = rowsById.get(item.id);
+        let compatible = options.find(
           (option) =>
             !row ||
             row.requirements.every((requirement) => satisfiesRequirement(option.tag, requirement)),
         );
+        let fullyLoaded = options.length < 10;
+        if (!loadError && !compatible && row?.requirements.length && !fullyLoaded) {
+          try {
+            options = await listInstallOptions(item.repo, profileId, 50);
+            fullyLoaded = true;
+            compatible = options.find((option) =>
+              row.requirements.every((requirement) =>
+                satisfiesRequirement(option.tag, requirement),
+              ),
+            );
+          } catch (reason: unknown) {
+            loadError = reason instanceof Error ? reason.message : String(reason);
+          }
+        }
         const compatibilityError =
-          !result.error && result.options.length > 0 && !compatible && row?.requirements.length
+          !loadError && options.length > 0 && !compatible && row?.requirements.length && fullyLoaded
             ? `No release of ${row.item.name} satisfies ${row.requirements.join(" and ")}.`
             : undefined;
-        nextStates[result.id] = {
-          loading: false,
-          options: result.options,
-          error: result.error ?? compatibilityError,
-        };
+        setStates((current) => ({
+          ...current,
+          [item.id]: {
+            loading: false,
+            options,
+            error: loadError ?? compatibilityError,
+            fullyLoaded,
+          },
+        }));
         if (compatible) {
-          nextVersions[result.id] = compatible.tag;
-          nextAssets[result.id] = compatible.assetName;
+          setChosenVersion((current) => ({ ...current, [item.id]: compatible.tag }));
+          setChosenAsset((current) => ({ ...current, [item.id]: compatible.assetName }));
         }
       }
-      setStates(nextStates);
-      setChosenVersion(nextVersions);
-      setChosenAsset(nextAssets);
-    });
+    };
+    void Promise.all(
+      Array.from({ length: Math.min(4, rows.length) }, () => loadNext()),
+    );
+    return () => {
+      cancelled = true;
+    };
   }, [open, profileId, rows]);
+
+  const loadOlder = async (row: ReviewRow) => {
+    const session = sessionRef.current;
+    setStates((current) => ({
+      ...current,
+      [row.item.id]: {
+        ...current[row.item.id],
+        loadingOlder: true,
+        olderError: undefined,
+      },
+    }));
+    try {
+      const options = await listInstallOptions(row.item.repo, profileId, 50);
+      if (sessionRef.current !== session) return;
+      setStates((current) => ({
+        ...current,
+        [row.item.id]: {
+          ...current[row.item.id],
+          options,
+          fullyLoaded: true,
+          loadingOlder: false,
+        },
+      }));
+    } catch (reason: unknown) {
+      if (sessionRef.current !== session) return;
+      setStates((current) => ({
+        ...current,
+        [row.item.id]: {
+          ...current[row.item.id],
+          loadingOlder: false,
+          olderError: reason instanceof Error ? reason.message : String(reason),
+        },
+      }));
+    }
+  };
 
   const ready =
     items.length > 0 &&
@@ -391,7 +450,8 @@ export function BatchInstallReview({
                     ) : state.error ? (
                       <p className="mt-3 text-[12.5px] break-words text-[#ff8a8a]" role="alert">{state.error}</p>
                     ) : (
-                      <div className="mt-3 grid min-w-0 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.45fr)]">
+                      <div className="mt-3">
+                        <div className="grid min-w-0 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.45fr)]">
                         <label className="min-w-0">
                           <span className="mb-1 block text-[10.5px] tracking-[0.12em] text-ink-faint uppercase">Version</span>
                           <select
@@ -424,6 +484,22 @@ export function BatchInstallReview({
                           </select>
                           {option && <span className="sr-only">Selected file size {formatSize(option.size)}</span>}
                         </label>
+                      </div>
+                        {!state.fullyLoaded && (
+                          <button
+                            type="button"
+                            onClick={() => void loadOlder(row)}
+                            disabled={controlsBusy || state.loadingOlder}
+                            className="ring-focus mt-2 rounded-lg px-2 py-1 text-[11.5px] font-semibold text-[#cbbcff] hover:bg-accent/10 disabled:opacity-50"
+                          >
+                            {state.loadingOlder ? "Loading older versions…" : "Load older versions"}
+                          </button>
+                        )}
+                        {state.olderError && (
+                          <p className="mt-1 text-[11.5px] break-words text-[#ff8a8a]" role="alert">
+                            Could not load older versions: {state.olderError}
+                          </p>
+                        )}
                       </div>
                     )}
                   </div>

@@ -39,6 +39,8 @@ function iconBg(tag: ModTag | null): string {
 interface ModRowProps {
   mod: ProfileMod;
   busy?: boolean;
+  toggleBlocked?: boolean;
+  togglePending?: boolean;
   onToggle: () => void;
   onRemove: () => Promise<void>;
   onPickRelease: () => void;
@@ -57,7 +59,17 @@ function errorMessage(error: unknown): string {
   }
 }
 
-export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRelease, onBrowseMaps }: ModRowProps) {
+export function ModRow({
+  mod,
+  busy = false,
+  toggleBlocked = false,
+  togglePending = false,
+  trust,
+  onToggle,
+  onRemove,
+  onPickRelease,
+  onBrowseMaps,
+}: ModRowProps) {
   const reduce = useReducedMotion();
   const tag = mod.tags.length ? primaryTag(mod.tags) : null;
   const Glyph = (tag && ICON[tag]) || PuzzlePiece;
@@ -69,6 +81,7 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
   const titleId = useId();
   const descriptionId = useId();
   const unavailable = busy || removing;
+  const toggleUnavailable = toggleBlocked || removing;
   const levelImposter = mod.packageId.toLowerCase() === "digiworm0/levelimposter";
 
   const closeConfirm = useCallback(() => {
@@ -107,7 +120,7 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
         initial={reduce ? false : { opacity: 0, y: 10 }}
         animate={{ opacity: mod.managed ? 0.72 : 1, y: 0 }}
         transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-        aria-busy={unavailable}
+        aria-busy={removing || togglePending}
         className="surface-row flex min-w-0 flex-wrap items-center gap-3.5 rounded-2xl px-3.5 py-3"
       >
         <span
@@ -154,15 +167,15 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
             </button>
           )}
 
-          {busy && !mod.managed && (
+          {togglePending && !mod.managed && (
             <span
               role="status"
               aria-live="polite"
               className="glass-2 flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12px] text-ink-dim"
             >
               <CircleNotch size={13} className="animate-spin" aria-hidden="true" />
-              Working
-              <span className="sr-only">; actions for {mod.name} are unavailable</span>
+              Saving
+              <span className="sr-only"> {mod.name} state and rebuilding its direct profile instance</span>
             </span>
           )}
 
@@ -217,10 +230,10 @@ export function ModRow({ mod, busy = false, trust, onToggle, onRemove, onPickRel
               <Toggle
                 on={mod.enabled}
                 onChange={() => {
-                  if (!unavailable) onToggle();
+                  if (!toggleUnavailable) onToggle();
                 }}
-                disabled={unavailable}
-                label={`Enable ${mod.name}`}
+                disabled={toggleUnavailable}
+                label={`${mod.enabled ? "Disable" : "Enable"} ${mod.name}`}
               />
 
               <button

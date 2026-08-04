@@ -18,6 +18,10 @@ interface MainPanelProps {
   game: GameStatus;
   gameInstances: GameInstance[];
   busy: boolean;
+  quickActionsBlocked: boolean;
+  gameInstancePending: boolean;
+  pendingModIds: ReadonlySet<string>;
+  launchBusy: boolean;
   unmanagedPlugins: readonly UnmanagedPlugin[];
   unmanagedLoading: boolean;
   unmanagedError: string | null;
@@ -131,7 +135,7 @@ export function MainPanel(props: MainPanelProps) {
     <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden max-[720px]:overflow-visible">
       <div className="flex items-center gap-3 border-b border-white/[0.06] px-6 py-2.5 max-[720px]:flex-wrap max-[720px]:px-3">
         <span className="text-[12px] font-medium tracking-[0.1em] text-ink-faint uppercase">
-          Among Us instance
+          Original Among Us source
         </span>
         {selectedGame ? (
           <>
@@ -139,9 +143,11 @@ export function MainPanel(props: MainPanelProps) {
               <GameController size={14} className="shrink-0 text-accent-2" />
               <select
                 value={selectedGame.id}
-                disabled={busy}
+                disabled={props.quickActionsBlocked}
                 onChange={(e) => props.onSelectGameInstance(e.target.value)}
-                aria-label="Among Us instance for this profile"
+                aria-label="Original Among Us source for this profile"
+                aria-busy={props.gameInstancePending}
+                aria-describedby={props.gameInstancePending ? "game-instance-pending" : undefined}
                 title={`${selectedGame.name} · ${selectedGame.store} · ${selectedGame.arch}`}
                 className="min-w-0 flex-1 appearance-none truncate bg-transparent pr-5 text-[12.5px] font-medium text-ink focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
               >
@@ -152,6 +158,11 @@ export function MainPanel(props: MainPanelProps) {
                 ))}
               </select>
               <CaretDown size={12} weight="bold" className="pointer-events-none absolute right-2.5 text-ink-faint" />
+              {props.gameInstancePending && (
+                <span id="game-instance-pending" role="status" className="sr-only">
+                  Saving the selected original source and rebuilding the direct profile instance
+                </span>
+              )}
             </label>
             <span
               className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink-faint max-[720px]:basis-full"
@@ -326,6 +337,8 @@ export function MainPanel(props: MainPanelProps) {
               mod={mod}
               trust={props.trustOf(mod.packageId)}
               busy={busy}
+              toggleBlocked={props.quickActionsBlocked}
+              togglePending={props.pendingModIds.has(mod.packageId)}
               onToggle={() => props.onToggle(mod.packageId)}
               onRemove={() => props.onRemove(mod.packageId)}
               onPickRelease={() => props.onPickRelease(mod.packageId)}
@@ -342,7 +355,7 @@ export function MainPanel(props: MainPanelProps) {
       <LaunchBar
         profileName={profile.name}
         running={game.running}
-        busy={busy}
+        busy={busy || props.launchBusy}
         onLaunch={props.onLaunch}
         onSetup={props.onSetup}
       />

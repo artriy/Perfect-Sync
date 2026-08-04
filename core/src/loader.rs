@@ -58,6 +58,10 @@ const MAX_MANAGED_PLUGIN_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MANAGED_PLUGIN_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const LEVELIMPOSTER_MAP_DIRECTORY: &str = "LevelImposter";
 const MANAGED_LEVELIMPOSTER_MAPS_MARKER: &str = ".perfectsync-maps.json";
+const SPLASH_SCREEN_ORIGINAL: &str =
+    "BepInEx/patchers/BepInEx.SplashScreen/BepInEx.SplashScreen.GUI.exe";
+const SPLASH_SCREEN_RUNTIME_NAME: &str =
+    "BepInEx/patchers/BepInEx.SplashScreen/Among Us.SplashScreen.GUI.exe";
 const MAX_MANAGED_LEVELIMPOSTER_MAPS: usize = 4_096;
 const MAX_MANAGED_LEVELIMPOSTER_MAP_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANAGED_LEVELIMPOSTER_MAP_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
@@ -96,6 +100,13 @@ pub fn has_doorstop_patch(game_dir: &Path, version: &str, arch: &str) -> bool {
     fs::read_to_string(game_dir.join("BepInEx").join(DOORSTOP_PATCH_MARKER))
         .ok()
         .is_some_and(|record| record.trim() == expected)
+}
+
+pub fn has_doorstop_patch_marker(game_dir: &Path) -> bool {
+    game_dir
+        .join("BepInEx")
+        .join(DOORSTOP_PATCH_MARKER)
+        .is_file()
 }
 
 /// Remove only Perfect Sync's patch marker after an unchecked full reinstall.
@@ -1382,6 +1393,10 @@ fn read_managed_tou_package(game_dir: &Path) -> io::Result<Option<ManagedTouPack
     Ok(Some(managed))
 }
 
+pub fn managed_tou_package_key(game_dir: &Path) -> io::Result<Option<String>> {
+    read_managed_tou_package(game_dir).map(|managed| managed.map(|record| record.key))
+}
+
 /// Whether the complete release-matched Town of Us package is already present.
 pub fn tou_package_is_current(game_dir: &Path, key: &str) -> io::Result<bool> {
     let Some(managed) = read_managed_tou_package(game_dir)? else {
@@ -1391,9 +1406,26 @@ pub fn tou_package_is_current(game_dir: &Path, key: &str) -> io::Result<bool> {
         return Ok(false);
     }
     for name in &managed.files {
-        let target = game_dir.join(name);
-        crate::profile::reject_reparse(&target)?;
-        if !fs::metadata(target).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0) {
+        let original = game_dir.join(name);
+        crate::profile::reject_reparse(&original)?;
+        let metadata = match fs::metadata(&original) {
+            Ok(metadata) => Some(metadata),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && name.eq_ignore_ascii_case(SPLASH_SCREEN_ORIGINAL) =>
+            {
+                let runtime = game_dir.join(SPLASH_SCREEN_RUNTIME_NAME);
+                crate::profile::reject_reparse(&runtime)?;
+                match fs::metadata(runtime) {
+                    Ok(metadata) => Some(metadata),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_some_and(|metadata| metadata.is_file() && metadata.len() > 0) {
             return Ok(false);
         }
     }
@@ -2986,6 +3018,23 @@ fn read_managed_levelimposter_maps(marker: &Path) -> io::Result<HashSet<String>>
     Ok(names)
 }
 
+pub fn levelimposter_maps_are_current(game_dir: &Path, map_ids: &[String]) -> io::Result<bool> {
+    let marker = game_dir
+        .join("BepInEx")
+        .join("plugins")
+        .join(LEVELIMPOSTER_MAP_DIRECTORY)
+        .join(MANAGED_LEVELIMPOSTER_MAPS_MARKER);
+    let managed = read_managed_levelimposter_maps(&marker)?;
+    let mut expected = HashSet::with_capacity(map_ids.len());
+    for id in map_ids {
+        let name = format!("{id}.lim2").to_ascii_lowercase();
+        if !valid_levelimposter_map_name(&name) || !expected.insert(name) {
+            return Ok(false);
+        }
+    }
+    Ok(managed == expected)
+}
+
 fn copy_bounded_levelimposter_map(
     source: &Path,
     destination: &Path,
@@ -3285,6 +3334,7 @@ mod tests {
                 "Tou/dotnet/coreclr.dll",
                 "Tou/BepInEx/core/BepInEx.Unity.IL2CPP.dll",
                 "Tou/BepInEx/unity-libs/System.dll",
+                "Tou/BepInEx/patchers/BepInEx.SplashScreen/BepInEx.SplashScreen.GUI.exe",
             ] {
                 writer.start_file(path, options).unwrap();
                 writer.write_all(&[identity]).unwrap();
@@ -3332,6 +3382,11 @@ mod tests {
         assert!(game.join("BepInEx/unity-libs/System.dll").is_file());
         assert!(game.join("steam_appid.txt").is_file());
         assert!(game.join("BepInEx/plugins/Legacy.dll").is_file());
+        let splash_original = game.join(SPLASH_SCREEN_ORIGINAL);
+        let splash_runtime = game.join(SPLASH_SCREEN_RUNTIME_NAME);
+        fs::rename(&splash_original, &splash_runtime).unwrap();
+        assert!(tou_package_is_current(&game, &first_key).unwrap());
+        fs::rename(&splash_runtime, &splash_original).unwrap();
         assert_eq!(
             fs::read(game.join("BepInEx/plugins/ExistingMod.dll")).unwrap(),
             b"existing"

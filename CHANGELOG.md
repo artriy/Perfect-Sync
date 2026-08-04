@@ -3,21 +3,28 @@
 ## v0.1.6 (experimental)
 
 > [!IMPORTANT]
-> **Action required after updating:** v0.1.6 performs a one-time reset of every
-> existing profile, personal mod selection, configured game source, immutable base,
-> and private workspace, then opens first-time setup. Select a fresh, untouched Among
-> Us installation; verify or reinstall it through Steam, Epic, or Microsoft Store first
-> if necessary. The chosen large-data storage location and GitHub credential are kept.
+> v0.1.6 migrates managed storage schemas 1 through 5 to the direct-source schema 6
+> in place. Profiles, personal mod selections, configured original sources, and valid
+> published profile instances are preserved. Obsolete immutable-base data is removed
+> only after canonical containment and reparse checks.
 
-- Treat every selected Among Us folder as a read-only source; reject known existing
-  mod-loader artifacts rather than silently filtering them, then import every source
-  file into an exact SHA-256-manifested immutable base under local app data.
-- Version immutable bases by source identity, executable, build, and content; retain
-  historical generations required by profiles, migrate compatible legacy bases, and
-  garbage-collect unreferenced generations after successful use.
-- Materialize every prepared profile into its own disposable private workspace with
-  verified file copies, profile-specific config persistence, crash recovery, and atomic
-  replacement that preserves both the immutable base and previous working instance.
+- Record each original Among Us source by its exact canonical path, complete tree
+  fingerprint, file count, byte count, and observed build.
+- Keep immutable source records for every canonical path and fingerprint referenced by
+  settings or a published workspace. Workspace markers bind to the exact historical
+  record, so registering a newer build cannot invalidate an older playable instance.
+- Build each profile's isolated direct instance from the selected original source in a
+  temporary workspace. Verify the copied fingerprint, re-fingerprint the source before
+  applying profile overlays, then publish the instance atomically.
+- Reuse an existing valid published instance without copying the original source again.
+  Keep it launchable when the source is unavailable; when the source is reachable, block
+  launch only if its observed build differs from the saved source record.
+- Require the exact recorded source fingerprint for every operation that constructs or
+  repairs a direct instance, with bounded copies, mutation locks, crash recovery, exact
+  path checks, and source/storage containment enforcement.
+- Migrate every referenced schema 1 through 5 base generation independently. Hash the
+  complete legacy manifest and defer obsolete-base cleanup while any global vanilla
+  workspace, unmigrated marker, unavailable source, or unverified generation remains.
 - Launch only validated managed workspaces across native Windows, Proton, Wine,
   CrossOver, Whisky, and Bottles; track running processes by exact workspace path so
   Steam, Epic, and other profiles can run concurrently without locking the rest of the
@@ -26,6 +33,8 @@
   including `MiraAPI.dll`, `touhats.bundle`, and `touhats.catalog`.
 - Repair relocated Epic source metadata from durable folder evidence, expose an explicit
   storefront picker during setup, and fall back to the current x64 Epic architecture.
+- Rebind a renamed original source only after its full manifest matches the saved record;
+  preserve missing legacy build metadata by restoring it from verified migration evidence.
 - Download and SHA-256-verify the pinned EpicGamesStarter helper, launch it with a usable
   interactive console, dismiss its success prompt automatically, and preserve concurrently
   running Steam profiles while the authenticated Epic workspace starts.
@@ -42,25 +51,52 @@
   profile switches; never silently substitute the first global Steam or Epic source.
 - Switch the selected profile through a dedicated lightweight settings command instead of
   rebuilding its already-isolated workspace; launch still validates and repairs stale workspaces.
-- Reuse the same immutable base after storefront or architecture metadata is corrected,
-  persist completed validation across app restarts, skip unchanged config publication,
-  and refresh the active revision after capturing runtime config so repeat launches do
-  not recopy or rehash the clean game.
-- Treat the selected Town of Us ZIP as authoritative when installing, updating,
-  or switching storefront packages: replace and claim every managed payload file,
-  including the Region Install config, instead of rejecting an unowned collision.
+- Reuse an already-valid direct profile instance after storefront or architecture
+  metadata is corrected, persist completed validation across app restarts, skip unchanged
+  config publication, and refresh the active revision after capturing runtime config.
+- Render immediately from the local profile/settings/catalog snapshot, move update checks
+  off the startup path, and populate multi-mod release reviews incrementally with bounded
+  concurrency plus on-demand access to older releases.
+- Reuse HTTP clients, deduplicate and cache release metadata, stream downloads through
+  verification, and retain verified mod assets in a content-addressed cache so repeated
+  installs avoid redundant network and memory work.
+- Refresh mod update metadata without stale cache entries or asset-size probes,
+  check profiles concurrently every 30 seconds while Perfect Sync is visible,
+  refresh immediately on focus, and isolate repository failures so one broken mod
+  cannot block update indicators for the rest of a profile.
+- Stage full profile transactions with copy-on-write hard links, commit mod toggles
+  through a crash-recoverable single-file rename and atomic manifest update, and patch
+  compatible active workspaces transactionally.
+- Apply profile, original-source, and mod selections optimistically with coalesced,
+  stale-safe persistence; preserve same-frame pending selections when source metadata is
+  refreshed in place.
+- Publish source metadata before atomically committing Settings, keep current runtime state
+  authoritative when a Settings write has an ambiguous durability error, and merge rescans
+  without replacing concurrently selected profiles, sources, or mod state.
+- Reject every containment overlap between managed storage and an original Among Us
+  source before direct-instance construction, preventing recursive copies on any drive.
+- Refresh fingerprint, file count, byte count, build, architecture, runtime, writable
+  state, and executable identity from each exact saved source path without substituting
+  a stale duplicate installation.
+- Replace only Town of Us package files owned by its prior managed manifest; preserve
+  user-owned plugins and configuration by rejecting conflicting package installs.
 - Treat automatic update discovery as best-effort so a missing or temporarily
   unavailable release manifest cannot interrupt application startup.
-- Auto-detect only fresh Among Us sources without known loader or mod artifacts;
-  manually inspected sources still report their exact contamination warning.
-- Let first-time setup and Settings place managed bases, profile workspaces, and package
-  caches in an empty custom folder. Relocation copies and SHA-256-verifies every file
-  before switching, rejects source-path aliases across platforms, and preserves the
-  previous location on failure.
-- Add a Settings action that exports the selected profile workspace's bounded,
+- Auto-detect only valid original Among Us sources without known loader or mod artifacts;
+  manually inspected sources report exact contamination and recovery guidance.
+- Let first-time setup and Settings place direct profile instances and package caches in
+  an empty custom folder. Relocation copies and SHA-256-verifies every file before
+  switching, rejects source-path aliases across platforms, and preserves the previous
+  location on failure.
+- Relocation rejects linked payload files, hashes the source again after copying, and
+  requires exact cleanup-token and tree-manifest evidence before each deletion. Save or
+  cleanup failures disarm every reachable capability and retain both copies with explicit
+  recovery paths.
+- Add a Settings action that exports the selected direct profile instance's bounded,
   non-linked BepInEx `LogOutput.log` through the native save dialog.
-- Prompt existing users to rerun setup until a fresh source has been selected for the
-  exact immutable-base workflow.
+- Add an explicit original-source check that refreshes source fingerprint and build
+  metadata in place without clearing installed mods, the active profile, the selected
+  instance, or pending optimistic changes.
 - Keep all five live operation stages aligned in one progress row.
 
 ## v0.1.5 (experimental)

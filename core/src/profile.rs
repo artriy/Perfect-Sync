@@ -996,14 +996,30 @@ pub fn install_tou_bundle_zip_bytes(
     }
 
     let bepinex = checked_profile_bepinex_dir(profiles_root, id, true)?;
+    let old_files = read_tou_bundle_manifest(&bepinex)?;
+    let old_names: HashSet<String> = old_files
+        .iter()
+        .map(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+        })
+        .collect();
     for (_, relative, _) in &selected {
         let destination = bepinex.join(relative);
         reject_reparse(&destination)?;
-        if destination.exists() && !fs::metadata(&destination)?.is_file() {
+        if destination.exists()
+            && !old_names.contains(
+                &relative
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase(),
+            )
+        {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
-                    "Town of Us package path is not a regular file {}",
+                    "Town of Us package would overwrite an unowned file {}",
                     relative.display()
                 ),
             ));
@@ -1484,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn replaces_existing_tou_config_from_the_authoritative_zip() {
+    fn preserves_unowned_tou_config_and_replaces_owned_config() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp
             .path()
@@ -1492,6 +1508,12 @@ mod tests {
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, b"unowned config").unwrap();
 
+        let error = install_tou_bundle_zip_bytes(tmp.path(), "p1", &tou_profile_zip(b'1', false))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&config).unwrap(), b"unowned config");
+
+        fs::remove_file(&config).unwrap();
         install_tou_bundle_zip_bytes(tmp.path(), "p1", &tou_profile_zip(b'1', false)).unwrap();
         assert_eq!(fs::read(&config).unwrap(), b"1");
 

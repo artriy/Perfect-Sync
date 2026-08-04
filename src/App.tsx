@@ -43,6 +43,7 @@ import type {
 const CREW_CYCLE = Object.values(CREW);
 const OPERATION_BUSY = new Error("Another operation is already in progress.");
 const UNMANAGED_REVIEW_CANCELLED = new Error("Unmanaged plugin review was canceled.");
+const MOD_UPDATE_REFRESH_MS = 30_000;
 
 const INSTANCE_NAMES: Record<Store, string> = {
   steam: "Steam",
@@ -63,10 +64,8 @@ const EMPTY_SETTINGS: Settings = {
 };
 interface StartupResult {
   settings: Settings;
-  games: GameInstall[];
   catalog: CatalogItem[];
   profiles: Profile[];
-  errors: string[];
   freshSourceMigration: boolean;
 }
 
@@ -84,11 +83,43 @@ interface UnmanagedPluginPrompt {
   plugins: UnmanagedPlugin[];
   continuation: boolean;
 }
+interface ProfileSelectionIntent {
+  request: number;
+  id: string;
+}
+
+interface GameInstanceSelectionIntent {
+  request: number;
+  profileId: string;
+  desiredId: string;
+  persistedId?: string;
+}
+
+interface ModToggleIntent {
+  request: number;
+  profileId: string;
+  packageId: string;
+  desired: boolean;
+  persisted: boolean;
+}
+
 
 function messageFrom(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (/^HTTP status 403$/i.test(message.trim())) {
     return "HTTP 403: GitHub temporarily refused this web request. Normal catalog installs do not use REST API quota; retry shortly and verify that github.com is reachable.";
+  }
+  if (/(source|original).*(unavailable|not found|does not exist|cannot be reached)|cannot access.*(source|original)/i.test(message)) {
+    return `The recorded original Among Us source is unavailable. Existing valid direct instances can still launch. Reconnect its drive or choose the exact original folder again in Settings before building or repairing. ${message}`;
+  }
+  if (/(source.*(fingerprint|build).*(changed|differ|mismatch)|source changed)/i.test(message)) {
+    return `The original Among Us source changed since its source record was saved. Check the original source in Settings and save its updated fingerprint and build before rebuilding this direct instance. ${message}`;
+  }
+  if (/(storage.*(inside|overlap|contain).*(source|among us)|(source|among us).*(inside|overlap|contain).*storage|storage.*(source|among us).*cannot contain|cannot contain one another|unsafe storage)/i.test(message)) {
+    return `Perfect Sync storage overlaps the original Among Us source. Move storage to a non-overlapping location in Settings before building a direct instance. ${message}`;
+  }
+  if (/(invalid.*(source|among us)|(source|among us).*(invalid|not (?:a )?valid)|mod-loader artifacts|among us executable|non-link directory|regular.*directory)/i.test(message)) {
+    return `The selected original Among Us source is invalid. Verify or repair the game in its store, then check the original folder again. ${message}`;
   }
   return message;
 }
@@ -100,18 +131,43 @@ export function App() {
   const [runningStatus, setRunningStatus] = useState({ profileId: "", running: false, known: false });
   const [operationBusy, setOperationBusy] = useState(false);
   const [operationActivity, setOperationActivity] = useState<OperationActivity | null>(null);
+  const [profileMutationCount, setProfileMutationCount] = useState(0);
+  const [pendingGameInstanceProfiles, setPendingGameInstanceProfiles] = useState<Set<string>>(new Set());
+  const [pendingModToggles, setPendingModToggles] = useState<Set<string>>(new Set());
+  const [workspacePreparationProfileId, setWorkspacePreparationProfileId] = useState("");
 
   const operationRef = useRef(false);
   const startupPromiseRef = useRef<Promise<StartupResult> | null>(null);
   const operationActivityId = useRef(0);
   const initialWorkspacePreparationStarted = useRef(false);
+  const workspacePreparationPromise = useRef<Promise<void> | null>(null);
   const automaticUpdateRef = useRef(false);
   const mainModWarningResolver = useRef<((confirmed: boolean) => void) | null>(null);
   const unmanagedPluginResolver = useRef<((resolved: boolean) => void) | null>(null);
+  const profileSelectionRequest = useRef(0);
+  const profileSelectionIntent = useRef<ProfileSelectionIntent | null>(null);
+  const profileSelectionWorker = useRef(false);
+  const persistedActiveProfile = useRef("");
+  const gameInstanceSelectionRequest = useRef(0);
+  const gameInstanceSelectionIntents = useRef(new Map<string, GameInstanceSelectionIntent>());
+  const gameInstanceSelectionWorkers = useRef(new Set<string>());
+  const modToggleRequest = useRef(0);
+  const modToggleIntents = useRef(new Map<string, ModToggleIntent>());
+  const modToggleWorkers = useRef(new Set<string>());
+  const profileMutationQueue = useRef<Promise<void>>(Promise.resolve());
+  const profileMutationCountRef = useRef(0);
+  const profileUpdateRefreshRef = useRef<Promise<void> | null>(null);
+  const profileUpdateWarningShownRef = useRef(false);
+  const profilesRef = useRef<Profile[]>([]);
+  const activeIdRef = useRef("");
+  const settingsRef = useRef<Settings>(EMPTY_SETTINGS);
 
   const [games, setGames] = useState<GameInstall[]>([]);
   const [settings, setSettings] = useState<Settings>(EMPTY_SETTINGS);
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
+  profilesRef.current = profiles;
+  settingsRef.current = settings;
+  activeIdRef.current = activeId;
   const [update, setUpdate] = useState<bridge.UpdateInfo | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [startupError, setStartupError] = useState<string | null>(null);
@@ -156,6 +212,88 @@ export function App() {
       window.setTimeout(() => setToast((current) => (current?.id === id ? null : current)), 2600);
     }
   };
+  const preservePendingProfileState = (updated: Profile): Profile => {
+    const pendingInstance = gameInstanceSelectionIntents.current.get(updated.id);
+    let preserved = pendingInstance
+      ? { ...updated, gameInstanceId: pendingInstance.desiredId }
+      : updated;
+    if (modToggleIntents.current.size > 0) {
+      preserved = {
+        ...preserved,
+        mods: preserved.mods.map((mod) => {
+          const pending = modToggleIntents.current.get(`${updated.id}\0${mod.packageId}`);
+          return pending ? { ...mod, enabled: pending.desired } : mod;
+        }),
+      };
+    }
+    return preserved;
+  };
+
+
+  const refreshModUpdates = (): Promise<void> => {
+    const pending = profileUpdateRefreshRef.current;
+    if (pending) return pending;
+
+    const instances = new Map(
+      settingsRef.current.gameInstances.map((instance) => [instance.id, instance]),
+    );
+    const targets = profilesRef.current.flatMap((profile) => {
+      const instance = instances.get(profile.gameInstanceId ?? "");
+      return instance ? [{ profile, arch: instance.arch }] : [];
+    });
+    if (targets.length === 0) {
+      profileUpdateWarningShownRef.current = false;
+      return Promise.resolve();
+    }
+
+    const refresh = Promise.allSettled(
+      targets.map(({ profile, arch }) => bridge.checkModUpdates(profile.id, arch)),
+    )
+      .then((results) => {
+        const updated = results.flatMap((result) =>
+          result.status === "fulfilled" ? [result.value] : [],
+        );
+        if (updated.length > 0) {
+          const byId = new Map(updated.map((profile) => [profile.id, profile]));
+          setProfiles((current) => {
+            const next = current.map((profile) => {
+              const refreshed = byId.get(profile.id);
+              if (!refreshed) return profile;
+              const refreshedMods = new Map(
+                refreshed.mods.map((mod) => [mod.packageId.toLowerCase(), mod]),
+              );
+              let changed = false;
+              const mods = profile.mods.map((mod) => {
+                const update = refreshedMods.get(mod.packageId.toLowerCase())?.update;
+                if (update === mod.update) return mod;
+                changed = true;
+                return { ...mod, update };
+              });
+              return changed ? { ...profile, mods } : profile;
+            });
+            profilesRef.current = next;
+            return next;
+          });
+        }
+
+        const failed = results.find(
+          (result): result is PromiseRejectedResult => result.status === "rejected",
+        );
+        if (failed) {
+          if (!profileUpdateWarningShownRef.current) {
+            profileUpdateWarningShownRef.current = true;
+            notify(`Could not refresh mod updates: ${messageFrom(failed.reason)}`, "error");
+          }
+        } else {
+          profileUpdateWarningShownRef.current = false;
+        }
+      })
+      .finally(() => {
+        profileUpdateRefreshRef.current = null;
+      });
+    profileUpdateRefreshRef.current = refresh;
+    return refresh;
+  };
 
   const requestMainModConfirmation = (
     existing: readonly MainModCandidate[],
@@ -181,8 +319,26 @@ export function App() {
   };
 
 
+  const beginProfileMutation = () => {
+    profileMutationCountRef.current += 1;
+    setProfileMutationCount(profileMutationCountRef.current);
+  };
+
+  const endProfileMutation = () => {
+    profileMutationCountRef.current = Math.max(0, profileMutationCountRef.current - 1);
+    setProfileMutationCount(profileMutationCountRef.current);
+  };
+
+  const enqueueProfileMutation = (action: () => Promise<void>) => {
+    const queued = async () => {
+      await workspacePreparationPromise.current?.catch(() => undefined);
+      await action();
+    };
+    profileMutationQueue.current = profileMutationQueue.current.then(queued, queued);
+  };
+
   const beginOperation = (): boolean => {
-    if (operationRef.current) return false;
+    if (operationRef.current || profileMutationCountRef.current > 0) return false;
     operationRef.current = true;
     setOperationBusy(true);
     return true;
@@ -196,6 +352,7 @@ export function App() {
   const exclusive = async <T,>(action: () => Promise<T>): Promise<T> => {
     if (!beginOperation()) throw OPERATION_BUSY;
     try {
+      await workspacePreparationPromise.current?.catch(() => undefined);
       return await action();
     } finally {
       endOperation();
@@ -208,6 +365,7 @@ export function App() {
   ): Promise<T> => {
     if (!beginOperation()) throw OPERATION_BUSY;
     const id = ++operationActivityId.current;
+    await workspacePreparationPromise.current?.catch(() => undefined);
     setOperationActivity({
       id,
       scope: descriptor.scope,
@@ -271,17 +429,15 @@ export function App() {
     unmanagedResolve?.(false);
   }, []);
 
-  // StrictMode replays effects. The startup promise is created synchronously
-  // once, so every replay observes the same reads and persistence work while
-  // only the currently mounted subscriber commits the result.
+  // StrictMode replays effects. The startup promise contains local persistence
+  // work only; remote discovery starts after the cached UI is visible.
   useEffect(() => {
     let current = true;
     if (!startupPromiseRef.current) {
       if (!beginOperation()) return;
       startupPromiseRef.current = (async (): Promise<StartupResult> => {
-        const [loadedSettings, detectedGames, loadedProfiles, loadedCatalog] = await Promise.all([
+        const [loadedSettings, loadedProfiles, loadedCatalog] = await Promise.all([
           bridge.getSettings(),
-          bridge.detectGames(),
           bridge.loadProfiles(),
           bridge.loadCatalog(),
         ]);
@@ -297,51 +453,12 @@ export function App() {
             mods: [],
           });
           nextProfiles = [starter];
-        } else if (defaultGameId) {
-          const validGameIds = new Set(loadedSettings.gameInstances.map((instance) => instance.id));
-          const migrated: Profile[] = [];
-          for (const profile of nextProfiles) {
-            if (profile.gameInstanceId && validGameIds.has(profile.gameInstanceId)) {
-              migrated.push(profile);
-            } else {
-              migrated.push(await bridge.saveProfile({ ...profile, gameInstanceId: defaultGameId }));
-            }
-          }
-          nextProfiles = migrated;
-        }
-
-        const errors: string[] = [];
-        let nextCatalog = loadedCatalog;
-        try {
-          await bridge.refreshCatalog();
-          nextCatalog = await bridge.loadCatalog();
-        } catch (error) {
-          errors.push(`Catalog refresh failed: ${messageFrom(error)}`);
-        }
-
-        const refreshedProfiles: Profile[] = [];
-        for (const profile of nextProfiles) {
-          const instance = loadedSettings.gameInstances.find(
-            (candidate) => candidate.id === profile.gameInstanceId,
-          );
-          if (!instance) {
-            refreshedProfiles.push(profile);
-            continue;
-          }
-          try {
-            refreshedProfiles.push(await bridge.checkModUpdates(profile.id, instance.arch));
-          } catch (error) {
-            refreshedProfiles.push(profile);
-            errors.push(`Could not check updates for ${profile.name}: ${messageFrom(error)}`);
-          }
         }
 
         return {
           settings: loadedSettings,
-          games: detectedGames,
-          catalog: nextCatalog,
-          profiles: refreshedProfiles,
-          errors,
+          catalog: loadedCatalog,
+          profiles: nextProfiles,
           freshSourceMigration:
             loadedSettings.setupComplete && !loadedSettings.freshSourceSetupComplete,
         };
@@ -353,21 +470,38 @@ export function App() {
         if (!current) return;
         initialWorkspacePreparationStarted.current =
           !result.settings.setupComplete || result.freshSourceMigration;
-        setSettings(result.settings);
-        setFreshSourceMigration(result.freshSourceMigration);
-        setGames(result.games);
-        setCatalog(result.catalog);
-        setProfiles(result.profiles);
         const persisted = result.settings.activeProfile;
-        setActiveId(
+        const selectedProfileId =
           persisted && result.profiles.some((profile) => profile.id === persisted)
             ? persisted
-            : result.profiles[0].id,
-        );
+            : result.profiles[0].id;
+        persistedActiveProfile.current = selectedProfileId;
+        setSettings({ ...result.settings, activeProfile: selectedProfileId });
+        setFreshSourceMigration(result.freshSourceMigration);
+        setCatalog(result.catalog);
+        setProfiles(result.profiles);
+        setActiveId(selectedProfileId);
         setLoaded(true);
-        if (result.settings.recoveryWarning) notify(result.settings.recoveryWarning, "error");
-        if (result.settings.storageWarning) notify(result.settings.storageWarning, "error");
-        for (const error of result.errors) notify(error, "error");
+        if (result.settings.recoveryWarning) notify(messageFrom(result.settings.recoveryWarning), "error");
+        if (result.settings.storageWarning) notify(messageFrom(result.settings.storageWarning), "error");
+
+        void bridge.detectGames()
+          .then((detected) => {
+            if (current) setGames(detected);
+          })
+          .catch((error) => {
+            if (current) notify(`Game detection failed: ${messageFrom(error)}`, "error");
+          });
+
+        void bridge.refreshCatalog()
+          .then(() => bridge.loadCatalog())
+          .then((refreshed) => {
+            if (current) setCatalog(refreshed);
+          })
+          .catch((error) => {
+            if (current) notify(`Catalog refresh failed: ${messageFrom(error)}`, "error");
+          });
+
       })
       .catch((error) => {
         if (!current) return;
@@ -379,6 +513,27 @@ export function App() {
       current = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const refreshWhenVisible = () => {
+      if (
+        document.visibilityState === "visible" &&
+        !document.querySelector('[aria-modal="true"]')
+      ) {
+        void refreshModUpdates();
+      }
+    };
+    refreshWhenVisible();
+    const timer = window.setInterval(refreshWhenVisible, MOD_UPDATE_REFRESH_MS);
+    window.addEventListener("focus", refreshWhenVisible);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [loaded]);
 
   useEffect(() => {
     let current = true;
@@ -470,7 +625,16 @@ export function App() {
   const activeGame = gameForProfile(active);
   const arch: Arch = activeGame?.arch ?? "x86";
   const gameStatus = { store: activeGame?.store ?? "manual", arch, running };
-  const busy = operationBusy;
+  const busy = operationBusy || profileMutationCount > 0;
+  const activePendingModIds = useMemo(() => {
+    if (!active) return new Set<string>();
+    const prefix = `${active.id}\0`;
+    return new Set(
+      [...pendingModToggles]
+        .filter((key) => key.startsWith(prefix))
+        .map((key) => key.slice(prefix.length)),
+    );
+  }, [active?.id, pendingModToggles]);
   const firstRun = loaded && !settings.setupComplete;
 
   useEffect(() => {
@@ -520,7 +684,7 @@ export function App() {
       firstRun ||
       !active ||
       !activeGame ||
-      operationBusy ||
+      busy ||
       !runningKnown ||
       running ||
       initialWorkspacePreparationStarted.current
@@ -528,27 +692,24 @@ export function App() {
       return;
     }
     initialWorkspacePreparationStarted.current = true;
-    let current = true;
-    void trackedExclusive(
-      {
-        scope: "profile",
-        title: "Preparing selected profile",
-        message: "Checking the isolated workspace",
-      },
-      (report) => bridge.syncProfile(activeGame.path, active.id, report),
-    )
+    const profileId = active.id;
+    setWorkspacePreparationProfileId(profileId);
+    const preparation = bridge
+      .syncProfile(activeGame.path, profileId)
       .then((warning) => {
-        if (current && warning) notify(warning, "error");
+        if (activeIdRef.current === profileId && warning) notify(warning, "error");
       })
       .catch((error) => {
-        if (current && error !== OPERATION_BUSY) {
+        if (activeIdRef.current === profileId) {
           notify(`Could not prepare ${active.name}: ${messageFrom(error)}`, "error");
         }
+      })
+      .finally(() => {
+        workspacePreparationPromise.current = null;
+        setWorkspacePreparationProfileId((preparingId) => preparingId === profileId ? "" : preparingId);
       });
-    return () => {
-      current = false;
-    };
-  }, [loaded, firstRun, active?.id, activeGame?.path, operationBusy, runningKnown, running]);
+    workspacePreparationPromise.current = preparation;
+  }, [loaded, firstRun, active?.id, activeGame?.path, busy, runningKnown, running]);
 
   useEffect(() => {
     if (!loaded || !active || !activeGame) {
@@ -611,11 +772,13 @@ export function App() {
   }
 
   const patchProfile = (updated: Profile) => {
-    setProfiles((current) =>
-      current.some((profile) => profile.id === updated.id)
-        ? current.map((profile) => (profile.id === updated.id ? updated : profile))
-        : current,
-    );
+    const preserved = preservePendingProfileState(updated);
+    setProfiles((current) => {
+      if (!current.some((profile) => profile.id === updated.id)) return current;
+      const next = current.map((profile) => profile.id === updated.id ? preserved : profile);
+      profilesRef.current = next;
+      return next;
+    });
   };
 
   const requestUnmanagedPluginResolution = async (
@@ -626,7 +789,7 @@ export function App() {
     const instance = targetInstance ?? gameForProfile(profile);
     if (!instance) throw new Error("No Among Us source is assigned to this profile.");
     const plugins = await bridge.listUnmanagedPlugins(instance.path, profile.id);
-    if (profile.id === active.id) {
+    if (profile.id === activeIdRef.current) {
       setUnmanagedPlugins(plugins);
       setUnmanagedScanError(null);
     }
@@ -678,9 +841,9 @@ export function App() {
     setUnmanagedScanError(null);
     const count = selectedPaths.length;
     const resultMessage = action === "quarantine"
-      ? `Moved ${count} plugin${count === 1 ? "" : "s"} to the instance quarantine.`
+      ? `Moved ${count} plugin${count === 1 ? "" : "s"} to the direct-instance quarantine.`
       : action === "delete"
-        ? `Permanently deleted ${count} plugin${count === 1 ? "" : "s"} from the instance.`
+        ? `Permanently deleted ${count} plugin${count === 1 ? "" : "s"} from the direct instance.`
         : `Added ${count} local plugin${count === 1 ? "" : "s"} to ${updated?.name ?? prompt.profileName}.`;
     if (remaining.length > 0) {
       setUnmanagedPrompt({ ...prompt, plugins: remaining });
@@ -700,7 +863,7 @@ export function App() {
       setUnmanagedPlugins(plugins);
       setUnmanagedScanError(null);
       if (plugins.length === 0) {
-        notify("No extra plugins were found in this game instance.");
+        notify("No extra plugins were found in this direct profile instance.");
         return;
       }
       setUnmanagedPrompt({
@@ -747,6 +910,12 @@ export function App() {
     return bridge.checkModUpdates(profile.id, instance.arch);
   };
 
+  const refreshProfileUpdatesInBackground = (profile: Profile, context: string): void => {
+    void refreshProfileUpdates(profile)
+      .then(patchProfile)
+      .catch((error) => notify(`${context}: ${messageFrom(error)}`, "error"));
+  };
+
   const ensureLoaderInternal = async (
     profile: Profile,
     onProgress?: (progress: OperationProgress) => void,
@@ -756,63 +925,187 @@ export function App() {
     return bridge.ensureLoader(instance.path, profile.id, instance.arch, false, onProgress);
   };
 
-  const selectProfile = async (id: string) => {
-    if (id === active.id) return;
-    try {
-      await exclusive(async () => {
-        if (!profiles.some((profile) => profile.id === id)) {
-          throw new Error("Profile not found.");
-        }
-        const normalized = await bridge.selectActiveProfile(id);
-        setSettings(normalized);
-        setActiveId(id);
-      });
-    } catch (error) {
-      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+  const selectProfile = (id: string): void => {
+    if (id === activeIdRef.current) return;
+    if (!profilesRef.current.some((profile) => profile.id === id)) {
+      notify("Profile not found.", "error");
+      return;
     }
+    const intent = { request: ++profileSelectionRequest.current, id };
+    profileSelectionIntent.current = intent;
+    activeIdRef.current = id;
+    setActiveId(id);
+    setSettings((current) => ({ ...current, activeProfile: id }));
+    if (profileSelectionWorker.current) return;
+
+    profileSelectionWorker.current = true;
+    void (async () => {
+      try {
+        while (profileSelectionIntent.current) {
+          const current = profileSelectionIntent.current;
+          try {
+            await bridge.selectActiveProfile(current.id);
+            persistedActiveProfile.current = current.id;
+            if (profileSelectionIntent.current?.request === current.request) {
+              profileSelectionIntent.current = null;
+            }
+          } catch (error) {
+            if (profileSelectionIntent.current?.request !== current.request) continue;
+            profileSelectionIntent.current = null;
+            const rollbackId = persistedActiveProfile.current;
+            activeIdRef.current = rollbackId;
+            setActiveId(rollbackId);
+            setSettings((settingsState) => ({ ...settingsState, activeProfile: rollbackId }));
+            notify(`Could not select profile: ${messageFrom(error)}`, "error");
+          }
+        }
+      } finally {
+        profileSelectionWorker.current = false;
+      }
+    })();
   };
 
-  const toggleMod = async (modId: string) => {
-    try {
-      const preflightProfile = profiles.find((candidate) => candidate.id === active.id);
-      const preflightInstance = gameForProfile(preflightProfile);
-      if (!preflightProfile || !preflightInstance) {
-        throw new Error("Assign an Among Us source before changing mods.");
-      }
-      if (!await requestUnmanagedPluginResolution(preflightProfile, true, preflightInstance)) return;
-      await trackedExclusive(
-        {
-          scope: "profile",
-          title: "Updating isolated profile",
-          message: "Changing the selected mod",
-        },
-        async (report) => {
-          const profile = profiles.find((candidate) => candidate.id === active.id);
-          const mod = profile?.mods.find((candidate) => candidate.packageId === modId);
-          const instance = gameForProfile(profile);
-          if (!profile || !mod || !instance) {
-            throw new Error("The selected profile or Among Us source is no longer available.");
+  const toggleMod = (modId: string) => {
+    if (operationRef.current) return;
+    const profile = profilesRef.current.find((candidate) => candidate.id === activeIdRef.current);
+    const mod = profile?.mods.find((candidate) => candidate.packageId === modId);
+    const instance = settingsRef.current.gameInstances.find(
+      (candidate) => candidate.id === profile?.gameInstanceId,
+    );
+    if (!profile || !mod || !instance) {
+      notify("Assign an Among Us source before changing mods.", "error");
+      return;
+    }
+
+    const key = `${profile.id}\0${modId}`;
+    const previous = modToggleIntents.current.get(key);
+    const intent: ModToggleIntent = {
+      request: ++modToggleRequest.current,
+      profileId: profile.id,
+      packageId: modId,
+      desired: !(previous?.desired ?? mod.enabled),
+      persisted: previous?.persisted ?? mod.enabled,
+    };
+    modToggleIntents.current.set(key, intent);
+    patchProfile({
+      ...profile,
+      mods: profile.mods.map((candidate) =>
+        candidate.packageId === modId ? { ...candidate, enabled: intent.desired } : candidate
+      ),
+    });
+    if (modToggleWorkers.current.has(key)) return;
+
+    modToggleWorkers.current.add(key);
+    beginProfileMutation();
+    setPendingModToggles((current) => new Set(current).add(key));
+    enqueueProfileMutation(async () => {
+      try {
+        while (modToggleIntents.current.has(key)) {
+          const current = modToggleIntents.current.get(key)!;
+          const currentProfile = profilesRef.current.find(
+            (candidate) => candidate.id === current.profileId,
+          );
+          const currentMod = currentProfile?.mods.find(
+            (candidate) => candidate.packageId === current.packageId,
+          );
+          const currentInstance = settingsRef.current.gameInstances.find(
+            (candidate) => candidate.id === currentProfile?.gameInstanceId,
+          );
+          if (!currentProfile || !currentMod || !currentInstance) {
+            if (modToggleIntents.current.get(key)?.request === current.request) {
+              modToggleIntents.current.delete(key);
+            }
+            notify("The selected profile, mod, or Among Us source is no longer available.", "error");
+            continue;
           }
-          const updated = await bridge.setModEnabled(profile, modId, !mod.enabled);
-          patchProfile(updated);
-          report({ phase: "finalizing", message: "Rebuilding the isolated workspace" });
+
+          let saved: Profile;
           try {
-            const warning = await bridge.syncProfile(instance.path, updated.id, report);
-            notify(
-              warning ?? `${mod.name} is ${mod.enabled ? "disabled" : "enabled"} in the isolated workspace`,
-              warning ? "error" : "success",
+            if (!await requestUnmanagedPluginResolution(currentProfile, true, currentInstance)) {
+              throw UNMANAGED_REVIEW_CANCELLED;
+            }
+            const pendingInstance = gameInstanceSelectionIntents.current.get(current.profileId);
+            saved = await bridge.setModEnabled(
+              {
+                ...currentProfile,
+                gameInstanceId: pendingInstance?.persistedId ?? currentProfile.gameInstanceId,
+                mods: currentProfile.mods.map((candidate) => {
+                  const pending = modToggleIntents.current.get(
+                    `${current.profileId}\0${candidate.packageId}`,
+                  );
+                  const enabled =
+                    candidate.packageId === current.packageId
+                      ? current.desired
+                      : pending?.persisted ?? candidate.enabled;
+                  return enabled === candidate.enabled ? candidate : { ...candidate, enabled };
+                }),
+              },
+              current.packageId,
+              current.desired,
             );
           } catch (error) {
+            const latest = modToggleIntents.current.get(key);
+            if (latest?.request === current.request) {
+              modToggleIntents.current.delete(key);
+              const rollbackProfile = profilesRef.current.find(
+                (candidate) => candidate.id === current.profileId,
+              );
+              if (rollbackProfile) {
+                patchProfile({
+                  ...rollbackProfile,
+                  mods: rollbackProfile.mods.map((candidate) =>
+                    candidate.packageId === current.packageId
+                      ? { ...candidate, enabled: current.persisted }
+                      : candidate
+                  ),
+                });
+              }
+              if (error !== UNMANAGED_REVIEW_CANCELLED) {
+                notify(`Could not change ${currentMod.name}: ${messageFrom(error)}`, "error");
+              }
+            }
+            continue;
+          }
+
+          const latest = modToggleIntents.current.get(key);
+          if (latest) {
+            modToggleIntents.current.set(key, { ...latest, persisted: current.desired });
+          }
+          patchProfile(saved);
+
+          let workspaceError: string | null = null;
+          let warning: string | null = null;
+          try {
+            warning = await bridge.syncProfile(currentInstance.path, saved.id);
+          } catch (error) {
+            workspaceError = messageFrom(error);
+          }
+
+          const completed = modToggleIntents.current.get(key);
+          if (completed?.request !== current.request) continue;
+          modToggleIntents.current.delete(key);
+          if (workspaceError) {
             notify(
-              `${mod.name} was changed in the profile, but its workspace could not be rebuilt: ${messageFrom(error)}`,
+              `${currentMod.name} was changed in the profile, but its direct instance could not be rebuilt: ${workspaceError}`,
               "error",
             );
+          } else {
+            notify(
+              warning ?? `${currentMod.name} is ${current.desired ? "enabled" : "disabled"} in the direct profile instance`,
+              warning ? "error" : "success",
+            );
           }
-        },
-      );
-    } catch (error) {
-      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
-    }
+        }
+      } finally {
+        modToggleWorkers.current.delete(key);
+        setPendingModToggles((current) => {
+          const next = new Set(current);
+          next.delete(key);
+          return next;
+        });
+        endProfileMutation();
+      }
+    });
   };
 
   const removeMod = async (modId: string): Promise<void> => {
@@ -838,16 +1131,16 @@ export function App() {
           const name = profile.mods.find((mod) => mod.packageId === modId)?.name ?? "mod";
           const updated = await bridge.removeMod(profile, modId);
           patchProfile(updated);
-          report({ phase: "finalizing", message: "Rebuilding the isolated workspace" });
+          report({ phase: "finalizing", message: "Rebuilding the direct profile instance" });
           try {
             const warning = await bridge.syncProfile(instance.path, updated.id, report);
             notify(
-              warning ? `Removed ${name}. ${warning}` : `Removed ${name} from the isolated workspace`,
+              warning ? `Removed ${name}. ${warning}` : `Removed ${name} from the direct profile instance`,
               warning ? "error" : "success",
             );
           } catch (error) {
             notify(
-              `${name} was removed from the profile, but its workspace could not be rebuilt: ${messageFrom(error)}`,
+              `${name} was removed from the profile, but its direct instance could not be rebuilt: ${messageFrom(error)}`,
               "error",
             );
           }
@@ -874,6 +1167,8 @@ export function App() {
         const normalized = await bridge.saveSettings({ ...settings, activeProfile: saved.id });
         setSettings(normalized);
         setProfiles((current) => [...current, saved]);
+        persistedActiveProfile.current = saved.id;
+        activeIdRef.current = saved.id;
         setActiveId(saved.id);
       });
     } catch (error) {
@@ -937,16 +1232,16 @@ export function App() {
           const installed = await bridge.installLocalMod(profile);
           if (!installed) return;
           patchProfile(installed);
-          report({ phase: "finalizing", message: "Rebuilding the isolated workspace" });
+          report({ phase: "finalizing", message: "Rebuilding the direct profile instance" });
           try {
             const warning = await bridge.syncProfile(instance.path, installed.id, report);
             notify(
-              warning ? `Added local DLL. ${warning}` : "Added local DLL to the isolated workspace",
+              warning ? `Added local DLL. ${warning}` : "Added local DLL to the direct profile instance",
               warning ? "error" : "success",
             );
           } catch (error) {
             notify(
-              `The local DLL was added to the profile, but its workspace could not be rebuilt: ${messageFrom(error)}`,
+              `The local DLL was added to the profile, but its direct instance could not be rebuilt: ${messageFrom(error)}`,
               "error",
             );
           }
@@ -979,16 +1274,9 @@ export function App() {
           if (!profile || !instance) throw new Error("Assign an Among Us source before installing mods.");
           const installed = await bridge.installAssets(profile, selections, true, report);
           const warnings: string[] = [];
-          report({ phase: "finalizing", message: "Checking installed versions for updates" });
-          let refreshed = installed;
-          try {
-            refreshed = await refreshProfileUpdates(installed);
-          } catch (error) {
-            warnings.push(`Update refresh failed: ${messageFrom(error)}`);
-          }
-          patchProfile(refreshed);
+          patchProfile(installed);
           report({ phase: "finalizing", message: "Checking the BepInEx loader" });
-          const loaderWarning = await ensureLoaderInternal(refreshed);
+          const loaderWarning = await ensureLoaderInternal(installed);
           if (loaderWarning) warnings.push(loaderWarning);
           report({ phase: "finalizing", message: "Refreshing the trusted catalog" });
           try {
@@ -1005,6 +1293,7 @@ export function App() {
               : `Installed ${count} mod${count === 1 ? "" : "s"}`,
             warnings.length > 0 ? "error" : "success",
           );
+          refreshProfileUpdatesInBackground(installed, "Background update refresh failed");
         },
       );
     } catch (error) {
@@ -1044,7 +1333,7 @@ export function App() {
                 : progress);
             },
           );
-          report({ phase: "finalizing", message: "Rebuilding the isolated workspace with the selected maps" });
+          report({ phase: "finalizing", message: "Rebuilding the direct profile instance with the selected maps" });
           patchProfile(installed);
           let syncError: string | null = null;
           let warning: string | null = null;
@@ -1053,14 +1342,7 @@ export function App() {
           } catch (error) {
             syncError = messageFrom(error);
           }
-          report({ phase: "finalizing", message: "Checking installed versions for updates" });
-          let refreshed = installed;
-          try {
-            refreshed = await refreshProfileUpdates(installed);
-          } catch (error) {
-            notify(`Maps installed, but update refresh failed: ${messageFrom(error)}`, "error");
-          }
-          patchProfile(refreshed);
+          refreshProfileUpdatesInBackground(installed, "Background map update refresh failed");
           setMapsOpen(false);
           setMapsReturnToAdd(false);
           setSelectedCatalogIds([]);
@@ -1130,33 +1412,127 @@ export function App() {
     }
   };
 
-  const selectGameInstance = async (id: string) => {
-    try {
-      await trackedExclusive(
-        {
-          scope: "profile",
-          title: "Changing profile source",
-          message: "Saving the selected source",
-        },
-        async (report) => {
-          const profile = profiles.find((candidate) => candidate.id === active.id);
-          const instance = gameInstances.find((candidate) => candidate.id === id);
-          if (!profile || !instance || profile.gameInstanceId === id) return;
-          const saved = await bridge.saveProfile({ ...profile, gameInstanceId: id });
-          patchProfile(saved);
-          report({ phase: "preparing", message: "Rebuilding the isolated workspace from the new source" });
-          const warning = await bridge.syncProfile(instance.path, saved.id, report);
-          notify(
-            warning
-              ? `Source changed. ${warning}`
-              : "Source changed and the isolated workspace is ready.",
-            warning ? "error" : "success",
-          );
-        },
-      );
-    } catch (error) {
-      if (error !== OPERATION_BUSY) notify(messageFrom(error), "error");
+  const selectGameInstance = (id: string) => {
+    if (operationRef.current) return;
+    const profile = profilesRef.current.find((candidate) => candidate.id === activeIdRef.current);
+    const instance = settingsRef.current.gameInstances.find((candidate) => candidate.id === id);
+    if (!profile || !instance) {
+      notify("The selected profile or Among Us source is no longer available.", "error");
+      return;
     }
+
+    const previous = gameInstanceSelectionIntents.current.get(profile.id);
+    if ((previous?.desiredId ?? profile.gameInstanceId) === id) return;
+    const intent: GameInstanceSelectionIntent = {
+      request: ++gameInstanceSelectionRequest.current,
+      profileId: profile.id,
+      desiredId: id,
+      persistedId: previous?.persistedId ?? profile.gameInstanceId,
+    };
+    gameInstanceSelectionIntents.current.set(profile.id, intent);
+    patchProfile({ ...profile, gameInstanceId: id });
+    if (gameInstanceSelectionWorkers.current.has(profile.id)) return;
+
+    const profileId = profile.id;
+    gameInstanceSelectionWorkers.current.add(profileId);
+    beginProfileMutation();
+    setPendingGameInstanceProfiles((current) => new Set(current).add(profileId));
+    enqueueProfileMutation(async () => {
+      try {
+        while (gameInstanceSelectionIntents.current.has(profileId)) {
+          const current = gameInstanceSelectionIntents.current.get(profileId)!;
+          const currentProfile = profilesRef.current.find(
+            (candidate) => candidate.id === current.profileId,
+          );
+          const currentInstance = settingsRef.current.gameInstances.find(
+            (candidate) => candidate.id === current.desiredId,
+          );
+          if (!currentProfile || !currentInstance) {
+            if (gameInstanceSelectionIntents.current.get(profileId)?.request === current.request) {
+              gameInstanceSelectionIntents.current.delete(profileId);
+            }
+            notify("The selected profile or Among Us source is no longer available.", "error");
+            continue;
+          }
+
+          let saved: Profile;
+          try {
+            if (!await requestUnmanagedPluginResolution(currentProfile, true, currentInstance)) {
+              throw UNMANAGED_REVIEW_CANCELLED;
+            }
+            saved = await bridge.saveProfile({
+              ...currentProfile,
+              gameInstanceId: current.desiredId,
+              mods: currentProfile.mods.map((candidate) => {
+                const pending = modToggleIntents.current.get(
+                  `${current.profileId}\0${candidate.packageId}`,
+                );
+                return pending && pending.desired !== pending.persisted
+                  ? { ...candidate, enabled: pending.persisted }
+                  : candidate;
+              }),
+            });
+          } catch (error) {
+            const latest = gameInstanceSelectionIntents.current.get(profileId);
+            if (latest?.request === current.request) {
+              gameInstanceSelectionIntents.current.delete(profileId);
+              const rollbackProfile = profilesRef.current.find(
+                (candidate) => candidate.id === current.profileId,
+              );
+              if (rollbackProfile) {
+                patchProfile({ ...rollbackProfile, gameInstanceId: current.persistedId });
+              }
+              if (error !== UNMANAGED_REVIEW_CANCELLED) {
+                notify(`Could not change source: ${messageFrom(error)}`, "error");
+              }
+            }
+            continue;
+          }
+
+          const latest = gameInstanceSelectionIntents.current.get(profileId);
+          if (latest) {
+            gameInstanceSelectionIntents.current.set(profileId, {
+              ...latest,
+              persistedId: current.desiredId,
+            });
+          }
+          patchProfile(saved);
+
+          let workspaceError: string | null = null;
+          let warning: string | null = null;
+          try {
+            warning = await bridge.syncProfile(currentInstance.path, saved.id);
+          } catch (error) {
+            workspaceError = messageFrom(error);
+          }
+
+          const completed = gameInstanceSelectionIntents.current.get(profileId);
+          if (completed?.request !== current.request) continue;
+          gameInstanceSelectionIntents.current.delete(profileId);
+          if (workspaceError) {
+            notify(
+              `Source changed, but its direct instance could not be rebuilt: ${workspaceError}`,
+              "error",
+            );
+          } else {
+            notify(
+              warning
+                ? `Source changed. ${warning}`
+                : "Source changed and the direct profile instance is ready.",
+              warning ? "error" : "success",
+            );
+          }
+        }
+      } finally {
+        gameInstanceSelectionWorkers.current.delete(profileId);
+        setPendingGameInstanceProfiles((current) => {
+          const next = new Set(current);
+          next.delete(profileId);
+          return next;
+        });
+        endProfileMutation();
+      }
+    });
   };
 
   const deleteActiveProfile = async (): Promise<void> => {
@@ -1178,6 +1554,8 @@ export function App() {
         await bridge.deleteProfile(profile.id);
         const nextProfiles = replacement ? [replacement] : left;
         setProfiles(nextProfiles);
+        persistedActiveProfile.current = nextProfiles[0].id;
+        activeIdRef.current = nextProfiles[0].id;
         setActiveId(nextProfiles[0].id);
         setSettings((current) => ({ ...current, activeProfile: undefined }));
         notify(`Deleted ${profile.name}`);
@@ -1235,16 +1613,9 @@ export function App() {
             report,
           );
           const warnings: string[] = [];
-          report({ phase: "finalizing", message: "Checking installed versions for updates" });
-          let refreshed = installed;
-          try {
-            refreshed = await refreshProfileUpdates(installed);
-          } catch (error) {
-            warnings.push(`Update refresh failed: ${messageFrom(error)}`);
-          }
-          patchProfile(refreshed);
+          patchProfile(installed);
           report({ phase: "finalizing", message: "Checking the BepInEx loader" });
-          const loaderWarning = await ensureLoaderInternal(refreshed);
+          const loaderWarning = await ensureLoaderInternal(installed);
           if (loaderWarning) warnings.push(loaderWarning);
           report({ phase: "finalizing", message: "Refreshing the trusted catalog" });
           try {
@@ -1258,6 +1629,7 @@ export function App() {
             warnings.length > 0 ? `Installed ${assetName}. ${warnings.join(" ")}` : `Installed ${assetName}`,
             warnings.length > 0 ? "error" : "success",
           );
+          refreshProfileUpdatesInBackground(installed, "Background update refresh failed");
         },
       );
     } catch (error) {
@@ -1299,13 +1671,19 @@ export function App() {
     if (!instance) throw new Error("No Among Us source is assigned to this profile.");
     setRunningStatus({ profileId: profile.id, running: true, known: true });
     try {
-      if (vanilla) await bridge.launchVanilla(instance.path, profile.id, onProgress);
-      else await bridge.launchProfile(instance.path, profile.id, onProgress);
+      const warning = vanilla
+        ? (await bridge.launchVanilla(instance.path, profile.id, onProgress), null)
+        : await bridge.launchProfile(instance.path, profile.id, onProgress);
+      if (warning) {
+        setRunningStatus({ profileId: profile.id, running: false, known: true });
+        return warning;
+      }
       notify(
         instance.store === "epic"
           ? `Launching ${vanilla ? "vanilla Among Us" : profile.name}. Epic may ask you to sign in the first time, that's normal.`
           : `Launching ${vanilla ? "vanilla Among Us" : profile.name}`,
       );
+      return null;
     } catch (error) {
       setRunningStatus({ profileId: profile.id, running: false, known: true });
       throw error;
@@ -1324,7 +1702,7 @@ export function App() {
         {
           scope: "launch",
           title: `Launching ${preflightProfile.name}`,
-          message: "Checking the isolated workspace and BepInEx loader",
+          message: "Checking the direct profile instance and BepInEx loader",
         },
         async (report) => {
           const current = profiles.find((candidate) => candidate.id === profile.id);
@@ -1332,14 +1710,8 @@ export function App() {
           if (!current || !instance) {
             throw new Error("No Among Us source is assigned. Add one in Settings.");
           }
-          if (!settings.skipLaunchWarning) {
-            const status = await bridge.loaderStatus(instance.path, current.id);
-            if (!status.current || !status.runtimeReady) {
-              setLaunchWarn(current);
-              return;
-            }
-          }
-          await launchInternal(current, false, report);
+          const warning = await launchInternal(current, false, report);
+          if (warning) setLaunchWarn(current);
         },
       );
     } catch (error) {
@@ -1364,7 +1736,8 @@ export function App() {
           const warning = await ensureLoaderInternal(profile, report);
           if (warning) throw new Error(warning);
           setLaunchWarn(null);
-          await launchInternal(profile, false, report);
+          const launchWarning = await launchInternal(profile, false, report);
+          if (launchWarning) throw new Error(launchWarning);
         },
       );
     } catch (error) {
@@ -1380,7 +1753,7 @@ export function App() {
         {
           scope: "launch",
           title: "Launching vanilla Among Us",
-          message: "Preparing the private vanilla workspace",
+          message: "Preparing the direct vanilla instance",
         },
         async (report) => {
           if (dontWarnAgain) {
@@ -1425,33 +1798,31 @@ export function App() {
           const instance = activeGame;
           if (!instance) throw new Error("Choose an Among Us source before applying a lobby.");
           const warnings: string[] = [];
-          let built = await bridge.applyLobbyCode(code, instance.arch, instance.id, report);
-          report({ phase: "finalizing", message: "Checking installed versions for updates" });
-          try {
-            built = await refreshProfileUpdates(built);
-          } catch (error) {
-            warnings.push(`Update refresh failed: ${messageFrom(error)}`);
-          }
+          const built = await bridge.applyLobbyCode(code, instance.arch, instance.id, report);
           report({ phase: "finalizing", message: "Selecting the new lobby profile" });
           const normalized = await bridge.saveSettings({ ...settings, activeProfile: built.id });
           setSettings(normalized);
           setProfiles((current) => [...current.filter((profile) => profile.id !== built.id), built]);
+          persistedActiveProfile.current = built.id;
+          activeIdRef.current = built.id;
           setActiveId(built.id);
           report({ phase: "finalizing", message: "Checking the BepInEx loader" });
           const loaderWarning = await ensureLoaderInternal(built);
           if (doLaunch) {
             if (loaderWarning) throw new Error(loaderWarning);
             report({ phase: "finalizing", message: `Starting ${built.name}` });
-            await launchInternal(built, false, report);
+            const launchWarning = await launchInternal(built, false, report);
+            if (launchWarning) throw new Error(launchWarning);
             setLobbyOpen(false);
             if (warnings.length > 0) notify(`Lobby launched. ${warnings.join(" ")}`, "error");
           } else {
-            report({ phase: "finalizing", message: "Building the lobby profile in its isolated workspace" });
+            report({ phase: "finalizing", message: "Building the lobby profile's direct instance" });
             const warning = (await syncAuthoritativeProfile(built, instance)) ?? loaderWarning;
             setLobbyOpen(false);
             const details = [warning, ...warnings].filter(Boolean).join(" ");
             notify(details ? `Lobby profile ready: ${built.name}. ${details}` : `Lobby profile ready: ${built.name}`, details ? "error" : "success");
           }
+          refreshProfileUpdatesInBackground(built, "Background lobby update refresh failed");
         },
       );
     } catch (error) {
@@ -1490,7 +1861,11 @@ export function App() {
   const saveSettings = async (draft: Settings, tokenAction: GithubTokenAction): Promise<void> => {
     try {
       await exclusive(async () => {
-        const normalized = await bridge.saveSettings(draft, tokenAction);
+        const normalized = await bridge.saveSettings(
+          { ...draft, activeProfile: settingsRef.current.activeProfile },
+          tokenAction,
+        );
+        settingsRef.current = normalized;
         setSettings(normalized);
         setGames(normalized.gameInstances);
         setSettingsOpen(false);
@@ -1511,8 +1886,14 @@ export function App() {
       },
       (report) => bridge.moveStorage(storagePath, report),
     );
+    settingsRef.current = normalized;
     setSettings(normalized);
-    notify(normalized.storageWarning ?? "Managed storage location updated", normalized.storageWarning ? "error" : "success");
+    notify(
+      normalized.storageWarning
+        ? messageFrom(normalized.storageWarning)
+        : "Direct-instance storage location updated",
+      normalized.storageWarning ? "error" : "success",
+    );
   };
   const saveErrorLog = async (): Promise<void> => {
     const destination = await exclusive(() => bridge.exportErrorLog(active.id));
@@ -1544,27 +1925,47 @@ export function App() {
           message: "Saving the selected Among Us source",
         },
         async (report) => {
-          const instances = [...gameInstances];
-          let gameInstanceId = active.gameInstanceId;
+          const currentSettings = settingsRef.current;
+          const instances = [...currentSettings.gameInstances];
+          const currentProfile =
+            profilesRef.current.find((profile) => profile.id === activeIdRef.current) ?? active;
+          let gameInstanceId = currentProfile.gameInstanceId;
           let selectedInstance: GameInstance | undefined;
           if (gamePath) {
+            const inspected = await bridge.inspectGame(gamePath);
+            const normalizedPath = inspected.path
+              .replaceAll("\\", "/")
+              .replace(/\/+$/u, "")
+              .toLocaleLowerCase();
             let instance = instances.find(
               (candidate) =>
-                candidate.path.replaceAll("\\", "/").toLowerCase() ===
-                gamePath.replaceAll("\\", "/").toLowerCase(),
+                candidate.path
+                  .replaceAll("\\", "/")
+                  .replace(/\/+$/u, "")
+                  .toLocaleLowerCase() === normalizedPath,
             );
-            if (!instance) {
-              const detected = games.find((candidate) => candidate.path === gamePath);
-              const instanceStore = (store as Store | undefined) ?? detected?.store ?? "manual";
-              const storeCount = instances.filter((candidate) => candidate.store === instanceStore).length;
-              const baseName = INSTANCE_NAMES[instanceStore];
+            const instanceStore = (store as Store | undefined) ?? inspected.store;
+            if (instance) {
               instance = {
-                id: `game-${Date.now().toString(36)}`,
-                name: storeCount === 0 ? baseName : `${baseName} ${storeCount + 1}`,
-                path: gamePath,
-                arch: (selectedArch as Arch | undefined) ?? detected?.arch ?? "x86",
+                ...instance,
+                ...inspected,
+                id: instance.id,
+                name: instance.name,
                 store: instanceStore,
-                runtime: runtime ?? detected?.runtime ?? "native",
+                arch: (selectedArch as Arch | undefined) ?? inspected.arch,
+                runtime: runtime ?? inspected.runtime ?? "native",
+              };
+              instances[instances.findIndex((candidate) => candidate.id === instance!.id)] = instance;
+            } else {
+              const storeCount = instances.filter((candidate) => candidate.store === instanceStore).length;
+              const name = INSTANCE_NAMES[instanceStore];
+              instance = {
+                ...inspected,
+                id: `game-${Date.now().toString(36)}`,
+                name: storeCount === 0 ? name : `${name} ${storeCount + 1}`,
+                store: instanceStore,
+                arch: (selectedArch as Arch | undefined) ?? inspected.arch,
+                runtime: runtime ?? inspected.runtime ?? "native",
               };
               instances.push(instance);
             }
@@ -1572,20 +1973,18 @@ export function App() {
             gameInstanceId = instance.id;
           }
           if (selection && !selectedInstance) {
-            throw new Error("Choose an Among Us source before preparing the isolated workspace.");
+            throw new Error("Choose an original Among Us source before preparing the direct profile instance.");
           }
 
-          report({ phase: "preparing", message: "Saving the game source and active profile" });
-          // Keep the existing completion state while a rerun is in progress. Each
-          // successful persistence step is mirrored locally so a failed download
-          // cannot leave the frontend trying to delete a newly assigned instance.
+          report({ phase: "preparing", message: "Saving the original source record and active profile" });
           const provisional = await bridge.saveSettings({
-            ...settings,
+            ...currentSettings,
             gameInstances: instances,
           });
+          settingsRef.current = provisional;
           setSettings(provisional);
           setGames(provisional.gameInstances);
-          let savedProfile = await bridge.saveProfile({ ...active, gameInstanceId });
+          let savedProfile = await bridge.saveProfile({ ...currentProfile, gameInstanceId });
           patchProfile(savedProfile);
           if (selection?.kind === "tou" && selectedInstance) {
             report({ phase: "resolving", message: `Resolving Town of Us ${selection.tag}` });
@@ -1599,11 +1998,11 @@ export function App() {
               report,
             );
             patchProfile(savedProfile);
-            report({ phase: "finalizing", message: "Building a fresh isolated Town of Us workspace" });
+            report({ phase: "finalizing", message: "Building a direct Town of Us profile instance" });
             await syncAuthoritativeProfile(savedProfile, selectedInstance);
           }
           if (selection?.kind === "bepinex" && selectedInstance) {
-            report({ phase: "finalizing", message: "Installing BepInEx into the isolated workspace" });
+            report({ phase: "finalizing", message: "Installing BepInEx into the direct profile instance" });
             await bridge.ensureLoader(
               selectedInstance.path,
               savedProfile.id,
@@ -1618,6 +2017,7 @@ export function App() {
             setupComplete: true,
             freshSourceSetupComplete: true,
           });
+          settingsRef.current = normalized;
           setSettings(normalized);
           setSetupOpen(false);
           setFreshSourceMigration(false);
@@ -1658,12 +2058,12 @@ export function App() {
         const current = profiles.find((candidate) => candidate.id === profile.id);
         const instance = gameForProfile(current);
         if (!current || !instance) throw new Error("No Among Us source is assigned. Add one in Settings.");
-        notify("Preparing an isolated mod workspace…");
+        notify("Preparing the direct profile instance…");
         const warning = await syncAuthoritativeProfile(current, instance);
         notify(
           warning
-            ? `The isolated workspace is ready. ${warning}`
-            : "Mods are ready in the isolated workspace. The original game source was not modified.",
+            ? `The direct profile instance is ready. ${warning}`
+            : "Mods are ready in the direct profile instance. The original game source was not modified.",
         );
       });
     } catch (error) {
@@ -1746,11 +2146,15 @@ export function App() {
             game={gameStatus}
             gameInstances={gameInstances}
             busy={busy}
+            quickActionsBlocked={operationBusy}
+            gameInstancePending={pendingGameInstanceProfiles.has(active.id)}
+            pendingModIds={activePendingModIds}
+            launchBusy={workspacePreparationProfileId !== ""}
             unmanagedPlugins={unmanagedPlugins}
             unmanagedLoading={unmanagedLoading}
             unmanagedError={unmanagedScanError}
             trustOf={trustOf}
-            onToggle={(id) => void toggleMod(id)}
+            onToggle={toggleMod}
             onRemove={removeMod}
             onPickRelease={openPicker}
             onShare={() => {
@@ -1768,7 +2172,7 @@ export function App() {
               if (!busy) setMapsOpen(true);
             }}
             onSetup={() => void setupMods(active)}
-            onSelectGameInstance={(id) => void selectGameInstance(id)}
+            onSelectGameInstance={selectGameInstance}
             onManageGameInstances={() => {
               if (!busy) setSettingsOpen(true);
             }}

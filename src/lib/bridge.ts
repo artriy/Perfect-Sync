@@ -212,8 +212,16 @@ export async function listReleases(repo: string): Promise<GhRelease[]> {
 }
 
 /** List installable release assets, with the catalog default first. */
-export async function listInstallOptions(repo: string, profileId: string): Promise<ModInstallOption[]> {
-  if (inTauri) return invoke<ModInstallOption[]>("list_install_options", { repo, profileId });
+export async function listInstallOptions(
+  repo: string,
+  profileId: string,
+  limit = 10,
+): Promise<ModInstallOption[]> {
+  if (inTauri) return invoke<ModInstallOption[]>("list_install_options", {
+    repo,
+    profileId,
+    limit,
+  });
   if (repo.toLowerCase() === TOWN_OF_US_ID) {
     const profile = browserProfiles.find((candidate) => candidate.id === profileId);
     const instance = browserSettings.gameInstances.find(
@@ -225,9 +233,15 @@ export async function listInstallOptions(repo: string, profileId: string): Promi
       instance?.runtime ?? "native",
     );
   }
-  return (await listReleases(repo)).flatMap((release) =>
-    release.assets.map((asset) => ({ tag: release.tag_name, assetName: asset.name, size: asset.size })),
-  );
+  return (await listReleases(repo))
+    .slice(0, limit)
+    .flatMap((release) =>
+      release.assets.map((asset) => ({
+        tag: release.tag_name,
+        assetName: asset.name,
+        size: asset.size,
+      })),
+    );
 }
 export async function listTouSetupOptions(
   arch: Arch,
@@ -509,7 +523,11 @@ export async function removeLevelImposterMaps(
 
 /** Native folder picker (Tauri only). Returns the chosen path or null. */
 export async function pickFolder(title = "Select your Among Us folder"): Promise<string | null> {
-  if (!inTauri) return title.toLowerCase().includes("storage") ? "D:/Perfect Sync Storage" : null;
+  if (!inTauri) {
+    return title.toLowerCase().includes("storage")
+      ? "D:/Perfect Sync Storage"
+      : "C:/Program Files (x86)/Steam/steamapps/common/Among Us";
+  }
   const picked = await openDialog({ directory: true, multiple: false, title });
   return typeof picked === "string" ? picked : null;
 }
@@ -526,11 +544,31 @@ export async function pickLocalDll(): Promise<string | null> {
   return typeof picked === "string" ? picked : null;
 }
 
-/** Validate and classify a manually selected Among Us folder. */
+const BROWSER_SOURCE_FINGERPRINT =
+  "640c620baf3bf71c8d789e45d2e07dbd6f0b31df59f9bf7e43d40da78113c83f";
+
 export async function inspectGame(gamePath: string): Promise<GameInstall> {
   if (inTauri) return invoke<GameInstall>("inspect_game", { gamePath });
-  if (!gamePath.trim()) throw new Error("Choose an Among Us folder.");
-  return { path: gamePath.trim(), store: "manual", arch: "x86", runtime: "native" };
+  const path = gamePath.trim();
+  if (!path) throw new Error("Choose an Among Us folder.");
+  const existing = browserSettings.gameInstances.find(
+    (instance) =>
+      instance.path.trim().replaceAll("\\", "/").replace(/\/+$/u, "").toLocaleLowerCase() ===
+      path.replaceAll("\\", "/").replace(/\/+$/u, "").toLocaleLowerCase(),
+  );
+  return {
+    path: existing?.path ?? path,
+    store: existing?.store ?? "manual",
+    arch: existing?.arch ?? "x86",
+    runtime: existing?.runtime ?? "native",
+    build: "2026.3.31",
+    writable: true,
+    sourceClean: true,
+    sourceModArtifacts: [],
+    sourceFingerprint: BROWSER_SOURCE_FINGERPRINT,
+    sourceFileCount: 624,
+    sourceByteCount: 842_100_000,
+  };
 }
 
 
@@ -585,6 +623,9 @@ export async function detectGames(): Promise<GameInstall[]> {
       writable: true,
       sourceClean: true,
       sourceModArtifacts: [],
+      sourceFingerprint: BROWSER_SOURCE_FINGERPRINT,
+      sourceFileCount: 624,
+      sourceByteCount: 842_100_000,
     },
   ];
 }
@@ -600,6 +641,10 @@ let browserSettings: Settings = {
       store: "steam",
       arch: "x86",
       runtime: "native",
+      build: "2026.3.31",
+      sourceFingerprint: BROWSER_SOURCE_FINGERPRINT,
+      sourceFileCount: 624,
+      sourceByteCount: 842_100_000,
     },
     {
       id: "epic-demo",
@@ -608,6 +653,10 @@ let browserSettings: Settings = {
       store: "epic",
       arch: "x64",
       runtime: "native",
+      build: "2026.3.31",
+      sourceFingerprint: BROWSER_SOURCE_FINGERPRINT,
+      sourceFileCount: 624,
+      sourceByteCount: 842_100_000,
     },
   ],
   personalMods: [],
@@ -635,6 +684,7 @@ function normalizeBrowserSettings(settings: Settings): Settings {
     personalMods: structuredClone(settings.personalMods ?? []),
     personalLocalMods: structuredClone(settings.personalLocalMods ?? []),
     setupComplete: !!settings.setupComplete,
+    activeProfile: settings.activeProfile ?? browserSettings.activeProfile,
     hasGithubToken: browserSettings.hasGithubToken,
     recoveryWarning: undefined,
   };
@@ -671,13 +721,12 @@ export async function saveSettings(
   return structuredClone(browserSettings);
 }
 
-export async function selectActiveProfile(profileId: string): Promise<Settings> {
-  if (inTauri) return invoke<Settings>("select_active_profile", { profileId });
+export async function selectActiveProfile(profileId: string): Promise<void> {
+  if (inTauri) return invoke<void>("select_active_profile", { profileId });
   if (!browserProfiles.some((profile) => profile.id === profileId)) {
     throw new Error("Profile not found.");
   }
   browserSettings = { ...browserSettings, activeProfile: profileId };
-  return structuredClone(browserSettings);
 }
 
 export async function moveStorage(
@@ -695,7 +744,7 @@ export async function moveStorage(
   await delay(120);
   onProgress?.({
     phase: "copying",
-    message: "Copying managed game data and package caches",
+    message: "Copying direct profile instances and package caches",
     bytesReceived: 12 * 1024 * 1024,
     bytesTotal: 24 * 1024 * 1024,
   });
@@ -715,7 +764,7 @@ function errorLogDefaultName(): string {
   return `Perfect-Sync-Error-Log-${timestamp}.log`;
 }
 
-/** Save LogOutput.log from the active managed profile workspace. */
+/** Save LogOutput.log from the active direct profile instance. */
 export async function exportErrorLog(profileId: string): Promise<string | null> {
   const defaultPath = errorLogDefaultName();
   if (!inTauri) return defaultPath;
@@ -831,10 +880,10 @@ export async function saveProfile(profile: Profile): Promise<Profile> {
   if (!saved.id || !saved.name || !saved.crewColor) throw new Error("Profile name and crew color are required.");
   if (saved.gameInstanceId) {
     if (!browserSettings.gameInstances.some((instance) => instance.id === saved.gameInstanceId)) {
-      throw new Error("Profile refers to an unknown Among Us instance.");
+      throw new Error("Profile refers to an unknown original Among Us source.");
     }
   } else if (browserSettings.gameInstances.length > 0) {
-    throw new Error("Choose and save an Among Us instance for this profile.");
+    throw new Error("Choose and save an original Among Us source for this profile.");
   }
   return replaceBrowserProfile(saved);
 }
@@ -1226,7 +1275,7 @@ export async function applyLobbyCode(
       onProgress: progressChannel(onProgress),
     });
   }
-  if (!gameInstanceId) throw new Error("Choose an Among Us instance before applying a lobby.");
+  if (!gameInstanceId) throw new Error("Choose an original Among Us source before applying a lobby.");
   const manifest = await decodeBrowserCode(code);
   await simulateBrowserTransfers(
     [
@@ -1305,7 +1354,7 @@ export async function listUnmanagedPlugins(
   if (inTauri) {
     return invoke<UnmanagedPlugin[]>("list_unmanaged_plugins", { gamePath, profileId });
   }
-  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  if (!gamePath.trim()) throw new Error("Choose an original Among Us source first.");
   return [];
 }
 
@@ -1317,7 +1366,7 @@ export async function quarantineUnmanagedPlugins(
   if (inTauri) {
     return invoke<UnmanagedPlugin[]>("quarantine_unmanaged_plugins", { gamePath, profileId, paths });
   }
-  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  if (!gamePath.trim()) throw new Error("Choose an original Among Us source first.");
   if (paths.length === 0) throw new Error("Select at least one plugin.");
   return [];
 }
@@ -1330,7 +1379,7 @@ export async function deleteUnmanagedPlugins(
   if (inTauri) {
     return invoke<UnmanagedPlugin[]>("delete_unmanaged_plugins", { gamePath, profileId, paths });
   }
-  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  if (!gamePath.trim()) throw new Error("Choose an original Among Us source first.");
   if (paths.length === 0) throw new Error("Select at least one plugin.");
   return [];
 }
@@ -1343,7 +1392,7 @@ export async function importUnmanagedPlugins(
   if (inTauri) {
     return invoke<Profile>("import_unmanaged_plugins", { gamePath, profileId, paths });
   }
-  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  if (!gamePath.trim()) throw new Error("Choose an original Among Us source first.");
   if (paths.length === 0) throw new Error("Select at least one plugin.");
   const profile = browserProfiles.find((candidate) => candidate.id === profileId);
   if (!profile) throw new Error("Profile not found.");
@@ -1371,7 +1420,7 @@ export interface LoaderStatus {
 
 export async function loaderStatus(gamePath: string, profileId: string): Promise<LoaderStatus> {
   if (inTauri) return invoke<LoaderStatus>("loader_status", { gamePath, profileId });
-  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  if (!gamePath.trim()) throw new Error("Choose an original Among Us source first.");
   return {
     gameFound: true,
     winhttp: true,
@@ -1386,7 +1435,7 @@ export async function loaderStatus(gamePath: string, profileId: string): Promise
     runtime: "native",
     runtimeReady: true,
     workspaceReady: true,
-    workspacePath: "Browser preview workspace",
+    workspacePath: "Browser preview direct instance",
   };
 }
 
@@ -1406,7 +1455,7 @@ export async function ensureLoader(
       onProgress: progressChannel(onProgress),
     });
   }
-  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  if (!gamePath.trim()) throw new Error("Choose an original Among Us source first.");
   await simulateBrowserTransfers(["BepInEx loader"], onProgress);
   return null;
 }
@@ -1426,7 +1475,7 @@ export async function reinstallLoader(
     applyDoorstopFix,
     useLatestLoader,
   });
-  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
+  if (!gamePath.trim()) throw new Error("Choose an original Among Us source first.");
   return null;
 }
 
@@ -1442,18 +1491,18 @@ export async function launchProfile(
   gamePath: string,
   profileId: string,
   onProgress?: ProgressHandler,
-): Promise<void> {
+): Promise<string | null> {
   if (inTauri) {
-    await invoke<void>("launch_profile", {
+    return invoke<string | null>("launch_profile", {
       gamePath,
       profileId,
       onProgress: progressChannel(onProgress),
     });
-    return;
   }
-  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
-  await simulateBrowserTransfers(["isolated profile workspace"], onProgress);
+  if (!gamePath.trim()) throw new Error("Choose an original Among Us source first.");
+  await simulateBrowserTransfers(["direct profile instance"], onProgress);
   beginBrowserLaunch(profileId);
+  return null;
 }
 
 export async function launchVanilla(
@@ -1469,12 +1518,12 @@ export async function launchVanilla(
     });
     return;
   }
-  if (!gamePath.trim()) throw new Error("Choose an Among Us instance first.");
-  await simulateBrowserTransfers(["private vanilla workspace"], onProgress);
+  if (!gamePath.trim()) throw new Error("Choose an original Among Us source first.");
+  await simulateBrowserTransfers(["direct vanilla instance"], onProgress);
   beginBrowserLaunch(profileId);
 }
 
-/** Prepare the active profile in the isolated managed workspace. */
+/** Prepare the active profile in its isolated direct instance. */
 export async function syncProfile(
   gamePath: string,
   profileId: string,
@@ -1488,7 +1537,7 @@ export async function syncProfile(
     });
   }
   if (!gamePath.trim()) throw new Error("Choose an Among Us source first.");
-  await simulateBrowserTransfers(["isolated game workspace"], onProgress);
+  await simulateBrowserTransfers(["direct profile instance"], onProgress);
   return null;
 }
 

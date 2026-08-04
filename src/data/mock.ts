@@ -32,6 +32,7 @@ export const PROFILES: Profile[] = [
     name: "ToU Mira night",
     crewColor: CREW.violet,
     gameBuild: "17.0.1",
+    gameInstanceId: "steam-demo",
     mods: [
       {
         packageId: "AU-Avengers/TOU-Mira",
@@ -62,6 +63,7 @@ export const PROFILES: Profile[] = [
     name: "TOHE chaos",
     crewColor: CREW.red,
     gameBuild: "17.0.1",
+    gameInstanceId: "steam-demo",
     mods: [
       {
         packageId: "EnhancedNetwork/TownofHost-Enhanced",
@@ -82,6 +84,7 @@ export const PROFILES: Profile[] = [
     name: "The Other Roles",
     crewColor: CREW.cyan,
     gameBuild: "16.0.5",
+    gameInstanceId: "steam-demo",
     mods: [
       {
         packageId: "TheOtherRolesAU/TheOtherRoles",
@@ -102,6 +105,7 @@ export const PROFILES: Profile[] = [
     name: "Vanilla + QoL",
     crewColor: CREW.mint,
     gameBuild: "17.0.1",
+    gameInstanceId: "steam-demo",
     mods: [
       {
         packageId: "DigiWorm0/LevelImposter",

@@ -11,7 +11,7 @@ interface SidebarProps {
 
 export function Sidebar({ profiles, activeId, busy, onSelect, onNewProfile }: SidebarProps) {
   return (
-    <aside className="glass-2 flex min-h-0 w-[244px] shrink-0 flex-col gap-2 overflow-hidden p-3.5 max-[720px]:w-full max-[720px]:flex-row max-[720px]:items-center max-[720px]:p-2.5" aria-busy={busy}>
+    <aside className="glass-2 flex min-h-0 w-[244px] shrink-0 flex-col gap-2 overflow-hidden p-3.5 max-[720px]:w-full max-[720px]:flex-row max-[720px]:items-center max-[720px]:p-2.5">
       <div className="flex items-center justify-between px-1 pb-1 max-[720px]:shrink-0 max-[720px]:gap-2 max-[720px]:pb-0">
         <span className="text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
           Profiles
@@ -35,7 +35,6 @@ export function Sidebar({ profiles, activeId, busy, onSelect, onNewProfile }: Si
             <button
               key={p.id}
               type="button"
-              disabled={busy}
               onClick={() => onSelect(p.id)}
               aria-current={active}
               title={p.name}

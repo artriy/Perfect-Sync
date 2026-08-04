@@ -14,7 +14,10 @@ use perfect_sync_core::catalog::{parse, AssetArchRule, AssetRules, Catalog};
 use perfect_sync_core::deps;
 use perfect_sync_core::preview::{preview, Preview};
 use perfect_sync_core::profile::{InstalledMod, ProfileRecord, ProfileStore};
-use perfect_sync_core::resolver::{download_resolved, Http, Release, ResolvedDownload, UreqHttp};
+use perfect_sync_core::resolver::{
+    download_resolved as download_resolved_uncached, download_resolved_to_writer, Http, Release,
+    ResolvedDownload, UreqHttp,
+};
 use perfect_sync_core::types::{
     valid_levelimposter_map_id, Arch, ModSource, ModTag, Runtime, Store, Trust,
 };
@@ -88,6 +91,15 @@ static LAUNCH_PENDING: LazyLock<Mutex<HashSet<String>>> =
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static INSPECTED_GAMES: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static HTTP_CLIENT: LazyLock<Mutex<Option<(String, UreqHttp)>>> =
+    LazyLock::new(|| Mutex::new(None));
+const ASSET_CACHE_LOCK_SHARDS: usize = 32;
+static ASSET_CACHE_LOCKS: LazyLock<[Mutex<()>; ASSET_CACHE_LOCK_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
+const PROFILE_LOCK_SHARDS: usize = 64;
+static PROFILE_LOCKS: LazyLock<[Mutex<()>; PROFILE_LOCK_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
+static PROFILE_RECOVERY_LOCK: Mutex<()> = Mutex::new(());
 
 /// Run a blocking closure off the UI thread and flatten the result.
 async fn blocking<T, F>(f: F) -> Result<T, String>
@@ -100,10 +112,59 @@ where
         .map_err(|e| e.to_string())?
 }
 
+fn log_perf(label: &str, started: Instant, files: usize, bytes: u64) {
+    log::info!(
+        target: "perfect_sync::performance",
+        "{label} completed in {} ms ({files} files, {bytes} bytes)",
+        started.elapsed().as_millis()
+    );
+}
+
 fn lock_mutations() -> Result<std::sync::MutexGuard<'static, ()>, String> {
     MUTATION_LOCK
         .lock()
         .map_err(|_| "backend mutation lock is poisoned".to_string())
+}
+
+fn lock_profile_mutation(profile_id: &str) -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in profile_id.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    PROFILE_LOCKS[hash as usize % PROFILE_LOCK_SHARDS]
+        .lock()
+        .map_err(|_| "profile mutation lock is poisoned".to_string())
+}
+
+fn lock_asset_cache(request_key: &str) -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    let shard = request_key
+        .bytes()
+        .take(8)
+        .fold(0_usize, |hash, byte| hash.wrapping_mul(33) ^ byte as usize)
+        % ASSET_CACHE_LOCK_SHARDS;
+    ASSET_CACHE_LOCKS[shard]
+        .lock()
+        .map_err(|_| "asset cache lock is poisoned".to_string())
+}
+fn lock_all_profile_mutations() -> Result<Vec<std::sync::MutexGuard<'static, ()>>, String> {
+    PROFILE_LOCKS
+        .iter()
+        .map(|lock| {
+            lock.lock()
+                .map_err(|_| "profile mutation lock is poisoned".to_string())
+        })
+        .collect()
+}
+
+fn lock_all_asset_caches() -> Result<Vec<std::sync::MutexGuard<'static, ()>>, String> {
+    ASSET_CACHE_LOCKS
+        .iter()
+        .map(|lock| {
+            lock.lock()
+                .map_err(|_| "asset cache lock is poisoned".to_string())
+        })
+        .collect()
 }
 
 fn validate_profile_id(id: &str) -> Result<(), String> {
@@ -361,6 +422,7 @@ fn is_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 fn copy_profile_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    let started = Instant::now();
     let source_metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     if is_reparse(&source_metadata) || !source_metadata.is_dir() {
         return Err("profile is not a regular directory".into());
@@ -409,6 +471,73 @@ fn copy_profile_tree(source: &Path, destination: &Path) -> Result<(), String> {
             }
         }
     }
+    log_perf("profile_tree_copy", started, files, bytes);
+    Ok(())
+}
+
+/// Build a transaction view without copying immutable payload bytes. Every profile
+/// mutation used by this module replaces, renames, or removes files; it never
+/// truncates an existing payload in place, so hard-linked inputs remain unchanged.
+fn stage_profile_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    let started = Instant::now();
+    let source_metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    if is_reparse(&source_metadata) || !source_metadata.is_dir() {
+        return Err("profile is not a regular directory".into());
+    }
+    fs::create_dir(destination).map_err(|error| error.to_string())?;
+    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+    let mut files = 0_usize;
+    let mut bytes = 0_u64;
+    let mut copied_bytes = 0_u64;
+    while let Some((from, to)) = pending.pop() {
+        for entry in fs::read_dir(&from).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+            if is_reparse(&metadata) {
+                return Err(format!(
+                    "profile contains a link or reparse point: {}",
+                    entry.path().display()
+                ));
+            }
+            let target = to.join(entry.file_name());
+            if metadata.is_dir() {
+                fs::create_dir(&target).map_err(|error| error.to_string())?;
+                pending.push((entry.path(), target));
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err("profile contains an unsupported filesystem entry".into());
+            }
+            files += 1;
+            bytes = bytes
+                .checked_add(metadata.len())
+                .filter(|total| *total <= MAX_PROFILE_STAGE_BYTES)
+                .ok_or("profile exceeds the staging byte limit")?;
+            if files > MAX_PROFILE_STAGE_FILES {
+                return Err("profile contains too many files".into());
+            }
+            if fs::hard_link(entry.path(), &target).is_err() {
+                let mut input = File::open(entry.path()).map_err(|error| error.to_string())?;
+                let mut output = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&target)
+                    .map_err(|error| error.to_string())?;
+                let copied =
+                    io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
+                if copied != metadata.len() {
+                    return Err("profile file changed while it was staged".into());
+                }
+                output.sync_all().map_err(|error| error.to_string())?;
+                copied_bytes += copied;
+            }
+        }
+    }
+    log::info!(
+        target: "perfect_sync::performance",
+        "profile_tree_stage completed in {} ms ({files} files, {bytes} logical bytes, {copied_bytes} copied bytes)",
+        started.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -637,6 +766,90 @@ struct ProfileRecoveryJournal {
     version: u32,
     profile_id: String,
     action: ProfileRecoveryAction,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ModToggleRecoveryJournal {
+    version: u32,
+    profile_id: String,
+    file: String,
+}
+
+fn mod_toggle_recovery_path(root: &Path, id: &str) -> Result<PathBuf, String> {
+    validate_profile_id(id)?;
+    let parent = root
+        .parent()
+        .ok_or("profile root has no parent directory")?;
+    Ok(parent.join(format!(
+        "{}{id}",
+        profile_sibling_prefix(root, "mod-toggle")?
+    )))
+}
+
+fn recover_mod_toggle_transaction(root: &Path, id: &str) -> Result<(), String> {
+    let journal_path = mod_toggle_recovery_path(root, id)?;
+    let metadata = match fs::symlink_metadata(&journal_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err(format!(
+            "mod toggle recovery marker is not a regular file: {}",
+            journal_path.display()
+        ));
+    }
+    let bytes = read_bounded(&journal_path, MAX_PROFILE_RECOVERY_JOURNAL_BYTES)?
+        .ok_or("mod toggle recovery marker disappeared")?;
+    let journal: ModToggleRecoveryJournal = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid mod toggle recovery marker: {error}"))?;
+    if journal.version != 1 || journal.profile_id != id {
+        return Err("mod toggle recovery marker does not match its profile".into());
+    }
+    let record = ProfileStore::new(root)
+        .load(id)
+        .map_err(|error| error.to_string())?
+        .ok_or("profile with a pending mod toggle is unavailable")?;
+    let enabled = record
+        .mods
+        .iter()
+        .find(|installed| {
+            installed
+                .file
+                .as_deref()
+                .is_some_and(|file| file.eq_ignore_ascii_case(&journal.file))
+        })
+        .map(|installed| installed.enabled)
+        .ok_or("mod toggle recovery marker refers to an unknown plugin")?;
+    profile::set_plugin_enabled(root, id, &journal.file, enabled).map_err(|error| {
+        format!(
+            "could not recover the pending mod toggle ({error}); recovery evidence was retained at {}",
+            journal_path.display()
+        )
+    })?;
+    fs::remove_file(&journal_path).map_err(|error| {
+        format!(
+            "mod toggle recovered but its recovery marker could not be removed ({error}): {}",
+            journal_path.display()
+        )
+    })
+}
+
+fn write_mod_toggle_recovery_journal(root: &Path, id: &str, file: &str) -> Result<PathBuf, String> {
+    let path = mod_toggle_recovery_path(root, id)?;
+    let mut bytes = serde_json::to_vec(&ModToggleRecoveryJournal {
+        version: 1,
+        profile_id: id.to_string(),
+        file: file.to_string(),
+    })
+    .map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_PROFILE_RECOVERY_JOURNAL_BYTES {
+        return Err("mod toggle recovery journal exceeds its size limit".into());
+    }
+    atomic_write(&path, &bytes)?;
+    Ok(path)
 }
 
 struct ProfileTransactionPaths {
@@ -888,16 +1101,21 @@ fn recover_profile_transaction(
 }
 
 fn recover_profile_transactions(root: &Path) -> Result<(), String> {
+    let _guard = PROFILE_RECOVERY_LOCK
+        .lock()
+        .map_err(|_| "profile recovery lock is poisoned".to_string())?;
     let parent = root
         .parent()
         .ok_or("profile root has no parent directory")?;
     let prefix = profile_sibling_prefix(root, "recovery")?;
+    let toggle_prefix = profile_sibling_prefix(root, "mod-toggle")?;
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
     let mut journals = Vec::new();
+    let mut toggle_ids = Vec::new();
     let mut parent_entries = 0_usize;
     for entry in entries {
         parent_entries += 1;
@@ -908,7 +1126,21 @@ fn recover_profile_transactions(root: &Path) -> Result<(), String> {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let Some(suffix) = name.strip_prefix(&prefix).map(str::to_owned) else {
+        let suffix = if let Some(suffix) = name.strip_prefix(&prefix) {
+            suffix.to_owned()
+        } else if let Some(id) = name.strip_prefix(&toggle_prefix) {
+            validate_profile_id(id).map_err(|error| {
+                format!(
+                    "invalid mod toggle recovery marker {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+            if toggle_ids.len() >= MAX_PROFILE_RECOVERY_JOURNALS {
+                return Err("too many pending mod toggle recovery journals".into());
+            }
+            toggle_ids.push(id.to_string());
+            continue;
+        } else {
             continue;
         };
         if !valid_profile_transaction_suffix(&suffix) {
@@ -957,6 +1189,16 @@ fn recover_profile_transactions(root: &Path) -> Result<(), String> {
             ));
         }
     }
+    toggle_ids.sort_by_key(|id| id.to_ascii_lowercase());
+    if toggle_ids
+        .windows(2)
+        .any(|ids| ids[0].eq_ignore_ascii_case(&ids[1]))
+    {
+        return Err("ambiguous mod toggle recovery journals were retained".into());
+    }
+    for id in toggle_ids {
+        recover_mod_toggle_transaction(root, &id)?;
+    }
     Ok(())
 }
 
@@ -980,6 +1222,7 @@ fn profile_transaction<T>(
     id: &str,
     operation: impl FnOnce(&Path, &ProfileStore) -> Result<T, String>,
 ) -> Result<T, String> {
+    let started = Instant::now();
     validate_profile_id(id)?;
     recover_profile_transactions(root)?;
     fs::create_dir_all(root).map_err(|error| error.to_string())?;
@@ -992,7 +1235,7 @@ fn profile_transaction<T>(
             let _ = fs::remove_dir(&paths.stage_root);
             return Err("profile is not a regular directory".into());
         }
-        Ok(_) => match copy_profile_tree(&final_dir, &stage_dir) {
+        Ok(_) => match stage_profile_tree(&final_dir, &stage_dir) {
             Ok(()) => true,
             Err(error) => {
                 let _ = fs::remove_dir_all(&paths.stage_root);
@@ -1040,6 +1283,9 @@ fn profile_transaction<T>(
         let _ = fs::remove_dir_all(&paths.stage_root);
         return Err(error);
     }
+    let _recovery_guard = PROFILE_RECOVERY_LOCK
+        .lock()
+        .map_err(|_| "profile recovery lock is poisoned".to_string())?;
     let backup = paths.backup_root.join(id);
     if old_exists {
         fs::create_dir(&paths.backup_root).map_err(|error| {
@@ -1087,6 +1333,7 @@ fn profile_transaction<T>(
     } else {
         let _ = fs::remove_dir(&paths.stage_root);
     }
+    log_perf("profile_transaction", started, 0, 0);
     Ok(value)
 }
 
@@ -1215,7 +1462,136 @@ fn http() -> Result<UreqHttp, String> {
     let exposed = token
         .as_ref()
         .map(|secret| secret.expose_secret().to_owned());
-    Ok(UreqHttp::new(exposed))
+    let fingerprint = sha256_hex(exposed.as_deref().unwrap_or_default().as_bytes());
+    let mut shared = HTTP_CLIENT
+        .lock()
+        .map_err(|_| "HTTP client lock is poisoned".to_string())?;
+    if let Some((cached_fingerprint, client)) = shared.as_ref() {
+        if cached_fingerprint == &fingerprint {
+            return Ok(client.clone());
+        }
+    }
+    let client = UreqHttp::new(exposed);
+    *shared = Some((fingerprint, client.clone()));
+    Ok(client)
+}
+
+fn fetch_releases_bounded(
+    client: &UreqHttp,
+    repo: &str,
+    limit: u32,
+) -> Result<Vec<Release>, String> {
+    let started = Instant::now();
+    let tags =
+        resolver::fetch_release_tags(client, repo, limit).map_err(|error| error.to_string())?;
+    let mut releases = Vec::with_capacity(tags.len());
+    for chunk in tags.chunks(4) {
+        let resolved = std::thread::scope(|scope| {
+            chunk
+                .iter()
+                .map(|tag| {
+                    let client = client.clone();
+                    let repo = repo.to_string();
+                    let tag = tag.clone();
+                    scope.spawn(move || {
+                        resolver::fetch_release_by_tag(&client, &repo, &tag)
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| "release metadata worker panicked".to_string())?
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        releases.extend(resolved);
+    }
+    log_perf("release_metadata", started, releases.len(), 0);
+    Ok(releases)
+}
+
+fn download_resolved(
+    client: &dyn Http,
+    resolved: &ResolvedDownload,
+) -> Result<Vec<u8>, perfect_sync_core::resolver::ResolveError> {
+    use perfect_sync_core::resolver::ResolveError;
+    let started = Instant::now();
+    let Some(cache_dir) = settings::cache_dir_if_initialized() else {
+        let result = download_resolved_uncached(client, resolved);
+        if result.is_ok() {
+            log_perf("asset_download", started, 1, resolved.size.bytes());
+        }
+        return result;
+    };
+
+    let cache_root = cache_dir.join("assets");
+    let blobs = cache_root.join("sha256");
+    let requests = cache_root.join("requests");
+    let mut identity = Vec::with_capacity(resolved.url.len() + 32);
+    identity.extend_from_slice(resolved.url.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(&resolved.size.bytes().to_le_bytes());
+    let request_key = sha256_hex(&identity);
+    let _guard = lock_asset_cache(&request_key).map_err(ResolveError::Http)?;
+    let request_path = requests.join(&request_key);
+    let expected_digest = resolved.size.sha256().map(|digest| sha256_hex(&digest));
+    let indexed_digest = read_bounded(&request_path, 64)
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if let Some(digest) = expected_digest.as_ref().or(indexed_digest.as_ref()) {
+        let path = blobs.join(digest);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.is_file()
+                && !is_reparse(&metadata)
+                && metadata.len() == resolved.size.bytes()
+            {
+                let bytes =
+                    fs::read(&path).map_err(|error| ResolveError::Http(error.to_string()))?;
+                if sha256_hex(&bytes).eq_ignore_ascii_case(digest) {
+                    log_perf("asset_cache_hit", started, 1, bytes.len() as u64);
+                    return Ok(bytes);
+                }
+            }
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fs::create_dir_all(&blobs).map_err(|error| ResolveError::Http(error.to_string()))?;
+    fs::create_dir_all(&requests).map_err(|error| ResolveError::Http(error.to_string()))?;
+    let temporary =
+        unique_sibling(&blobs.join(&request_key), "download").map_err(ResolveError::Http)?;
+    let download_result = (|| {
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| ResolveError::Http(error.to_string()))?;
+        download_resolved_to_writer(client, resolved, &mut output, &mut |_, _| {})?;
+        output
+            .sync_all()
+            .map_err(|error| ResolveError::Http(error.to_string()))?;
+        drop(output);
+        let bytes = fs::read(&temporary).map_err(|error| ResolveError::Http(error.to_string()))?;
+        let digest = sha256_hex(&bytes);
+        let blob = blobs.join(&digest);
+        if blob.is_file() {
+            fs::remove_file(&temporary).map_err(|error| ResolveError::Http(error.to_string()))?;
+        } else {
+            fs::rename(&temporary, &blob).map_err(|error| ResolveError::Http(error.to_string()))?;
+        }
+        atomic_write(&request_path, digest.as_bytes()).map_err(ResolveError::Http)?;
+        Ok(bytes)
+    })();
+    if download_result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    if let Ok(bytes) = &download_result {
+        log_perf("asset_download", started, 1, bytes.len() as u64);
+    }
+    download_result
 }
 
 fn default_rules() -> AssetRules {
@@ -1373,6 +1749,26 @@ fn resolve_profile_latest(
     let asset = pick_profile_asset(&release, repo, rules, arch, store, runtime)?
         .ok_or_else(|| format!("Town of Us {} has no compatible full package", release.tag))?;
     resolver::resolved_asset(http, &release, asset).map_err(|error| error.to_string())
+}
+
+fn latest_profile_version(
+    http: &dyn Http,
+    repo: &str,
+    rules: &AssetRules,
+    arch: &str,
+    store: Store,
+    runtime: Runtime,
+) -> Result<String, String> {
+    let release =
+        resolver::fetch_latest_release_fresh(http, repo).map_err(|error| error.to_string())?;
+    if pick_profile_asset(&release, repo, rules, arch, store, runtime)?.is_none() {
+        return Err(if is_tou_mira(repo) {
+            format!("Town of Us {} has no compatible full package", release.tag)
+        } else {
+            format!("{repo} release {} has no compatible package", release.tag)
+        });
+    }
+    Ok(release.tag)
 }
 
 fn arch_str(a: Arch) -> String {
@@ -1538,24 +1934,39 @@ fn game_executable_identity(game_dir: &Path) -> Option<String> {
     let metadata = fs::metadata(game_dir.join(process::GAME_EXE)).ok()?;
     Some(format!("{:016x}:{:016x}", metadata.dev(), metadata.ino()))
 }
+fn refresh_game_instance(
+    instance: &mut settings::GameInstance,
+    canonical: &Path,
+) -> Result<bool, String> {
+    let previous = instance.clone();
+    let path_changed = !same_path(Path::new(&instance.path), canonical);
+    instance.path = canonical.to_string_lossy().into_owned();
+    instance.executable_identity = game_executable_identity(canonical);
+    instance.arch = game::exe_arch(&canonical.join(process::GAME_EXE))
+        .ok_or("Among Us executable architecture is unsupported")?;
+    instance.runtime = compat::resolve_with_hint(canonical, Some(instance.runtime)).runtime;
+    if path_changed {
+        instance.source_fingerprint = None;
+        instance.source_file_count = None;
+        instance.source_byte_count = None;
+    }
+    if instance.source_fingerprint.is_none() {
+        instance.build = game::detect_build(canonical);
+    }
+    instance.writable = game::is_writable_game_dir(canonical);
+    let detected_store = game::store_for_path(canonical, Store::Manual);
+    if detected_store != Store::Manual {
+        instance.store = detected_store;
+    }
+    Ok(*instance != previous)
+}
 
 fn repair_moved_game_instances(saved: &mut Settings) -> Result<(bool, Vec<String>), String> {
     let mut changed = false;
     let mut repaired = Vec::new();
     for instance in &mut saved.game_instances {
         if let Ok(canonical) = canonical_game_path(Path::new(&instance.path)) {
-            let identity = game_executable_identity(&canonical);
-            let normalized = canonical.to_string_lossy().into_owned();
-            let detected_store = game::store_for_path(&canonical, Store::Manual);
-            if detected_store != Store::Manual && instance.store != detected_store {
-                instance.store = detected_store;
-                changed = true;
-            }
-            if instance.path != normalized || instance.executable_identity != identity {
-                instance.path = normalized;
-                instance.executable_identity = identity;
-                changed = true;
-            }
+            changed |= refresh_game_instance(instance, &canonical)?;
             continue;
         }
 
@@ -1599,15 +2010,18 @@ fn repair_moved_game_instances(saved: &mut Settings) -> Result<(bool, Vec<String
         if candidates.len() != 1 {
             continue;
         }
-        let (candidate, identity) = candidates.pop().unwrap();
-        instance.path = candidate.to_string_lossy().into_owned();
-        instance.executable_identity = identity;
-        instance.runtime = compat::resolve_with_hint(&candidate, Some(instance.runtime)).runtime;
-        instance.build = game::detect_build(&candidate);
-        instance.writable = game::is_writable_game_dir(&candidate);
-        let detected_store = game::store_for_path(&candidate, Store::Manual);
-        if detected_store != Store::Manual {
-            instance.store = detected_store;
+        let (candidate, _) = candidates.pop().unwrap();
+        let rebound = if instance.source_fingerprint.is_some() {
+            managed_instance::rebind_source_record(instance, &candidate)?
+        } else {
+            None
+        };
+        refresh_game_instance(instance, &candidate)?;
+        if let Some(source) = rebound {
+            instance.source_fingerprint = Some(source.record.fingerprint);
+            instance.source_file_count = Some(source.record.file_count);
+            instance.source_byte_count = Some(source.record.byte_count);
+            instance.build = source.record.observed_build;
         }
         repaired.push(instance.name.clone());
         changed = true;
@@ -1688,6 +2102,26 @@ fn launch_err_msg(ctx: &compat::RuntimeContext, e: &std::io::Error) -> String {
         ),
         Runtime::Native => format!("Failed to launch the game: {e}"),
     }
+}
+fn require_profile_source_for_install(profile_id: &str) -> Result<(), String> {
+    managed_instance::migrate_direct_source_storage()?;
+    let profiles = recovered_profile_store(&settings::profiles_root())?;
+    let profile = profiles
+        .load(profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("profile not found")?;
+    let saved = settings::load().map_err(|error| error.to_string())?;
+    let instance = selected_profile_instance(&saved, profile.game_instance_id.as_deref())?;
+    let source = managed_instance::source_for_rebuild(instance, profile.game_build.as_deref())?;
+    managed_instance::ensure_exact_source_available(&source)
+}
+
+fn require_instance_source_for_install(game_instance_id: Option<&str>) -> Result<(), String> {
+    managed_instance::migrate_direct_source_storage()?;
+    let saved = settings::load().map_err(|error| error.to_string())?;
+    let instance = selected_profile_instance(&saved, game_instance_id)?;
+    let source = managed_instance::source_for_rebuild(instance, instance.build.as_deref())?;
+    managed_instance::ensure_exact_source_available(&source)
 }
 
 /// Download a verified release asset and install its declared plugin DLL.
@@ -1841,8 +2275,24 @@ pub async fn inspect_game(game_path: String) -> Result<GameInstallView, String> 
 pub async fn get_settings() -> Result<SettingsView, String> {
     blocking(|| {
         let _guard = lock_mutations()?;
+        managed_instance::migrate_direct_source_storage()?;
         let mut view = settings::view().map_err(|error| error.to_string())?;
-        let (changed, repaired) = repair_moved_game_instances(&mut view.settings)?;
+        let mut changed = false;
+        for instance in &mut view.settings.game_instances {
+            if instance.source_fingerprint.is_none() {
+                if let Some(source) = managed_instance::saved_source(instance)? {
+                    if instance.build.is_none() && source.record.observed_build.is_some() {
+                        instance.build = source.record.observed_build.clone();
+                    }
+                    instance.source_fingerprint = Some(source.record.fingerprint);
+                    instance.source_file_count = Some(source.record.file_count);
+                    instance.source_byte_count = Some(source.record.byte_count);
+                    changed = true;
+                }
+            }
+        }
+        let (metadata_changed, repaired) = repair_moved_game_instances(&mut view.settings)?;
+        changed |= metadata_changed;
         if changed {
             settings::save(&view.settings).map_err(|error| error.to_string())?;
         }
@@ -1858,7 +2308,7 @@ pub async fn get_settings() -> Result<SettingsView, String> {
 }
 
 #[tauri::command]
-pub async fn select_active_profile(profile_id: String) -> Result<SettingsView, String> {
+pub async fn select_active_profile(profile_id: String) -> Result<(), String> {
     blocking(move || {
         let _guard = lock_mutations()?;
         let profile_id = profile_id.trim().to_string();
@@ -1870,12 +2320,7 @@ pub async fn select_active_profile(profile_id: String) -> Result<SettingsView, S
         {
             return Err("Profile not found.".into());
         }
-        let mut saved = settings::load().map_err(|error| error.to_string())?;
-        if saved.active_profile.as_deref() != Some(profile_id.as_str()) {
-            saved.active_profile = Some(profile_id);
-            settings::save(&saved).map_err(|error| error.to_string())?;
-        }
-        settings::view().map_err(|error| error.to_string())
+        settings::set_active_profile(&profile_id).map_err(|error| error.to_string())
     })
     .await
 }
@@ -1887,6 +2332,7 @@ pub async fn save_settings(
 ) -> Result<SettingsView, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
+        managed_instance::migrate_direct_source_storage()?;
         if let TokenAction::Set { token } = &mut token_action {
             *token = token.trim().to_string();
             if token.is_empty() {
@@ -1928,6 +2374,10 @@ pub async fn save_settings(
             }
             instance.build = game::detect_build(&canonical);
             instance.writable = game::is_writable_game_dir(&canonical);
+            let source = managed_instance::record_source(instance)?;
+            instance.source_fingerprint = Some(source.record.fingerprint);
+            instance.source_file_count = Some(source.record.file_count);
+            instance.source_byte_count = Some(source.record.byte_count);
             paths.push(canonical);
         }
         let mut personal_sources = HashSet::new();
@@ -2033,6 +2483,14 @@ pub async fn save_settings(
                         profile.name
                     ));
                 }
+                if profile.game_build.is_some() && replacement.build != profile.game_build {
+                    return Err(format!(
+                        "Profile {} is pinned to Among Us build {}. Keep it on a source with that exact build, or create and re-resolve a profile for the new source.",
+
+                        profile.name,
+                        profile.game_build.as_deref().unwrap_or("unknown"),
+                    ));
+                }
             }
         }
         if let Some(active) = settings.active_profile.take() {
@@ -2052,6 +2510,21 @@ pub async fn save_settings(
     .await
 }
 
+fn storage_root_after_ambiguous_save(
+    persisted_storage_path: Option<&str>,
+    previous_storage_path: Option<&str>,
+    target_storage_path: Option<&str>,
+    current_root: &Path,
+    target_root: &Path,
+) -> Result<PathBuf, String> {
+    if persisted_storage_path == target_storage_path {
+        return Ok(target_root.to_path_buf());
+    }
+    if persisted_storage_path == previous_storage_path {
+        return Ok(current_root.to_path_buf());
+    }
+    Err("persisted storage pointer matched neither the previous nor target location".into())
+}
 #[tauri::command]
 pub async fn move_storage(
     storage_path: Option<String>,
@@ -2059,11 +2532,15 @@ pub async fn move_storage(
 ) -> Result<SettingsView, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
+        let _profile_guards = lock_all_profile_mutations()?;
+        let _asset_cache_guards = lock_all_asset_caches()?;
         managed_workspaces_are_stopped()?;
+        managed_instance::migrate_direct_source_storage()?;
         let reporter = ProgressReporter::new(on_progress);
         reporter.stage("preparing", "Validating the new storage location");
 
         let previous = settings::load().map_err(|error| error.to_string())?;
+        let previous_storage_path = previous.storage_path.clone();
         let current_root = settings::managed_data_dir();
         let current_cache = settings::cache_dir();
         let default_root = settings::default_managed_data_dir();
@@ -2073,6 +2550,11 @@ pub async fn move_storage(
             .iter()
             .map(|instance| PathBuf::from(&instance.path))
             .collect::<Vec<_>>();
+        storage::retry_pending_storage_cleanup(&current_root, &game_sources).map_err(|error| {
+            format!(
+                "The previous storage cleanup is still pending. Close programs using the old storage and retry: {error}"
+            )
+        })?;
         let Some(target) = storage::resolve_target(
             storage_path.as_deref(),
             &current_root,
@@ -2088,7 +2570,7 @@ pub async fn move_storage(
             "copying",
             "Creating a verified copy of managed game data and caches",
         );
-        let published = storage::copy_payload(
+        let mut published = storage::copy_payload(
             &current_root,
             &current_cache,
             &target,
@@ -2105,28 +2587,81 @@ pub async fn move_storage(
                 None => error.to_string(),
             });
         }
+        if let Err(error) =
+            storage::prepare_published_cleanup(&mut published, &current_root, &current_cache)
+        {
+            return match settings::set_managed_data_dir(current_root.clone()) {
+                Ok(()) => {
+                    let rollback = storage::rollback_published(&published).err();
+                    Err(match rollback {
+                        Some(rollback) => format!(
+                            "{error}; additionally could not remove the copied storage: {rollback}"
+                        ),
+                        None => error,
+                    })
+                }
+                Err(root_rollback) => {
+                    let disarm = storage::disarm_published_cleanup(&published).err();
+                    Err(match disarm {
+                        Some(disarm) => format!(
+                            "{error}; additionally could not restore the active storage path: {root_rollback}; automatic cleanup could not be disabled: {disarm}. Both storage copies were retained."
+                        ),
+                        None => format!(
+                            "{error}; additionally could not restore the active storage path: {root_rollback}. Automatic cleanup was disabled and both storage copies were retained."
+                        ),
+                    })
+                }
+            };
+        }
         if let Err(error) = settings::save(&updated) {
-            let root_rollback = settings::set_managed_data_dir(current_root.clone()).err();
-            let storage_rollback = storage::rollback_published(&published).err();
-            let mut message = error.to_string();
-            if let Some(rollback) = root_rollback {
-                message.push_str(&format!(
-                    "; additionally could not restore the active storage path: {rollback}"
+            let mut errors = vec![format!(
+                "Could not confirm whether the new storage pointer was persisted: {error}"
+            )];
+            if let Err(disarm) = storage::disarm_published_cleanup(&published) {
+                errors.push(format!(
+                    "automatic cleanup could not be fully disarmed: {disarm}"
                 ));
             }
-            if let Some(rollback) = storage_rollback {
-                message.push_str(&format!(
-                    "; additionally could not remove the copied storage: {rollback}"
-                ));
+            match settings::load() {
+                Ok(persisted) => match storage_root_after_ambiguous_save(
+                    persisted.storage_path.as_deref(),
+                    previous_storage_path.as_deref(),
+                    target.configured_path.as_deref(),
+                    &current_root,
+                    &target.root,
+                ) {
+                    Ok(authoritative_root) => {
+                        if let Err(pointer_error) =
+                            settings::set_managed_data_dir(authoritative_root)
+                        {
+                            errors.push(format!(
+                                "the runtime storage pointer could not follow the persisted settings: {pointer_error}"
+                            ));
+                        }
+                    }
+                    Err(pointer_error) => errors.push(pointer_error),
+                },
+                Err(load_error) => errors.push(format!(
+                    "the persisted storage pointer could not be reread: {load_error}"
+                )),
             }
-            return Err(message);
+            errors.push(format!(
+                "Both storage copies were retained at {} and {}",
+                current_root.display(),
+                target.root.display()
+            ));
+            return Err(errors.join("; "));
         }
 
         reporter.stage(
             "finalizing",
             "Switching Perfect Sync to the relocated storage",
         );
-        let cleanup_errors = storage::cleanup_old_payload(&current_root, &current_cache);
+        let cleanup_errors = storage::commit_published_and_cleanup(
+            &mut published,
+            &current_root,
+            &current_cache,
+        );
         let mut view = settings::view().map_err(|error| error.to_string())?;
         if !cleanup_errors.is_empty() {
             view.storage_warning = Some(format!(
@@ -2668,7 +3203,7 @@ pub async fn list_profiles() -> Result<Vec<ProfileRecord>, String> {
 #[tauri::command]
 pub async fn save_profile(mut profile: ProfileRecord) -> Result<ProfileRecord, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile.id)?;
         validate_profile_id(&profile.id)?;
         profile.name = profile.name.trim().to_string();
         profile.crew_color = profile.crew_color.trim().to_string();
@@ -2708,6 +3243,12 @@ pub async fn save_profile(mut profile: ProfileRecord) -> Result<ProfileRecord, S
                             .into(),
                     );
                 }
+                if existing.game_build.is_some() && proposed_instance.build != existing.game_build {
+                    return Err(
+                        "This profile is pinned to a different Among Us build. Keep it on a source with that exact build, or create and re-resolve a profile for the new source."
+                            .into(),
+                    );
+                }
             }
             profile.game_build = existing.game_build;
             profile.mods = existing.mods;
@@ -2723,7 +3264,7 @@ pub async fn save_profile(mut profile: ProfileRecord) -> Result<ProfileRecord, S
 #[tauri::command]
 pub async fn delete_profile(id: String) -> Result<(), String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&id)?;
         validate_profile_id(&id)?;
         workspace_is_stopped(&id)?;
         let mut saved = settings::load().map_err(|error| error.to_string())?;
@@ -2757,7 +3298,7 @@ pub async fn delete_profile(id: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn encode_lobby_code(profile: ProfileRecord) -> Result<String, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile.id)?;
         let profile_store = store()?;
         let mut authoritative = profile_store
             .load(&profile.id)
@@ -2787,7 +3328,7 @@ pub fn preview_code(code: String, installed: Vec<(String, String)>) -> Result<Pr
 pub async fn list_releases(repo: String) -> Result<Vec<Release>, String> {
     blocking(move || {
         let repo = resolver::parse_repo(&repo).ok_or("invalid repo or URL")?;
-        resolver::fetch_releases(&http()?, &repo, 20).map_err(|error| error.to_string())
+        fetch_releases_bounded(&http()?, &repo, 20)
     })
     .await
 }
@@ -2946,6 +3487,17 @@ impl Http for ProgressHttp {
     }
 
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>, perfect_sync_core::resolver::ResolveError> {
+        let mut bytes = Vec::new();
+        self.download_to(url, &mut bytes, &mut |_, _| {})?;
+        Ok(bytes)
+    }
+
+    fn download_to(
+        &self,
+        url: &str,
+        output: &mut dyn Write,
+        _on_progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<u64, perfect_sync_core::resolver::ResolveError> {
         let label = url::Url::parse(url)
             .ok()
             .and_then(|parsed| {
@@ -2961,29 +3513,28 @@ impl Http for ProgressHttp {
         let mut last_emit = None;
         let mut last_received = 0_u64;
         let mut last_total = None;
-        let result = self
-            .inner
-            .get_bytes_with_progress(url, &mut |received, total| {
-                let now = Instant::now();
-                let should_emit = received == 0
-                    || total.is_some_and(|expected| received >= expected)
-                    || last_emit.is_none_or(|last: Instant| {
-                        now.duration_since(last) >= Duration::from_millis(100)
-                    });
-                last_received = received;
-                last_total = total;
-                if should_emit {
-                    self.reporter.download(&message, received, total);
-                    last_emit = Some(now);
-                }
-            });
-        if let Ok(bytes) = &result {
-            let received = bytes.len() as u64;
+        let result = self.inner.download_to(url, output, &mut |received, total| {
+            let now = Instant::now();
+            let should_emit = received == 0
+                || total.is_some_and(|expected| received >= expected)
+                || last_emit.is_none_or(|last: Instant| {
+                    now.duration_since(last) >= Duration::from_millis(100)
+                });
+            last_received = received;
+            last_total = total;
+            if should_emit {
+                self.reporter.download(&message, received, total);
+                last_emit = Some(now);
+            }
+        });
+        if let Ok(received) = result {
             if received != last_received {
                 self.reporter.download(&message, received, last_total);
             }
+            Ok(received)
+        } else {
+            result
         }
-        result
     }
 }
 
@@ -2991,8 +3542,13 @@ impl Http for ProgressHttp {
 pub async fn list_install_options(
     repo: String,
     profile_id: String,
+    limit: Option<u32>,
 ) -> Result<Vec<ModInstallOption>, String> {
     blocking(move || {
+        let limit = limit.unwrap_or(10);
+        if !(1..=50).contains(&limit) {
+            return Err("release option limit must be between 1 and 50".into());
+        }
         validate_profile_id(&profile_id)?;
         let arch = profile_arch(&profile_id)?;
         let (store, runtime) = profile_store_runtime(&profile_id)?;
@@ -3001,9 +3557,12 @@ pub async fn list_install_options(
         let rules = catalog_entry_for(&catalog, &repo)
             .map(|entry| entry.asset_rules.clone())
             .unwrap_or_else(default_rules);
-        let releases =
-            resolver::fetch_releases(&http()?, &repo, 50).map_err(|error| error.to_string())?;
-        install_options_for_profile(releases, &repo, &rules, &arch, store, runtime)
+        let started = Instant::now();
+        let releases = fetch_releases_bounded(&http()?, &repo, limit)?;
+        let release_count = releases.len();
+        let options = install_options_for_profile(releases, &repo, &rules, &arch, store, runtime)?;
+        log_perf("release_options", started, release_count, 0);
+        Ok(options)
     })
     .await
 }
@@ -3023,8 +3582,7 @@ pub async fn list_tou_setup_options(
             .get(TOU_MIRA_ID)
             .ok_or("Town of Us is missing from the trusted catalog")?;
         let repo = entry.repo.as_deref().unwrap_or(&entry.id);
-        let releases =
-            resolver::fetch_releases(&http()?, repo, 50).map_err(|error| error.to_string())?;
+        let releases = fetch_releases_bounded(&http()?, repo, 50)?;
         install_options_for_profile(releases, repo, &entry.asset_rules, &arch, store, runtime)
     })
     .await
@@ -3039,7 +3597,8 @@ pub async fn install_assets(
 ) -> Result<ProfileRecord, String> {
     require_manual_install_confirmation(confirmed)?;
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
+        require_profile_source_for_install(&profile_id)?;
         let reporter = ProgressReporter::new(on_progress);
         install_assets_impl(profile_id, selections, &reporter)
     })
@@ -3049,7 +3608,8 @@ pub async fn install_assets(
 #[tauri::command]
 pub async fn install_local_mod(profile_id: String, path: String) -> Result<ProfileRecord, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
+        require_profile_source_for_install(&profile_id)?;
         install_local_mod_impl(&settings::profiles_root(), &profile_id, Path::new(&path))
     })
     .await
@@ -3132,7 +3692,8 @@ pub async fn install_levelimposter_maps(
     on_progress: Channel<OperationProgress>,
 ) -> Result<ProfileRecord, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
+        require_profile_source_for_install(&profile_id)?;
         let reporter = ProgressReporter::new(on_progress);
         install_levelimposter_maps_impl(profile_id, map_ids, &reporter)
     })
@@ -3144,7 +3705,8 @@ pub async fn remove_levelimposter_maps(
     map_ids: Vec<String>,
 ) -> Result<ProfileRecord, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
+        require_profile_source_for_install(&profile_id)?;
         remove_levelimposter_maps_impl(profile_id, map_ids)
     })
     .await
@@ -3163,7 +3725,8 @@ pub async fn install_asset(
 ) -> Result<ProfileRecord, String> {
     require_manual_install_confirmation(confirmed)?;
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
+        require_profile_source_for_install(&profile_id)?;
         let reporter = ProgressReporter::new(on_progress);
         install_asset_impl(profile_id, repo, tag, asset_name, arch, &reporter)
     })
@@ -3839,13 +4402,15 @@ fn install_catalog_latest(
             context.runtime,
         )?
     } else {
-        let releases =
-            resolver::fetch_releases(context.http, &repo, 20).map_err(|error| error.to_string())?;
+        let tags = resolver::fetch_release_tags(context.http, &repo, 20)
+            .map_err(|error| error.to_string())?;
         let mut selected = None;
-        for release in releases {
-            if !perfect_sync_core::version::satisfies_all(&release.tag, requirements) {
+        for tag in tags {
+            if !perfect_sync_core::version::satisfies_all(&tag, requirements) {
                 continue;
             }
+            let release = resolver::fetch_release_by_tag(context.http, &repo, &tag)
+                .map_err(|error| error.to_string())?;
             let Some(asset) = pick_profile_asset(
                 &release,
                 &repo,
@@ -4733,7 +5298,8 @@ pub async fn add_mod(
     arch: String,
 ) -> Result<ProfileRecord, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
+        require_profile_source_for_install(&profile_id)?;
         add_mod_impl(profile_id, repo, arch)
     })
     .await
@@ -4824,26 +5390,70 @@ pub async fn set_mod_enabled(
     enabled: bool,
 ) -> Result<ProfileRecord, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
         validate_profile_id(&profile_id)?;
         let root = settings::profiles_root();
+        recover_profile_transactions(&root)?;
+        let store = ProfileStore::new(&root);
         let catalog = catalog()?;
-        profile_transaction(&root, &profile_id, |stage_root, stage_store| {
-            let mut record = stage_store
-                .load(&profile_id)
-                .map_err(|error| error.to_string())?
-                .ok_or("profile not found")?;
-            let position = validate_mod_toggle(&record, &catalog, &package_id)?;
-            if let Some(file) = record.mods[position].file.as_deref() {
-                profile::set_plugin_enabled(stage_root, &profile_id, file, enabled)
+        let mut record = store
+            .load(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("profile not found")?;
+        let position = validate_mod_toggle(&record, &catalog, &package_id)?;
+        let previous = record.mods[position].enabled;
+        let file = record.mods[position].file.clone();
+        if previous == enabled {
+            if let Some(file) = file.as_deref() {
+                profile::set_plugin_enabled(&root, &profile_id, file, enabled)
                     .map_err(|error| error.to_string())?;
             }
+            return Ok(record);
+        }
+        let Some(file) = file else {
             record.mods[position].enabled = enabled;
-            stage_store
-                .save(&record)
-                .map_err(|error| error.to_string())?;
-            Ok(record)
-        })
+            store.save(&record).map_err(|error| error.to_string())?;
+            return Ok(record);
+        };
+        let _recovery_guard = PROFILE_RECOVERY_LOCK
+            .lock()
+            .map_err(|_| "profile recovery lock is poisoned".to_string())?;
+        let journal = write_mod_toggle_recovery_journal(&root, &profile_id, &file)?;
+        if let Err(error) = profile::set_plugin_enabled(&root, &profile_id, &file, enabled) {
+            let cleanup = fs::remove_file(&journal).err();
+            return Err(match cleanup {
+                Some(cleanup) => format!(
+                    "{error}; additionally could not remove the unused recovery marker ({cleanup}): {}",
+                    journal.display()
+                ),
+                None => error.to_string(),
+            });
+        }
+        record.mods[position].enabled = enabled;
+        if let Err(error) = store.save(&record) {
+            let rollback = profile::set_plugin_enabled(&root, &profile_id, &file, previous);
+            if rollback.is_ok() {
+                return match fs::remove_file(&journal) {
+                    Ok(()) => Err(error.to_string()),
+                    Err(cleanup) => Err(format!(
+                        "{error}; the plugin file was restored, but the recovery marker could not be removed ({cleanup}): {}",
+                        journal.display()
+                    )),
+                };
+            }
+            return Err(format!(
+                "could not save the mod toggle ({error}) or restore the plugin file ({}); recovery evidence was retained at {}",
+                rollback.expect_err("failed rollback has an error"),
+                journal.display()
+            ));
+        }
+        fs::remove_file(&journal).map_err(|error| {
+            format!(
+                "mod toggle committed but its recovery marker could not be removed ({error}): {}",
+                journal.display()
+            )
+        })?;
+        Ok(record)
     })
     .await
 }
@@ -4856,7 +5466,8 @@ pub async fn set_mod_version(
     arch: String,
 ) -> Result<ProfileRecord, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
+        require_profile_source_for_install(&profile_id)?;
         set_mod_version_impl(profile_id, package_id, version, arch)
     })
     .await
@@ -4933,8 +5544,9 @@ fn set_mod_version_impl(
 #[tauri::command]
 pub async fn remove_mod(profile_id: String, package_id: String) -> Result<ProfileRecord, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
         validate_profile_id(&profile_id)?;
+        require_profile_source_for_install(&profile_id)?;
         let root = settings::profiles_root();
         profile_transaction(&root, &profile_id, |stage_root, stage_store| {
             let mut record = stage_store
@@ -4955,51 +5567,93 @@ pub async fn remove_mod(profile_id: String, package_id: String) -> Result<Profil
 #[tauri::command]
 pub async fn check_mod_updates(profile_id: String, arch: String) -> Result<ProfileRecord, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let started = Instant::now();
+        let _guard = lock_profile_mutation(&profile_id)?;
         validate_profile_id(&profile_id)?;
         let _ = arch;
         let arch = profile_arch(&profile_id)?;
         let (store, runtime) = profile_store_runtime(&profile_id)?;
         let catalog = catalog()?;
         let root = settings::profiles_root();
-        profile_transaction(&root, &profile_id, |_stage_root, stage_store| {
-            let mut record = stage_store
-                .load(&profile_id)
-                .map_err(|error| error.to_string())?
-                .ok_or("profile not found")?;
-            let http = http()?;
-            let provided = provided_dependency_ids(&record, &catalog);
-            for installed in &mut record.mods {
-                if provided.contains(&installed.package_id.to_ascii_lowercase())
-                    || installed
-                        .repo
-                        .as_deref()
-                        .is_some_and(|repo| provided.contains(&repo.to_ascii_lowercase()))
-                {
-                    installed.update = None;
-                    continue;
-                }
-                let Some(repo) = installed
+        let profile_store = recovered_profile_store(&root)?;
+        let mut record = profile_store
+            .load(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("profile not found")?;
+        let http = http()?;
+        let provided = provided_dependency_ids(&record, &catalog);
+        let mut candidates = Vec::new();
+        for (position, installed) in record.mods.iter_mut().enumerate() {
+            if provided.contains(&installed.package_id.to_ascii_lowercase())
+                || installed
                     .repo
                     .as_deref()
-                    .and_then(resolver::parse_repo)
-                    .or_else(|| resolver::parse_repo(&installed.package_id))
-                else {
-                    continue;
-                };
-                let rules = catalog_entry_for(&catalog, &installed.package_id)
-                    .map(|entry| entry.asset_rules.clone())
-                    .unwrap_or_else(default_rules);
-                let latest = resolve_profile_latest(&http, &repo, &rules, &arch, store, runtime)?;
-                installed.update =
-                    perfect_sync_core::version::is_newer(&latest.version, &installed.version)
-                        .then_some(latest.version);
+                    .is_some_and(|repo| provided.contains(&repo.to_ascii_lowercase()))
+            {
+                installed.update = None;
+                continue;
             }
-            stage_store
-                .save(&record)
-                .map_err(|error| error.to_string())?;
-            Ok(record)
-        })
+            let Some(repo) = installed
+                .repo
+                .as_deref()
+                .and_then(resolver::parse_repo)
+                .or_else(|| resolver::parse_repo(&installed.package_id))
+            else {
+                continue;
+            };
+            let rules = catalog_entry_for(&catalog, &installed.package_id)
+                .map(|entry| entry.asset_rules.clone())
+                .unwrap_or_else(default_rules);
+            candidates.push((position, repo, rules));
+        }
+
+        for chunk in candidates.chunks(4) {
+            let results = std::thread::scope(|scope| {
+                chunk
+                    .iter()
+                    .map(|(position, repo, rules)| {
+                        let client = http.clone();
+                        let repo = repo.clone();
+                        let rules = rules.clone();
+                        let arch = arch.clone();
+                        scope.spawn(move || {
+                            (
+                                *position,
+                                latest_profile_version(
+                                    &client, &repo, &rules, &arch, store, runtime,
+                                ),
+                            )
+                        })
+                    })
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| "update resolver worker panicked".to_string())
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })?;
+            for (position, latest) in results {
+                let installed = &mut record.mods[position];
+                match latest {
+                    Ok(latest) => {
+                        installed.update =
+                            perfect_sync_core::version::is_newer(&latest, &installed.version)
+                                .then_some(latest);
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "could not refresh update metadata for {}: {error}",
+                            installed.package_id
+                        );
+                    }
+                }
+            }
+        }
+        profile_store
+            .save(&record)
+            .map_err(|error| error.to_string())?;
+        log_perf("update_metadata_resolution", started, candidates.len(), 0);
+        Ok(record)
     })
     .await
 }
@@ -5012,8 +5666,9 @@ pub async fn apply_mod_updates(
     on_progress: Channel<OperationProgress>,
 ) -> Result<ProfileRecord, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
         validate_profile_id(&profile_id)?;
+        require_profile_source_for_install(&profile_id)?;
         if package_ids.is_empty() || package_ids.len() > 64 {
             return Err("Choose between 1 and 64 reviewed mod updates.".into());
         }
@@ -5128,6 +5783,8 @@ pub async fn apply_lobby_code(
 ) -> Result<ProfileRecord, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
+        let _profile_guards = lock_all_profile_mutations()?;
+        require_instance_source_for_install(game_instance_id.as_deref())?;
         let reporter = ProgressReporter::new(on_progress);
         apply_lobby_code_impl(code, arch, game_instance_id, &reporter)
     })
@@ -5164,7 +5821,7 @@ fn apply_lobby_code_impl(
                 ""
             } else {
                 "s"
-            }
+            },
         ),
     );
     let settings = settings::load().map_err(|error| error.to_string())?;
@@ -5473,6 +6130,7 @@ pub async fn import_unmanaged_plugins(
     blocking(move || {
         let _guard = lock_mutations()?;
         validate_profile_id(&profile_id)?;
+        require_profile_source_for_install(&profile_id)?;
         let game_dir = validate_game_target(&game_path, Some(&profile_id))?;
         let profiles_root = settings::profiles_root();
         let plugins =
@@ -5521,7 +6179,7 @@ pub async fn ensure_loader(
     on_progress: Channel<OperationProgress>,
 ) -> Result<Option<String>, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
         workspace_is_stopped(&profile_id)?;
         let reporter = ProgressReporter::new(on_progress);
         let profiles_root = settings::profiles_root();
@@ -5534,6 +6192,7 @@ pub async fn ensure_loader(
         if arch_str(instance.arch) != arch {
             return Err("requested loader architecture does not match the game source".into());
         }
+        require_profile_source_for_install(&profile_id)?;
         if profile_uses_tou_mira(&profile) && apply_doorstop_fix {
             return Err(
                 "Town of Us includes its own UnityDoorstop build; the separate compatibility fix cannot be applied."
@@ -5562,7 +6221,7 @@ pub async fn reinstall_loader(
     use_latest_loader: bool,
 ) -> Result<Option<String>, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
         workspace_is_stopped(&profile_id)?;
         let profiles_root = settings::profiles_root();
         let profile_store = recovered_profile_store(&profiles_root)?;
@@ -5574,6 +6233,7 @@ pub async fn reinstall_loader(
         if arch_str(instance.arch) != arch {
             return Err("requested loader architecture does not match the game source".into());
         }
+        require_profile_source_for_install(&profile_id)?;
         if profile_uses_tou_mira(&profile) {
             return Err(
                 "Town of Us owns this profile's BepInEx build. Reinstall or change the Town of Us release instead."
@@ -5625,7 +6285,7 @@ pub struct LoaderStatus {
 #[tauri::command]
 pub async fn loader_status(game_path: String, profile_id: String) -> Result<LoaderStatus, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
         validate_profile_id(&profile_id)?;
         let source = validate_game_target(&game_path, Some(&profile_id))?;
         let root = settings::profiles_root();
@@ -5754,6 +6414,23 @@ fn load_tou_package_bytes(
     Ok(bytes)
 }
 
+fn saved_profile_instance(
+    game_path: &str,
+    profile: &ProfileRecord,
+) -> Result<settings::GameInstance, String> {
+    let saved = settings::load().map_err(|error| error.to_string())?;
+    let instance = selected_profile_instance(&saved, profile.game_instance_id.as_deref())?;
+    let normalize = |path: &str| {
+        path.replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    if normalize(&instance.path) != normalize(game_path) {
+        return Err("game folder does not match the profile's saved source".into());
+    }
+    Ok(instance.clone())
+}
+
 fn profile_game_instance(
     game_path: &str,
     profile: &ProfileRecord,
@@ -5767,13 +6444,17 @@ fn profile_game_instance(
     Ok(instance.clone())
 }
 
-fn registered_game_instance(game_path: &str) -> Result<settings::GameInstance, String> {
-    let canonical = validate_game_target(game_path, None)?;
+fn saved_registered_game_instance(game_path: &str) -> Result<settings::GameInstance, String> {
+    let normalize = |path: &str| {
+        path.replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
     settings::load()
         .map_err(|error| error.to_string())?
         .game_instances
         .into_iter()
-        .find(|instance| same_path(Path::new(&instance.path), &canonical))
+        .find(|instance| normalize(&instance.path) == normalize(game_path))
         .ok_or_else(|| "game source is not registered".to_string())
 }
 
@@ -5819,6 +6500,7 @@ fn prepare_profile_with_guard(
     force_rebuild: bool,
     process_guard: impl Fn() -> Result<(), String>,
 ) -> Result<Option<String>, String> {
+    let started = Instant::now();
     process_guard()?;
     let profiles_root = settings::profiles_root();
     let profile_store = recovered_profile_store(&profiles_root)?;
@@ -5826,20 +6508,14 @@ fn prepare_profile_with_guard(
         .load(profile_id)
         .map_err(|error| error.to_string())?
         .ok_or("profile not found")?;
-    let mut instance = profile_game_instance(game_path, &profile)?;
-    let source = canonical_game_path(Path::new(&instance.path))?;
-    instance.build = game::detect_build(&source);
-    let source_arch = game::exe_arch(&source.join(process::GAME_EXE))
-        .map(arch_str)
-        .ok_or("Among Us executable architecture is unsupported")?;
-    if source_arch != arch_str(instance.arch) {
-        return Err("saved game architecture no longer matches the selected source".into());
-    }
+    managed_instance::migrate_direct_source_storage()?;
+    let instance = saved_profile_instance(game_path, &profile)?;
+    let source_arch = arch_str(instance.arch).to_string();
 
     if let Some(reporter) = reporter {
         reporter.stage(
             "preparing",
-            "Creating or validating the private clean game base",
+            "Creating or validating the isolated profile workspace",
         );
     }
     let profile_root = profile_store
@@ -5861,12 +6537,32 @@ fn prepare_profile_with_guard(
             &revision,
         )?;
     }
-    let base = managed_instance::ensure_base(&instance, profile.game_build.as_deref())?;
-    if !force_rebuild && managed_instance::active_matches(&base, profile_id, &revision, profile_id)?
+    if !force_rebuild
+        && managed_instance::cached_active_source(
+            &instance,
+            profile.game_build.as_deref(),
+            profile_id,
+            &revision,
+            &material_revision,
+            profile_id,
+        )?
+        .is_some()
     {
-        let context = compat::resolve_with_hint(&source, Some(instance.runtime));
-        return Ok(configure_runtime_override(&context).err());
+        log_perf(
+            "prepare_profile_cached_source",
+            started,
+            profile.mods.len(),
+            0,
+        );
+        let warning = fs::canonicalize(&instance.path).ok().and_then(|source| {
+            let context = compat::resolve_with_hint(&source, Some(instance.runtime));
+            configure_runtime_override(&context).err()
+        });
+        return Ok(warning);
     }
+    let source_record =
+        managed_instance::source_for_rebuild(&instance, profile.game_build.as_deref())?;
+    managed_instance::ensure_source_build_allows_launch(&source_record)?;
 
     let active_tou = profile
         .mods
@@ -5881,13 +6577,89 @@ fn prepare_profile_with_guard(
                 .ok_or("Town of Us profile is missing its exact release asset")
         })
         .transpose()?;
+    let shadowed_plugin_files = tou_shadowed_plugin_files(&profile);
+    let preference = managed_instance::loader_preference(&profile_root)?;
+    if !force_rebuild {
+        if let Some(marker) = managed_instance::active_marker(profile_id)? {
+            let active = managed_instance::workspace_game_dir(profile_id)?;
+            let prior_workspace_is_valid = managed_instance::active_matches(
+                &source_record,
+                profile_id,
+                &marker.profile_revision,
+                &marker.material_revision,
+                profile_id,
+            )?;
+            let maps_are_current =
+                loader::levelimposter_maps_are_current(&active, &profile.levelimposter_maps)
+                    .unwrap_or(false);
+            let loader_is_current = if let Some(key) = tou_key.as_deref() {
+                loader::tou_package_is_current(&active, key).unwrap_or(false)
+            } else {
+                let desired_version = preference
+                    .loader_version
+                    .as_deref()
+                    .unwrap_or(PINNED_LOADER_VERSION);
+                let doorstop_is_current = if preference.apply_doorstop_fix {
+                    doorstop_fix_is_current(&active, &source_arch)
+                } else {
+                    !loader::has_doorstop_patch_marker(&active)
+                };
+                matches!(loader::managed_tou_package_key(&active), Ok(None))
+                    && loader::has_loader(&active)
+                    && loader::installed_version(&active).as_deref() == Some(desired_version)
+                    && doorstop_is_current
+            };
+            if prior_workspace_is_valid && maps_are_current && loader_is_current {
+                if let Some(reporter) = reporter {
+                    reporter.stage(
+                        "preparing",
+                        format!("Updating the active {} workspace", profile.name),
+                    );
+                }
+                process_guard()?;
+                let delta_result = (|| {
+                    loader::sync_profile_plugins_shadowing(
+                        &profiles_root,
+                        profile_id,
+                        &active,
+                        &shadowed_plugin_files,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    loader::ensure_steam_appid(&active).map_err(|error| error.to_string())?;
+                    loader::write_console_off(&active).map_err(|error| error.to_string())?;
+                    process_guard()?;
+                    managed_instance::refresh_workspace_marker(
+                        &source_record,
+                        profile_id,
+                        &revision,
+                        &material_revision,
+                        profile_id,
+                    )?;
+                    let warning = fs::canonicalize(&instance.path).ok().and_then(|source| {
+                        let context = compat::resolve_with_hint(&source, Some(instance.runtime));
+                        configure_runtime_override(&context).err()
+                    });
+                    Ok::<Option<String>, String>(warning)
+                })();
+                match delta_result {
+                    Ok(warning) => {
+                        log_perf("prepare_profile_delta", started, profile.mods.len(), 0);
+                        return Ok(warning);
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "active workspace delta failed; falling back to a full rebuild: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
     let tou_package = active_tou
         .map(|installed| {
             load_tou_package_bytes(installed, &source_arch, instance.store, instance.runtime)
         })
         .transpose()?;
-    let shadowed_plugin_files = tou_shadowed_plugin_files(&profile);
-    let preference = managed_instance::loader_preference(&profile_root)?;
     let loader_pack = if active_tou.is_none() {
         Some(cached_loader_pack(&source_arch, &preference)?)
     } else {
@@ -5906,7 +6678,7 @@ fn prepare_profile_with_guard(
         );
     }
     process_guard()?;
-    let stage = managed_instance::begin_workspace(&base, profile_id)?;
+    let stage = managed_instance::begin_workspace(&source_record, profile_id)?;
     let result = (|| {
         if let Some(bytes) = tou_package.as_deref() {
             loader::install_tou_package(
@@ -5952,12 +6724,27 @@ fn prepare_profile_with_guard(
                 "Verifying and publishing the isolated workspace",
             );
         }
-        managed_instance::publish_workspace(&stage, &base, profile_id, &revision, profile_id)?;
-        let context = compat::resolve_with_hint(&source, Some(instance.runtime));
+        managed_instance::publish_workspace(
+            &stage,
+            &source_record,
+            profile_id,
+            &revision,
+            &material_revision,
+            profile_id,
+        )?;
+        let context = compat::resolve_with_hint(&source_record.source_dir, Some(instance.runtime));
         Ok(configure_runtime_override(&context).err())
     })();
     if result.is_err() && stage.exists() {
         let _ = managed_instance::discard_workspace(&stage, profile_id);
+    }
+    if result.is_ok() {
+        log_perf(
+            "prepare_profile_rebuild",
+            started,
+            source_record.record.file_count as usize,
+            source_record.record.byte_count,
+        );
     }
     result
 }
@@ -5967,16 +6754,23 @@ fn prepare_vanilla(
     workspace_id: &str,
 ) -> Result<(PathBuf, settings::GameInstance), String> {
     workspace_is_stopped(workspace_id)?;
-    let mut instance = registered_game_instance(game_path)?;
-    let source = canonical_game_path(Path::new(&instance.path))?;
-    instance.build = game::detect_build(&source);
+    managed_instance::migrate_direct_source_storage()?;
+    let instance = saved_registered_game_instance(game_path)?;
     managed_instance::capture_workspace_config(&settings::profiles_root(), workspace_id)?;
-    let base = managed_instance::ensure_base(&instance, None)?;
-    let revision = sha256_hex(format!("vanilla\\0{}", base.record.id).as_bytes());
-    if !managed_instance::active_matches(&base, "_vanilla", &revision, workspace_id)? {
-        let stage = managed_instance::begin_workspace(&base, workspace_id)?;
-        let result =
-            managed_instance::publish_workspace(&stage, &base, "_vanilla", &revision, workspace_id);
+    let source = managed_instance::source_for_rebuild(&instance, None)?;
+    let revision = sha256_hex(format!("vanilla\\0{}", source.record.fingerprint).as_bytes());
+    if managed_instance::active_matches(&source, "_vanilla", &revision, &revision, workspace_id)? {
+        managed_instance::ensure_source_build_allows_launch(&source)?;
+    } else {
+        let stage = managed_instance::begin_workspace(&source, workspace_id)?;
+        let result = managed_instance::publish_workspace(
+            &stage,
+            &source,
+            "_vanilla",
+            &revision,
+            &revision,
+            workspace_id,
+        );
         if result.is_err() && stage.exists() {
             let _ = managed_instance::discard_workspace(&stage, workspace_id);
         }
@@ -5988,13 +6782,6 @@ fn prepare_vanilla(
     ))
 }
 
-fn require_launch_ready(guidance: Option<String>) -> Result<(), String> {
-    match guidance {
-        Some(guidance) => Err(guidance),
-        None => Ok(()),
-    }
-}
-
 #[tauri::command]
 pub async fn sync_profile(
     game_path: String,
@@ -6002,7 +6789,7 @@ pub async fn sync_profile(
     on_progress: Channel<OperationProgress>,
 ) -> Result<Option<String>, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
         let reporter = ProgressReporter::new(on_progress);
         prepare_profile(&game_path, &profile_id, Some(&reporter), false)
     })
@@ -6280,22 +7067,21 @@ pub async fn launch_profile(
     game_path: String,
     profile_id: String,
     on_progress: Channel<OperationProgress>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
         let reporter = ProgressReporter::new(on_progress);
-        require_launch_ready(prepare_profile(
-            &game_path,
-            &profile_id,
-            Some(&reporter),
-            false,
-        )?)?;
+        if let Some(guidance) =
+            prepare_profile(&game_path, &profile_id, Some(&reporter), false)?
+        {
+            return Ok(Some(guidance));
+        }
         workspace_is_stopped(&profile_id)?;
         let profile = recovered_profile_store(&settings::profiles_root())?
             .load(&profile_id)
             .map_err(|error| error.to_string())?
             .ok_or("profile not found")?;
-        let instance = profile_game_instance(&game_path, &profile)?;
+        let instance = saved_profile_instance(&game_path, &profile)?;
         let game_dir = managed_instance::workspace_game_dir(&profile_id)?;
         reporter.stage(
             "finalizing",
@@ -6305,7 +7091,8 @@ pub async fn launch_profile(
                 "Starting Among Us"
             },
         );
-        launch_prepared_game(&game_dir, &instance, &profile_id)
+        launch_prepared_game(&game_dir, &instance, &profile_id)?;
+        Ok(None)
     })
     .await
 }
@@ -6317,7 +7104,7 @@ pub async fn launch_vanilla(
     on_progress: Channel<OperationProgress>,
 ) -> Result<(), String> {
     blocking(move || {
-        let _guard = lock_mutations()?;
+        let _guard = lock_profile_mutation(&profile_id)?;
         let reporter = ProgressReporter::new(on_progress);
         validate_profile_id(&profile_id)?;
         reporter.stage(
@@ -6916,6 +7703,51 @@ pub async fn export_support_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ambiguous_storage_save_uses_only_the_reread_pointer() {
+        let current = PathBuf::from("C:/old");
+        let target = PathBuf::from("D:/new");
+
+        assert_eq!(
+            storage_root_after_ambiguous_save(
+                Some("D:/new"),
+                Some("C:/old"),
+                Some("D:/new"),
+                &current,
+                &target,
+            )
+            .unwrap(),
+            target
+        );
+        assert_eq!(
+            storage_root_after_ambiguous_save(
+                Some("C:/old"),
+                Some("C:/old"),
+                Some("D:/new"),
+                &current,
+                &target,
+            )
+            .unwrap(),
+            current
+        );
+        assert!(storage_root_after_ambiguous_save(
+            Some("E:/other"),
+            Some("C:/old"),
+            Some("D:/new"),
+            &current,
+            &target,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn storage_move_lock_set_covers_profile_and_cache_shards() {
+        let profile_guards = lock_all_profile_mutations().unwrap();
+        assert_eq!(profile_guards.len(), PROFILE_LOCK_SHARDS);
+        drop(profile_guards);
+        let asset_guards = lock_all_asset_caches().unwrap();
+        assert_eq!(asset_guards.len(), ASSET_CACHE_LOCK_SHARDS);
+    }
 
     struct DownloadHttp(&'static [u8]);
 
@@ -6963,6 +7795,9 @@ mod tests {
             name: name.into(),
             path: format!("C:/{name}/Among Us"),
             executable_identity: None,
+            source_fingerprint: None,
+            source_file_count: None,
+            source_byte_count: None,
             arch,
             store,
             runtime: Runtime::Native,
@@ -7479,6 +8314,7 @@ mod tests {
 
         let error = profile_transaction(&root, "stable", |stage_root, _| {
             profile::remove_plugin(stage_root, "stable", "Owned.dll").unwrap();
+            profile::install_plugin_bytes(stage_root, "stable", "Owned.dll", b"new").unwrap();
             Err::<(), _>("injected failure".into())
         })
         .unwrap_err();
@@ -7492,6 +8328,68 @@ mod tests {
             fs::read(root.join("stable/BepInEx/plugins/Owned.dll")).unwrap(),
             original_plugin
         );
+    }
+
+    #[test]
+    fn interrupted_mod_toggle_recovers_to_the_manifest_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profiles");
+        let id = "toggle-recovery";
+        let file = "Toggle.dll";
+        let mut record = ProfileRecord {
+            id: id.into(),
+            name: "Toggle".into(),
+            crew_color: "#fff".into(),
+            game_build: None,
+            game_instance_id: None,
+            mods: vec![InstalledMod {
+                package_id: "Owner/Toggle".into(),
+                name: "Toggle".into(),
+                repo: Some("Owner/Toggle".into()),
+                version: "v1".into(),
+                versions: vec!["v1".into()],
+                enabled: true,
+                source: ModSource::Github,
+                tags: Vec::new(),
+                managed: false,
+                update: None,
+                file: Some(file.into()),
+                asset: Some(file.into()),
+            }],
+            levelimposter_maps: Vec::new(),
+        };
+        let store = ProfileStore::new(&root);
+        store.save(&record).unwrap();
+        profile::install_plugin_bytes(&root, id, file, b"plugin").unwrap();
+
+        let journal = write_mod_toggle_recovery_journal(&root, id, file).unwrap();
+        let visible = recovered_profile_store(&root).unwrap().list().unwrap();
+        assert!(visible[0].mods[0].enabled);
+        assert!(root.join(id).join("BepInEx/plugins/Toggle.dll").is_file());
+        assert!(!journal.exists());
+
+        write_mod_toggle_recovery_journal(&root, id, file).unwrap();
+        profile::set_plugin_enabled(&root, id, file, false).unwrap();
+        let visible = recovered_profile_store(&root)
+            .unwrap()
+            .load(id)
+            .unwrap()
+            .unwrap();
+        assert!(visible.mods[0].enabled);
+        assert!(root.join(id).join("BepInEx/plugins/Toggle.dll").is_file());
+        assert!(!journal.exists());
+
+        write_mod_toggle_recovery_journal(&root, id, file).unwrap();
+        profile::set_plugin_enabled(&root, id, file, false).unwrap();
+        record.mods[0].enabled = false;
+        store.save(&record).unwrap();
+        let visible = recovered_profile_store(&root).unwrap().list().unwrap();
+        assert!(!visible[0].mods[0].enabled);
+        assert!(root
+            .join(id)
+            .join("BepInEx/plugins/Toggle.dll.disabled")
+            .is_file());
+        assert!(!journal.exists());
     }
 
     #[test]
@@ -7755,6 +8653,62 @@ mod tests {
     }
 
     #[test]
+    fn update_discovery_skips_asset_download_probes() {
+        struct ReleaseHttp;
+
+        impl Http for ReleaseHttp {
+            fn get_text(
+                &self,
+                _url: &str,
+            ) -> Result<String, perfect_sync_core::resolver::ResolveError> {
+                unreachable!()
+            }
+
+            fn get_text_fresh(
+                &self,
+                _url: &str,
+            ) -> Result<String, perfect_sync_core::resolver::ResolveError> {
+                Ok(r#"<a href="/AU-Avengers/TOU-Mira/releases/download/1.7.0/TouMira.v1.7.0-x86-steam-itch.zip">package</a>"#.into())
+            }
+
+            fn get_text_with_url_fresh(
+                &self,
+                _url: &str,
+            ) -> Result<
+                perfect_sync_core::resolver::TextResponse,
+                perfect_sync_core::resolver::ResolveError,
+            > {
+                Ok(perfect_sync_core::resolver::TextResponse {
+                    body: String::new(),
+                    final_url: "https://github.com/AU-Avengers/TOU-Mira/releases/tag/1.7.0".into(),
+                })
+            }
+
+            fn get_bytes(
+                &self,
+                _url: &str,
+            ) -> Result<Vec<u8>, perfect_sync_core::resolver::ResolveError> {
+                unreachable!()
+            }
+        }
+
+        let catalog = bundled_catalog();
+        let rules = &catalog.get(TOU_MIRA_ID).unwrap().asset_rules;
+        assert_eq!(
+            latest_profile_version(
+                &ReleaseHttp,
+                TOU_MIRA_ID,
+                rules,
+                "x86",
+                Store::Steam,
+                Runtime::Native,
+            )
+            .unwrap(),
+            "1.7.0"
+        );
+    }
+
+    #[test]
     fn town_of_us_options_expose_only_the_target_specific_complete_zip() {
         let catalog = bundled_catalog();
         let rules = &catalog.get("AU-Avengers/TOU-Mira").unwrap().asset_rules;
@@ -7973,6 +8927,9 @@ mod tests {
             name: "Renamed instance".into(),
             path: original.to_string_lossy().into_owned(),
             executable_identity: Some(identity.clone()),
+            source_fingerprint: None,
+            source_file_count: None,
+            source_byte_count: None,
             arch: Arch::X86,
             store: Store::Manual,
             runtime: Runtime::Native,
@@ -8012,6 +8969,9 @@ mod tests {
             name: "Epic".into(),
             path: game_dir.to_string_lossy().into_owned(),
             executable_identity: None,
+            source_fingerprint: None,
+            source_file_count: None,
+            source_byte_count: None,
             arch: Arch::X64,
             store: Store::Manual,
             runtime: Runtime::Native,
@@ -8025,6 +8985,61 @@ mod tests {
         assert!(repaired.is_empty());
         assert_eq!(saved.game_instances[0].store, Store::Epic);
         assert!(saved.game_instances[0].executable_identity.is_some());
+    }
+    #[test]
+    fn refreshes_registered_game_metadata_at_the_exact_saved_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        let stale_duplicate = temporary.path().join("stale duplicate");
+        for (directory, machine, build) in [
+            (&selected, 0x014c_u16, "2026.8.4"),
+            (&stale_duplicate, 0x8664_u16, "2025.1.1"),
+        ] {
+            fs::create_dir_all(directory.join("Among Us_Data")).unwrap();
+            let mut executable = vec![0_u8; 72];
+            executable[0..2].copy_from_slice(b"MZ");
+            executable[0x3c..0x40].copy_from_slice(&(64_u32).to_le_bytes());
+            executable[64..68].copy_from_slice(b"PE\0\0");
+            executable[68..70].copy_from_slice(&machine.to_le_bytes());
+            fs::write(directory.join(process::GAME_EXE), executable).unwrap();
+            fs::write(
+                directory.join("Among Us_Data/globalgamemanagers"),
+                format!("Among Us {build}"),
+            )
+            .unwrap();
+        }
+        let canonical = fs::canonicalize(&selected).unwrap();
+        let expected_runtime = compat::resolve_with_hint(&canonical, Some(Runtime::Wine)).runtime;
+        let mut saved = Settings::default();
+        saved.game_instances.push(settings::GameInstance {
+            id: "selected".into(),
+            name: "Selected".into(),
+            path: selected.to_string_lossy().into_owned(),
+            executable_identity: Some("stale-fingerprint".into()),
+            source_fingerprint: None,
+            source_file_count: None,
+            source_byte_count: None,
+            arch: Arch::X64,
+            store: Store::Manual,
+            runtime: Runtime::Wine,
+            build: Some("2024.1.1".into()),
+            writable: false,
+        });
+
+        let (changed, repaired) = repair_moved_game_instances(&mut saved).unwrap();
+        let refreshed = &saved.game_instances[0];
+
+        assert!(changed);
+        assert!(repaired.is_empty());
+        assert_eq!(Path::new(&refreshed.path), canonical);
+        assert_eq!(
+            refreshed.executable_identity,
+            game_executable_identity(&canonical)
+        );
+        assert_eq!(refreshed.arch, Arch::X86);
+        assert_eq!(refreshed.runtime, expected_runtime);
+        assert_eq!(refreshed.build.as_deref(), Some("2026.8.4"));
+        assert!(refreshed.writable);
     }
 
     #[test]
@@ -8098,15 +9113,6 @@ mod tests {
         assert!(!ran.get());
         assert!(ProfileStore::new(&root).list().unwrap().is_empty());
         assert!(!root.join("missing").exists());
-    }
-
-    #[test]
-    fn launch_readiness_rejects_runtime_guidance_while_sync_can_return_it() {
-        assert!(require_launch_ready(None).is_ok());
-        assert_eq!(
-            require_launch_ready(Some("configure the runtime override first".into())).unwrap_err(),
-            "configure the runtime override first"
-        );
     }
 
     #[test]
@@ -8481,6 +9487,84 @@ mod tests {
         assert!(require_manual_install_confirmation(true).is_ok());
         let error = require_manual_install_confirmation(false).unwrap_err();
         assert!(error.contains("repository, release tag, and asset"));
+    }
+
+    #[test]
+    fn durable_profile_mutations_require_the_recorded_exact_source() {
+        const CHILD: &str = "PERFECT_SYNC_MUTATION_SOURCE_CHILD";
+        const ROOT: &str = "PERFECT_SYNC_MUTATION_SOURCE_ROOT";
+        const TEST: &str =
+            "commands::tests::durable_profile_mutations_require_the_recorded_exact_source";
+
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            settings::initialize_app_data_dir(root.join("app")).unwrap();
+            settings::initialize_managed_data_dir(root.join("managed")).unwrap();
+            let source = root.join("source");
+            fs::create_dir_all(source.join("Among Us_Data")).unwrap();
+            fs::write(source.join("Among Us.exe"), b"executable").unwrap();
+            fs::write(source.join("Among Us_Data/data.unity3d"), b"game data").unwrap();
+            let source = fs::canonicalize(source).unwrap();
+            let mut instance = settings::GameInstance {
+                id: "source-1".into(),
+                name: "Source".into(),
+                path: source.to_string_lossy().into_owned(),
+                executable_identity: None,
+                source_fingerprint: None,
+                source_file_count: None,
+                source_byte_count: None,
+                arch: Arch::X86,
+                store: Store::Steam,
+                runtime: Runtime::Native,
+                build: Some("2026.8.4".into()),
+                writable: true,
+            };
+            let managed = managed_instance::record_source(&instance).unwrap();
+            instance.source_fingerprint = Some(managed.record.fingerprint.clone());
+            instance.source_file_count = Some(managed.record.file_count);
+            instance.source_byte_count = Some(managed.record.byte_count);
+            settings::save(&Settings {
+                game_instances: vec![instance],
+                ..Settings::default()
+            })
+            .unwrap();
+            ProfileStore::new(&settings::profiles_root())
+                .save(&ProfileRecord {
+                    id: "profile-1".into(),
+                    name: "Profile".into(),
+                    crew_color: "#fff".into(),
+                    game_build: Some("2026.8.4".into()),
+                    game_instance_id: Some("source-1".into()),
+                    mods: Vec::new(),
+                    levelimposter_maps: Vec::new(),
+                })
+                .unwrap();
+
+            require_profile_source_for_install("profile-1").unwrap();
+            fs::write(source.join("Among Us_Data/data.unity3d"), b"changed").unwrap();
+            assert!(require_profile_source_for_install("profile-1")
+                .unwrap_err()
+                .contains("fingerprint changed"));
+            fs::remove_dir_all(&source).unwrap();
+            assert!(require_profile_source_for_install("profile-1")
+                .unwrap_err()
+                .contains("source is unavailable"));
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let output = process::command(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .env(ROOT, root.path())
+            .args(["--exact", TEST, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     #[test]
     fn concurrent_profile_sessions_are_independent() {
