@@ -2103,6 +2103,78 @@ fn launch_err_msg(ctx: &compat::RuntimeContext, e: &std::io::Error) -> String {
         Runtime::Native => format!("Failed to launch the game: {e}"),
     }
 }
+fn ensure_or_refresh_source(
+    instance: &settings::GameInstance,
+    required_build: Option<&str>,
+) -> Result<(), String> {
+    if let Ok(source) = managed_instance::source_for_rebuild(instance, required_build) {
+        if managed_instance::ensure_exact_source_available(&source).is_ok() {
+            return Ok(());
+        }
+    }
+
+    let canonical = canonical_game_path(Path::new(&instance.path))?;
+    if !same_path(Path::new(&instance.path), &canonical) {
+        return Err(
+            "The saved Among Us source path changed. Open Settings to select it again.".into(),
+        );
+    }
+    let arch = game::exe_arch(&canonical.join(process::GAME_EXE))
+        .ok_or("Among Us executable architecture is unsupported")?;
+    if arch != instance.arch {
+        return Err(
+            "The original Among Us source architecture changed. Re-resolve this profile before installing mods."
+                .into(),
+        );
+    }
+    let store = game::store_for_path(&canonical, instance.store);
+    if store != instance.store {
+        return Err(
+            "The original Among Us source storefront changed. Re-resolve this profile before installing mods."
+                .into(),
+        );
+    }
+    let build = game::detect_build(&canonical);
+    if required_build.is_some_and(|required| build.as_deref() != Some(required)) {
+        return Err(format!(
+            "The original Among Us source is now build {}, but this profile requires build {}. Its existing direct instance remains playable.",
+            build.as_deref().unwrap_or("unknown"),
+            required_build.unwrap_or("unknown"),
+        ));
+    }
+
+    let mut refreshed = instance.clone();
+    refreshed.path = canonical.to_string_lossy().into_owned();
+    refreshed.executable_identity = game_executable_identity(&canonical);
+    refreshed.source_fingerprint = None;
+    refreshed.source_file_count = None;
+    refreshed.source_byte_count = None;
+    refreshed.runtime = compat::resolve_with_hint(&canonical, Some(instance.runtime)).runtime;
+    refreshed.build = build;
+    refreshed.writable = game::is_writable_game_dir(&canonical);
+    let source = managed_instance::record_source(&refreshed)?;
+    refreshed.source_fingerprint = Some(source.record.fingerprint);
+    refreshed.source_file_count = Some(source.record.file_count);
+    refreshed.source_byte_count = Some(source.record.byte_count);
+    if !settings::update_game_instance_source(instance, &refreshed)
+        .map_err(|error| error.to_string())?
+    {
+        let current = settings::load()
+            .map_err(|error| error.to_string())?
+            .game_instances
+            .into_iter()
+            .find(|current| current.id == instance.id)
+            .ok_or("The selected Among Us source was removed while it was being refreshed.")?;
+        let source = managed_instance::source_for_rebuild(&current, required_build)?;
+        return managed_instance::ensure_exact_source_available(&source);
+    }
+    log::info!(
+        "refreshed changed original source record automatically for {}",
+        instance.name
+    );
+    Ok(())
+}
+
 fn require_profile_source_for_install(profile_id: &str) -> Result<(), String> {
     managed_instance::migrate_direct_source_storage()?;
     let profiles = recovered_profile_store(&settings::profiles_root())?;
@@ -2112,16 +2184,14 @@ fn require_profile_source_for_install(profile_id: &str) -> Result<(), String> {
         .ok_or("profile not found")?;
     let saved = settings::load().map_err(|error| error.to_string())?;
     let instance = selected_profile_instance(&saved, profile.game_instance_id.as_deref())?;
-    let source = managed_instance::source_for_rebuild(instance, profile.game_build.as_deref())?;
-    managed_instance::ensure_exact_source_available(&source)
+    ensure_or_refresh_source(instance, profile.game_build.as_deref())
 }
 
 fn require_instance_source_for_install(game_instance_id: Option<&str>) -> Result<(), String> {
     managed_instance::migrate_direct_source_storage()?;
     let saved = settings::load().map_err(|error| error.to_string())?;
     let instance = selected_profile_instance(&saved, game_instance_id)?;
-    let source = managed_instance::source_for_rebuild(instance, instance.build.as_deref())?;
-    managed_instance::ensure_exact_source_available(&source)
+    ensure_or_refresh_source(instance, instance.build.as_deref())
 }
 
 /// Download a verified release asset and install its declared plugin DLL.
@@ -9490,11 +9560,11 @@ mod tests {
     }
 
     #[test]
-    fn durable_profile_mutations_require_the_recorded_exact_source() {
+    fn durable_profile_mutations_refresh_compatible_source_changes() {
         const CHILD: &str = "PERFECT_SYNC_MUTATION_SOURCE_CHILD";
         const ROOT: &str = "PERFECT_SYNC_MUTATION_SOURCE_ROOT";
         const TEST: &str =
-            "commands::tests::durable_profile_mutations_require_the_recorded_exact_source";
+            "commands::tests::durable_profile_mutations_refresh_compatible_source_changes";
 
         if std::env::var_os(CHILD).is_some() {
             let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
@@ -9502,8 +9572,18 @@ mod tests {
             settings::initialize_managed_data_dir(root.join("managed")).unwrap();
             let source = root.join("source");
             fs::create_dir_all(source.join("Among Us_Data")).unwrap();
-            fs::write(source.join("Among Us.exe"), b"executable").unwrap();
+            let mut executable = vec![0_u8; 72];
+            executable[0..2].copy_from_slice(b"MZ");
+            executable[0x3c..0x40].copy_from_slice(&(64_u32).to_le_bytes());
+            executable[64..68].copy_from_slice(b"PE\0\0");
+            executable[68..70].copy_from_slice(&(0x014c_u16).to_le_bytes());
+            fs::write(source.join("Among Us.exe"), executable).unwrap();
             fs::write(source.join("Among Us_Data/data.unity3d"), b"game data").unwrap();
+            fs::write(
+                source.join("Among Us_Data/globalgamemanagers"),
+                b"Among Us 2026.8.4",
+            )
+            .unwrap();
             let source = fs::canonicalize(source).unwrap();
             let mut instance = settings::GameInstance {
                 id: "source-1".into(),
@@ -9520,11 +9600,14 @@ mod tests {
                 writable: true,
             };
             let managed = managed_instance::record_source(&instance).unwrap();
+            let original_fingerprint = managed.record.fingerprint.clone();
             instance.source_fingerprint = Some(managed.record.fingerprint.clone());
             instance.source_file_count = Some(managed.record.file_count);
             instance.source_byte_count = Some(managed.record.byte_count);
             settings::save(&Settings {
                 game_instances: vec![instance],
+                active_profile: Some("profile-1".into()),
+                skip_launch_warning: true,
                 ..Settings::default()
             })
             .unwrap();
@@ -9542,13 +9625,32 @@ mod tests {
 
             require_profile_source_for_install("profile-1").unwrap();
             fs::write(source.join("Among Us_Data/data.unity3d"), b"changed").unwrap();
+            require_profile_source_for_install("profile-1").unwrap();
+            let refreshed = settings::load().unwrap();
+            let refreshed_instance = &refreshed.game_instances[0];
+            assert_ne!(
+                refreshed_instance.source_fingerprint.as_deref(),
+                Some(original_fingerprint.as_str())
+            );
+            assert_eq!(refreshed.active_profile.as_deref(), Some("profile-1"));
+            assert!(refreshed.skip_launch_warning);
+            let refreshed_source = managed_instance::saved_source(refreshed_instance)
+                .unwrap()
+                .unwrap();
+            managed_instance::ensure_exact_source_available(&refreshed_source).unwrap();
+
+            fs::write(
+                source.join("Among Us_Data/globalgamemanagers"),
+                b"Among Us 2026.9.1",
+            )
+            .unwrap();
             assert!(require_profile_source_for_install("profile-1")
                 .unwrap_err()
-                .contains("fingerprint changed"));
+                .contains("requires build 2026.8.4"));
             fs::remove_dir_all(&source).unwrap();
             assert!(require_profile_source_for_install("profile-1")
                 .unwrap_err()
-                .contains("source is unavailable"));
+                .contains("game folder not found"));
             return;
         }
 

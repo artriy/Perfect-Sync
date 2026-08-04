@@ -892,6 +892,41 @@ pub fn save(settings: &Settings) -> Result<(), SettingsError> {
     }
     write_settings_unlocked(settings)
 }
+pub fn update_game_instance_source(
+    expected: &GameInstance,
+    refreshed: &GameInstance,
+) -> Result<bool, SettingsError> {
+    let _guard = lock_settings()?;
+    let (mut settings, _) = load_unlocked()?;
+    let Some(instance) = settings
+        .game_instances
+        .iter_mut()
+        .find(|instance| instance.id == expected.id)
+    else {
+        return Ok(false);
+    };
+    if refreshed.id != expected.id
+        || instance.path != expected.path
+        || instance.arch != expected.arch
+        || instance.store != expected.store
+        || instance.runtime != expected.runtime
+        || instance.build != expected.build
+        || instance.source_fingerprint != expected.source_fingerprint
+        || instance.source_file_count != expected.source_file_count
+        || instance.source_byte_count != expected.source_byte_count
+    {
+        return Ok(false);
+    }
+    instance.executable_identity = refreshed.executable_identity.clone();
+    instance.source_fingerprint = refreshed.source_fingerprint.clone();
+    instance.source_file_count = refreshed.source_file_count;
+    instance.source_byte_count = refreshed.source_byte_count;
+    instance.runtime = refreshed.runtime;
+    instance.build = refreshed.build.clone();
+    instance.writable = refreshed.writable;
+    write_settings_unlocked(&settings)?;
+    Ok(true)
+}
 
 pub fn set_active_profile(profile_id: &str) -> Result<(), SettingsError> {
     let _guard = lock_settings()?;

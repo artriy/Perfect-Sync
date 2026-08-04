@@ -97,6 +97,9 @@
 - Add an explicit original-source check that refreshes source fingerprint and build
   metadata in place without clearing installed mods, the active profile, the selected
   instance, or pending optimistic changes.
+- Refresh a changed but build-compatible clean original source automatically before mod
+  installs and updates, preserving unrelated Settings fields. Continue blocking actual
+  build, architecture, storefront, unavailable-source, and contaminated-source changes.
 - Keep all five live operation stages aligned in one progress row.
 
 ## v0.1.5 (experimental)
