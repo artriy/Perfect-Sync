@@ -45,8 +45,8 @@ pub struct RuntimeContext {
     /// Wine prefix (the dir holding `user.reg`): Proton's `compatdata/<id>/pfx`
     /// or a Wine/CrossOver/Whisky/Bottles bottle. `None` on native Windows.
     pub prefix: Option<PathBuf>,
-    /// Binary used to start the selected executable (`proton`, `wine`, `cxrun`,
-    /// etc.). `None` means runtime discovery failed.
+    /// Binary used to start the selected executable (`proton`, `wine`, etc.).
+    /// `None` means runtime discovery failed.
     pub launcher: Option<PathBuf>,
     /// Arguments which select the launcher/bottle, before the game-specific args.
     pub launcher_args: Vec<OsString>,
@@ -274,19 +274,71 @@ fn proton_launcher(game_dir: &Path, prefix: Option<&Path>) -> (Option<PathBuf>, 
     (candidates.pop(), vec![OsString::from("run")])
 }
 
-fn find_crossover_cxrun() -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from(
-        "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxrun",
-    )];
-    if let Some(home) = home_dir() {
-        candidates.push(
-            home.join("Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxrun"),
-        );
+const CROSSOVER_WINE_RELATIVE_PATH: &str = "Contents/SharedSupport/CrossOver/bin/wine";
+
+fn crossover_wine_from_root(root: &Path) -> Option<PathBuf> {
+    [
+        root.join("bin/wine"),
+        root.join(CROSSOVER_WINE_RELATIVE_PATH),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+fn find_crossover_wine_in_applications(applications: &Path) -> Option<PathBuf> {
+    let mut apps = fs::read_dir(applications)
+        .ok()?
+        .flatten()
+        .take(256)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("CrossOver") && name.ends_with(".app"))
+        })
+        .collect::<Vec<_>>();
+    apps.sort();
+    apps.into_iter()
+        .find_map(|application| crossover_wine_from_root(&application))
+}
+
+fn find_crossover_wine_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("wine"))
+        .find(|candidate| {
+            candidate.is_file()
+                && candidate
+                    .parent()
+                    .and_then(Path::parent)
+                    .is_some_and(|root| root.join("etc/CrossOver.conf").is_file())
+        })
+}
+
+fn find_crossover_wine() -> Option<PathBuf> {
+    if let Some(wine) = std::env::var_os("CX_ROOT")
+        .map(PathBuf::from)
+        .and_then(|root| crossover_wine_from_root(&root))
+    {
+        return Some(wine);
     }
-    candidates
+
+    let mut applications = vec![PathBuf::from("/Applications")];
+    let mut direct = vec![PathBuf::from("/Applications/CrossOver.app")];
+    if let Some(home) = home_dir() {
+        direct.push(home.join("CrossOver.app"));
+        direct.push(home.join("Applications/CrossOver.app"));
+        applications.push(home.join("Applications"));
+    }
+    direct
         .into_iter()
-        .find(|p| p.is_file())
-        .or_else(|| find_binary(&["cxrun"]))
+        .find_map(|application| crossover_wine_from_root(&application))
+        .or_else(|| {
+            applications
+                .into_iter()
+                .find_map(|root| find_crossover_wine_in_applications(&root))
+        })
+        .or_else(find_crossover_wine_on_path)
 }
 
 fn find_whisky_wine() -> Option<PathBuf> {
@@ -317,7 +369,7 @@ fn find_launcher(
             if let Some(name) = bottle_name(prefix) {
                 args.extend([OsString::from("--bottle"), name, OsString::from("--")]);
             }
-            (find_crossover_cxrun(), args)
+            (find_crossover_wine(), args)
         }
         Runtime::Whisky => (find_whisky_wine(), vec!["start".into(), "/unix".into()]),
         Runtime::Bottles => {
@@ -369,7 +421,7 @@ fn runtime_fallback(runtime: Runtime) -> &'static str {
         Runtime::Native => GAME_EXE,
         Runtime::Proton => "proton",
         Runtime::Wine => "wine",
-        Runtime::Crossover => "cxrun",
+        Runtime::Crossover => "wine",
         Runtime::Whisky => "wine64",
         Runtime::Bottles => "bottles-cli",
     }
@@ -460,6 +512,14 @@ pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> L
             let env = wine_environment(ctx, std::env::var_os("WINEDLLOVERRIDES"));
             let mut args = ctx.launcher_args.clone();
             args.push(program.as_os_str().to_owned());
+            let error = if ctx.runtime == Runtime::Crossover && ctx.launcher.is_none() {
+                Some(
+                    "Could not find CrossOver's command-line Wine launcher. Install CrossOver in the system or user Applications folder, then retry."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
             LaunchSpec {
                 program: ctx
                     .launcher
@@ -468,7 +528,7 @@ pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> L
                 args,
                 cwd: cwd.to_path_buf(),
                 env,
-                error: None,
+                error,
             }
         }
     }
@@ -906,7 +966,10 @@ mod tests {
 
     #[test]
     fn inherited_dll_overrides_and_bottle_environment_are_preserved() {
-        let mut ctx = context(Runtime::Crossover, "/Applications/CrossOver.app/cxrun");
+        let mut ctx = context(
+            Runtime::Crossover,
+            "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine",
+        );
         ctx.prefix = Some(PathBuf::from("/CrossOver/Bottles/Existing Bottle"));
         let env = wine_environment(&ctx, Some(OsString::from("custom=n")));
         assert!(!env.iter().any(|(key, _)| key == "WINEDLLOVERRIDES"));
@@ -916,14 +979,63 @@ mod tests {
     }
 
     #[test]
-    fn crossover_spec_selects_bottle() {
+    fn crossover_spec_uses_wine_and_selects_bottle() {
         let game = Path::new("/CrossOver/Bottles/AU/drive_c/Games/Among Us");
-        let mut ctx = context(Runtime::Crossover, "/Applications/CrossOver.app/cxrun");
+        let mut ctx = context(
+            Runtime::Crossover,
+            "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine",
+        );
         ctx.prefix = Some(PathBuf::from("/CrossOver/Bottles/AU"));
         ctx.launcher_args = vec!["--bottle".into(), "AU".into(), "--".into()];
         let spec = build_launch_spec(game, &ctx);
         assert_eq!(&spec.args[..3], ["--bottle", "AU", "--"]);
+        assert!(spec.program.ends_with("bin/wine"));
         assert!(spec.env.iter().any(|(k, v)| k == "CX_BOTTLE" && v == "AU"));
+    }
+
+    #[test]
+    fn crossover_wine_is_found_in_current_and_versioned_app_bundles() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp
+            .path()
+            .join("CrossOver.app")
+            .join(CROSSOVER_WINE_RELATIVE_PATH);
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::write(&current, b"wine").unwrap();
+        assert_eq!(
+            find_crossover_wine_in_applications(temp.path()),
+            Some(current.clone())
+        );
+
+        fs::remove_dir_all(temp.path().join("CrossOver.app")).unwrap();
+        let versioned = temp
+            .path()
+            .join("CrossOver-Preview.app")
+            .join(CROSSOVER_WINE_RELATIVE_PATH);
+        fs::create_dir_all(versioned.parent().unwrap()).unwrap();
+        fs::write(&versioned, b"wine").unwrap();
+        assert_eq!(
+            find_crossover_wine_in_applications(temp.path()),
+            Some(versioned)
+        );
+    }
+
+    #[test]
+    fn missing_crossover_wine_fails_before_spawning_a_bare_command() {
+        let game = Path::new("/managed/workspace/current");
+        let mut ctx = context(Runtime::Crossover, "wine");
+        ctx.launcher = None;
+        ctx.prefix = Some(PathBuf::from("/CrossOver/Bottles/AU"));
+        ctx.launcher_args = vec!["--bottle".into(), "AU".into(), "--".into()];
+        let spec = build_launch_spec(game, &ctx);
+        assert!(spec
+            .error
+            .as_deref()
+            .is_some_and(|message| { message.contains("CrossOver's command-line Wine launcher") }));
+        assert_eq!(
+            crate::process::launch(&spec).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

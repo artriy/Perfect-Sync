@@ -1,0 +1,84 @@
+name: trial macOS bundles
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: trial-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build macOS ${{ matrix.arch }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-apple-darwin
+          - arch: arm64
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: trial-${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build macOS bundles
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles app,dmg -- --locked
+
+      - name: Validate and stage trial files
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          root="target/${{ matrix.target }}/release/bundle"
+          apps=("$root"/macos/*.app)
+          dmgs=("$root"/dmg/*.dmg)
+          archives=("$root"/macos/*.app.tar.gz)
+          signatures=("$root"/macos/*.app.tar.gz.sig)
+          test ${#apps[@]} -eq 1
+          test ${#dmgs[@]} -eq 1
+          test ${#archives[@]} -eq 1
+          test ${#signatures[@]} -eq 1
+          codesign --verify --deep --strict --verbose=2 "${apps[0]}"
+          hdiutil verify "${dmgs[0]}"
+          stage="$RUNNER_TEMP/perfect-sync-macos-${{ matrix.arch }}"
+          mkdir -p "$stage"
+          for file in "${dmgs[@]}" "${archives[@]}" "${signatures[@]}"; do
+            cp "$file" "$stage/"
+            shasum -a 256 "$file" >> "$stage/SHA256SUMS.txt"
+          done
+
+      - name: Upload trial artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: perfect-sync-macos-${{ matrix.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/perfect-sync-macos-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7

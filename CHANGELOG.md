@@ -29,6 +29,10 @@
   CrossOver, Whisky, and Bottles; track running processes by exact workspace path so
   Steam, Epic, and other profiles can run concurrently without locking the rest of the
   app, while file-changing actions remain blocked only for the affected profile.
+- Launch CrossOver bottles on macOS through CrossOver's bundled `wine` wrapper instead
+  of the removed `cxrun` command; discover system, user, versioned, and `CX_ROOT`
+  installations, preserve the selected bottle, and report a missing installation before
+  attempting an unavailable command.
 - Verify both x86 Steam and x64 Epic Town of Us workspaces against the exact release ZIP,
   including `MiraAPI.dll`, `touhats.bundle`, and `touhats.catalog`.
 - Repair relocated Epic source metadata from durable folder evidence, expose an explicit

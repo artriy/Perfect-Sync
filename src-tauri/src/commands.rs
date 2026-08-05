@@ -2092,7 +2092,7 @@ fn launch_err_msg(ctx: &compat::RuntimeContext, e: &std::io::Error) -> String {
             "Couldn't run Wine ({e}). The isolated workspace is still ready; verify the configured Wine runtime, then retry."
         ),
         Runtime::Crossover => format!(
-            "Couldn't run CrossOver's cxrun ({e}). The isolated workspace is still ready; verify the selected bottle, then retry."
+            "Couldn't run CrossOver's Wine launcher ({e}). The isolated workspace is still ready; verify the selected bottle and CrossOver installation, then retry."
         ),
         Runtime::Whisky => format!(
             "Couldn't run Whisky's Wine ({e}). The isolated workspace is still ready; verify the selected bottle, then retry."
@@ -7773,6 +7773,24 @@ pub async fn export_support_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crossover_launch_error_names_the_current_wine_launcher() {
+        let context = compat::RuntimeContext {
+            host: compat::HostPlatform::Macos,
+            runtime: Runtime::Crossover,
+            prefix: Some(PathBuf::from("/CrossOver/Bottles/AU")),
+            launcher: None,
+            launcher_args: vec!["--bottle".into(), "AU".into(), "--".into()],
+        };
+        let message = launch_err_msg(
+            &context,
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        assert!(message.starts_with("Couldn't run CrossOver's Wine launcher"));
+        assert!(message.contains("selected bottle and CrossOver installation"));
+        assert!(!message.contains("cxrun"));
+    }
     #[test]
     fn ambiguous_storage_save_uses_only_the_reread_pointer() {
         let current = PathBuf::from("C:/old");
