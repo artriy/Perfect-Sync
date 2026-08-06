@@ -238,6 +238,7 @@ struct RunningGameProcess {
     path: PathBuf,
 }
 
+#[cfg(windows)]
 fn running_game_processes() -> io::Result<Vec<RunningGameProcess>> {
     use std::os::windows::ffi::OsStringExt;
 
