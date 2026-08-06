@@ -39,11 +39,12 @@ jobs:
         with:
           workspaces: '. -> target'
 
-      - name: Audit Rust dependencies
+      - name: Audit Rust dependencies (ignore inactive rust_decimal rkyv feature)
         if: runner.os == 'Linux'
         uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2026-0235
 
       - name: Install Linux Tauri libraries
         if: runner.os == 'Linux'
