@@ -29,8 +29,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
 
@@ -86,6 +87,8 @@ const MAX_RECURSIVE_COPY_FILES: usize = 200_000;
 const MAX_RECURSIVE_COPY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_ERROR_LOG_BYTES: u64 = 256 * 1024 * 1024;
 const CROSSOVER_GAME_START_TIMEOUT: Duration = Duration::from_secs(300);
+const CROSSOVER_OUTPUT_BYTES_PER_STREAM: usize = 8 * 1024;
+const CROSSOVER_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LAUNCH_PENDING: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -342,6 +345,233 @@ fn wait_for_game_start(
     }
 }
 
+#[derive(Default)]
+struct CrossoverOutputStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+    closed: bool,
+    read_error: Option<String>,
+}
+
+struct CrossoverOutputCapture {
+    stdout: Option<Arc<Mutex<CrossoverOutputStream>>>,
+    stderr: Option<Arc<Mutex<CrossoverOutputStream>>>,
+}
+
+impl CrossoverOutputCapture {
+    fn new(launcher: &mut std::process::Child) -> Self {
+        Self {
+            stdout: launcher.stdout.take().map(drain_crossover_output),
+            stderr: launcher.stderr.take().map(drain_crossover_output),
+        }
+    }
+
+    fn finish(self) -> String {
+        let deadline = Instant::now() + CROSSOVER_OUTPUT_DRAIN_TIMEOUT;
+        while !self.is_closed() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5).min(deadline - now));
+        }
+
+        let mut diagnostic = String::new();
+        append_crossover_output(&mut diagnostic, "stdout", self.stdout.as_ref());
+        append_crossover_output(&mut diagnostic, "stderr", self.stderr.as_ref());
+        diagnostic
+    }
+
+    fn is_closed(&self) -> bool {
+        [&self.stdout, &self.stderr].into_iter().all(|stream| {
+            stream
+                .as_ref()
+                .is_none_or(|stream| stream.lock().is_ok_and(|stream| stream.closed))
+        })
+    }
+}
+
+fn drain_crossover_output(
+    mut reader: impl Read + Send + 'static,
+) -> Arc<Mutex<CrossoverOutputStream>> {
+    let stream = Arc::new(Mutex::new(CrossoverOutputStream::default()));
+    let writer = Arc::clone(&stream);
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let Ok(mut output) = writer.lock() else {
+                        return;
+                    };
+                    if read >= CROSSOVER_OUTPUT_BYTES_PER_STREAM {
+                        output.bytes.clear();
+                        output.bytes.extend_from_slice(
+                            &chunk[read - CROSSOVER_OUTPUT_BYTES_PER_STREAM..read],
+                        );
+                        output.truncated = true;
+                        continue;
+                    }
+                    let overflow = (output.bytes.len() + read)
+                        .saturating_sub(CROSSOVER_OUTPUT_BYTES_PER_STREAM);
+                    if overflow > 0 {
+                        output.bytes.drain(..overflow);
+                        output.truncated = true;
+                    }
+                    output.bytes.extend_from_slice(&chunk[..read]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    if let Ok(mut output) = writer.lock() {
+                        output.read_error = Some(error.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+        if let Ok(mut output) = writer.lock() {
+            output.closed = true;
+        }
+    });
+    stream
+}
+
+fn redact_user_paths_and_tokens(mut text: String) -> String {
+    for variable in ["USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA"] {
+        if let Some(path) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+            text = text.replace(&path.to_string_lossy().to_string(), "<redacted-user-path>");
+        }
+    }
+    let token =
+        regex::Regex::new(r"(?i)\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})\b")
+            .expect("static token regex");
+    token.replace_all(&text, "<redacted-token>").into_owned()
+}
+
+fn redact_crossover_text(text: String) -> String {
+    if settings::cache_dir_if_initialized().is_some() {
+        if let Ok(saved) = settings::load() {
+            return redact_sensitive(text, &saved);
+        }
+    }
+    redact_user_paths_and_tokens(text)
+}
+
+fn append_crossover_output(
+    diagnostic: &mut String,
+    name: &str,
+    stream: Option<&Arc<Mutex<CrossoverOutputStream>>>,
+) {
+    let Some(stream) = stream else {
+        return;
+    };
+    let Ok(stream) = stream.lock() else {
+        return;
+    };
+    let text: String = String::from_utf8_lossy(&stream.bytes)
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect();
+    let text = redact_crossover_text(text);
+    let text = text.trim();
+    if text.is_empty() && stream.read_error.is_none() {
+        return;
+    }
+    diagnostic.push_str("\nCrossOver ");
+    diagnostic.push_str(name);
+    diagnostic.push_str(" (recent output, capped at 8 KiB");
+    if stream.truncated {
+        diagnostic.push_str(", earlier output omitted");
+    }
+    diagnostic.push_str("): ");
+    diagnostic.push_str(text);
+    if let Some(error) = &stream.read_error {
+        if !text.is_empty() {
+            diagnostic.push_str("; ");
+        }
+        diagnostic.push_str("capture ended with ");
+        diagnostic.push_str(error);
+    }
+}
+
+fn with_crossover_output(mut message: String, diagnostic: String) -> String {
+    if !diagnostic.is_empty() {
+        message.push_str(&diagnostic);
+    }
+    message
+}
+
+fn crossover_exit_error(status: std::process::ExitStatus, diagnostic: String) -> String {
+    let message = if status.success() {
+        "CrossOver's attached wrapper exited successfully before the exact managed Among Us process became ready. Verify the selected bottle and CrossOver installation, then retry.".to_string()
+    } else {
+        format!(
+            "CrossOver's attached wrapper exited with {status} before the exact managed Among Us process became ready. Verify the selected bottle and CrossOver installation, then retry."
+        )
+    };
+    with_crossover_output(message, diagnostic)
+}
+
+fn crossover_timeout_label(timeout: Duration) -> String {
+    if timeout.as_millis() % 60_000 == 0 {
+        let minutes = timeout.as_secs() / 60;
+        format!(
+            "{minutes} {}",
+            if minutes == 1 { "minute" } else { "minutes" }
+        )
+    } else if timeout.as_millis() % 1_000 == 0 {
+        let seconds = timeout.as_secs();
+        format!(
+            "{seconds} {}",
+            if seconds == 1 { "second" } else { "seconds" }
+        )
+    } else {
+        format!("{} ms", timeout.as_millis())
+    }
+}
+
+fn launch_crossover(
+    specification: &process::LaunchSpec,
+    interactive: bool,
+) -> io::Result<std::process::Child> {
+    if let Some(message) = &specification.error {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message.clone()));
+    }
+    let mut command = if interactive {
+        process::interactive_command(&specification.program)
+    } else {
+        process::command(&specification.program)
+    };
+    command
+        .current_dir(&specification.cwd)
+        .stdin(if interactive {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(&specification.args);
+    for (key, value) in &specification.env {
+        command.env(key, value);
+    }
+    command.spawn()
+}
+
+fn submit_crossover_enter(launcher: &mut std::process::Child) -> Result<(), String> {
+    let Some(mut input) = launcher.stdin.take() else {
+        return Ok(());
+    };
+    match input.write_all(b"\n") {
+        Ok(()) => input
+            .flush()
+            .map_err(|error| format!("Could not finish CrossOver helper input: {error}")),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(format!("Could not submit CrossOver helper input: {error}")),
+    }
+}
+
 fn stop_crossover_launcher(launcher: &mut std::process::Child) -> Result<(), String> {
     if launcher
         .try_wait()
@@ -358,40 +588,66 @@ fn stop_crossover_launcher(launcher: &mut std::process::Child) -> Result<(), Str
         .map_err(|error| format!("Could not finish closing CrossOver's launcher: {error}"))?;
     Ok(())
 }
+fn stop_crossover_attempt(
+    launcher: &mut std::process::Child,
+    game_dir: &Path,
+) -> Result<bool, String> {
+    let input_result = submit_crossover_enter(launcher);
+    let launcher_result = stop_crossover_launcher(launcher);
+    let game_result = process::terminate_game_dir(game_dir).map_err(|error| {
+        format!("Could not stop the exact managed CrossOver process after launch failure: {error}")
+    });
+    match (input_result, launcher_result, game_result) {
+        (Ok(()), Ok(()), Ok(stopped)) => Ok(stopped),
+        (input, launcher, game) => {
+            let errors = [input.err(), launcher.err(), game.err()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            Err(errors.join(". "))
+        }
+    }
+}
+
 fn supervise_crossover_launch(
     mut launcher: std::process::Child,
     game_dir: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
+    let output = CrossoverOutputCapture::new(&mut launcher);
+    let mut wrapper_exit = None;
+    let mut wrapper_observed_alive = false;
     let launch_result = wait_for_game_start(game_dir, timeout, || {
-        let Some(status) = launcher
+        wrapper_exit = launcher
             .try_wait()
-            .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?
-        else {
-            return Ok(());
-        };
-        if status.success() {
-            Err(
-                "CrossOver's attached launch process ended before the exact managed Among Us process became ready."
-                    .into(),
-            )
+            .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?;
+        if wrapper_exit.is_some() {
+            Err("CrossOver's attached wrapper exited during startup.".into())
         } else {
-            Err(format!(
-                "CrossOver could not start Among Us ({status}). Verify the selected bottle and CrossOver installation, then retry."
-            ))
+            wrapper_observed_alive = true;
+            Ok(())
         }
     });
 
     match launch_result {
         Ok(true) => {
+            if let Err(error) = submit_crossover_enter(&mut launcher) {
+                let cleanup_error = stop_crossover_attempt(&mut launcher, game_dir).err();
+                let message = with_crossover_output(
+                    format!("Among Us started, but Perfect Sync could not release CrossOver's interactive helper: {error}"),
+                    output.finish(),
+                );
+                return Err(match cleanup_error {
+                    Some(cleanup_error) => format!("{message} {cleanup_error}"),
+                    None => message,
+                });
+            }
             match launcher
                 .try_wait()
                 .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?
             {
                 Some(status) if !status.success() => {
-                    return Err(format!(
-                        "CrossOver could not start Among Us ({status}). Verify the selected bottle and CrossOver installation, then retry."
-                    ));
+                    return Err(crossover_exit_error(status, output.finish()));
                 }
                 Some(_) => {}
                 None => {
@@ -403,17 +659,48 @@ fn supervise_crossover_launch(
             Ok(())
         }
         Ok(false) => {
-            stop_crossover_launcher(&mut launcher)?;
-            Err(
-                "Perfect Sync did not detect the exact managed Among Us process within 5 minutes. The launch is no longer pending. If this profile later appears as running, stop it in Perfect Sync before retrying."
-                    .into(),
-            )
+            if let Some(status) = launcher
+                .try_wait()
+                .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?
+            {
+                let cleanup_result = stop_crossover_attempt(&mut launcher, game_dir);
+                let message = crossover_exit_error(status, output.finish());
+                cleanup_result.map_err(|error| format!("{message} {error}"))?;
+                return Err(message);
+            }
+            let cleanup_result = stop_crossover_attempt(&mut launcher, game_dir);
+            let scoped_result = match &cleanup_result {
+                Ok(true) => "The exact managed process was stopped.",
+                Ok(false) => "No exact managed process remained.",
+                Err(_) => "Perfect Sync could not verify complete launch cleanup.",
+            };
+            let message = with_crossover_output(
+                format!(
+                    "Perfect Sync did not detect the exact managed Among Us process within {}. CrossOver's attached wrapper remained alive until the readiness timeout and was stopped. {scoped_result} The launch is no longer pending; retry it once.",
+                    crossover_timeout_label(timeout)
+                ),
+                output.finish(),
+            );
+            cleanup_result.map_err(|error| format!("{message} {error}"))?;
+            Err(message)
         }
         Err(error) => {
-            if let Err(cleanup_error) = stop_crossover_launcher(&mut launcher) {
-                return Err(format!("{error}. {cleanup_error}"));
+            if let Some(status) = wrapper_exit {
+                let cleanup_result = stop_crossover_attempt(&mut launcher, game_dir);
+                let message = crossover_exit_error(status, output.finish());
+                cleanup_result.map_err(|cleanup_error| format!("{message} {cleanup_error}"))?;
+                return Err(message);
             }
-            Err(error)
+            let wrapper_evidence = if wrapper_observed_alive {
+                " CrossOver's attached wrapper remained alive when readiness checking failed."
+            } else {
+                " CrossOver's attached wrapper state could not be verified."
+            };
+            let cleanup_result = stop_crossover_attempt(&mut launcher, game_dir);
+            let message =
+                with_crossover_output(format!("{error}{wrapper_evidence}"), output.finish());
+            cleanup_result.map_err(|cleanup_error| format!("{message} {cleanup_error}"))?;
+            Err(message)
         }
     }
 }
@@ -7226,12 +7513,14 @@ fn launch_prepared_game(
         }
         let specification = compat::build_program_spec(&starter, game_dir, &context);
         return spawn_launch(workspace_id, || {
-            let launcher = process::launch_interactive(&specification)
-                .map_err(|error| launch_err_msg(&context, &error))?;
             if context.runtime == Runtime::Crossover {
+                let launcher = launch_crossover(&specification, true)
+                    .map_err(|error| launch_err_msg(&context, &error))?;
                 supervise_crossover_launch(launcher, game_dir, CROSSOVER_GAME_START_TIMEOUT)
             } else {
-                Ok(())
+                process::launch_interactive(&specification)
+                    .map(|_| ())
+                    .map_err(|error| launch_err_msg(&context, &error))
             }
         });
     }
@@ -7251,7 +7540,7 @@ fn launch_prepared_game(
     let specification = compat::build_launch_spec(game_dir, &context);
     if context.runtime == Runtime::Crossover {
         return spawn_launch(workspace_id, || {
-            let launcher = process::launch(&specification)
+            let launcher = launch_crossover(&specification, false)
                 .map_err(|error| launch_err_msg(&context, &error))?;
             supervise_crossover_launch(launcher, game_dir, CROSSOVER_GAME_START_TIMEOUT)
         });
@@ -7629,15 +7918,7 @@ fn redact_sensitive(mut text: String, saved: &Settings) -> String {
             text = text.replace(path, "<redacted-path>");
         }
     }
-    for variable in ["USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA"] {
-        if let Some(path) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
-            text = text.replace(&path.to_string_lossy().to_string(), "<redacted-user-path>");
-        }
-    }
-    let token =
-        regex::Regex::new(r"(?i)\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})\b")
-            .expect("static token regex");
-    token.replace_all(&text, "<redacted-token>").into_owned()
+    redact_user_paths_and_tokens(text)
 }
 
 fn recent_log_errors(game_dir: &Path, saved: &Settings) -> Result<Vec<String>, String> {
@@ -9836,7 +10117,6 @@ mod tests {
         if let Ok(role) = std::env::var(ROLE) {
             match role.as_str() {
                 "launcher" | "game" => std::thread::sleep(Duration::from_secs(1)),
-                "exited" => {}
                 _ => panic!("unexpected CrossOver supervisor role"),
             }
             return;
@@ -9868,17 +10148,144 @@ mod tests {
         supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(3)).unwrap();
         let mut game = delayed_game.join().unwrap();
         assert!(game.wait().unwrap().success());
+    }
 
-        let exited_launcher = process::command(std::env::current_exe().unwrap())
-            .env(ROLE, "exited")
-            .args(["--exact", TEST, "--nocapture"])
-            .spawn()
-            .unwrap();
-        let exit_started = Instant::now();
-        let error = supervise_crossover_launch(exited_launcher, &game_dir, Duration::from_secs(3))
-            .unwrap_err();
-        assert!(error.contains("ended before the exact managed Among Us process"));
-        assert!(exit_started.elapsed() < Duration::from_secs(2));
+    #[test]
+    fn crossover_supervisor_releases_interactive_helper_after_readiness() {
+        const ROLE: &str = "PERFECT_SYNC_CROSSOVER_INTERACTIVE_ROLE";
+        const MARKER: &str = "PERFECT_SYNC_CROSSOVER_INTERACTIVE_MARKER";
+        const TEST: &str =
+            "commands::tests::crossover_supervisor_releases_interactive_helper_after_readiness";
+
+        if let Ok(role) = std::env::var(ROLE) {
+            match role.as_str() {
+                "helper" => {
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input).unwrap();
+                    assert_eq!(input, "\n");
+                    fs::write(std::env::var_os(MARKER).unwrap(), b"released").unwrap();
+                }
+                "game" => std::thread::sleep(Duration::from_secs(1)),
+                _ => panic!("unexpected CrossOver interactive role"),
+            }
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let game_dir = temp.path().join("managed-game");
+        fs::create_dir(&game_dir).unwrap();
+        let game_executable = game_dir.join(process::GAME_EXE);
+        fs::copy(std::env::current_exe().unwrap(), &game_executable).unwrap();
+        let marker = temp.path().join("helper-released");
+        let specification = process::LaunchSpec {
+            program: std::env::current_exe().unwrap(),
+            args: vec!["--exact".into(), TEST.into(), "--nocapture".into()],
+            cwd: std::env::current_dir().unwrap(),
+            env: vec![
+                (ROLE.into(), "helper".into()),
+                (MARKER.into(), marker.as_os_str().to_owned()),
+            ],
+            error: None,
+        };
+        let launcher = launch_crossover(&specification, true).unwrap();
+        let delayed_game = std::thread::spawn({
+            let game_executable = game_executable.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                process::command(game_executable)
+                    .env(ROLE, "game")
+                    .args(["--exact", TEST, "--nocapture"])
+                    .spawn()
+                    .unwrap()
+            }
+        });
+
+        supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(3)).unwrap();
+        let marker_deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && Instant::now() < marker_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(fs::read(marker).unwrap(), b"released");
+        let mut game = delayed_game.join().unwrap();
+        assert!(game.wait().unwrap().success());
+    }
+
+    #[test]
+    fn crossover_supervisor_reports_immediate_wrapper_failure_output() {
+        const CHILD: &str = "PERFECT_SYNC_CROSSOVER_FAILURE_CHILD";
+        const TEST: &str =
+            "commands::tests::crossover_supervisor_reports_immediate_wrapper_failure_output";
+
+        if std::env::var_os(CHILD).is_some() {
+            println!("wrapper dispatch detail");
+            io::stdout().flush().unwrap();
+            eprint!("{}", "x".repeat(CROSSOVER_OUTPUT_BYTES_PER_STREAM * 2));
+            eprintln!("bottle configuration missing");
+            io::stderr().flush().unwrap();
+            std::process::exit(23);
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let game_dir = temp.path().join("managed-game");
+        fs::create_dir(&game_dir).unwrap();
+        let specification = process::LaunchSpec {
+            program: std::env::current_exe().unwrap(),
+            args: vec!["--exact".into(), TEST.into(), "--nocapture".into()],
+            cwd: std::env::current_dir().unwrap(),
+            env: vec![(CHILD.into(), "1".into())],
+            error: None,
+        };
+        let launcher = launch_crossover(&specification, false).unwrap();
+
+        let started = Instant::now();
+        let error =
+            supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(3)).unwrap_err();
+        assert!(error.contains("attached wrapper exited with"));
+        assert!(error.contains("23"));
+        assert!(error.contains("before the exact managed Among Us process became ready"));
+        assert!(error.contains("CrossOver stdout"));
+        assert!(error.contains("wrapper dispatch detail"));
+        assert!(error.contains("CrossOver stderr"));
+        assert!(error.contains("earlier output omitted"));
+        assert!(error.contains("bottle configuration missing"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn crossover_supervisor_reports_live_wrapper_and_output_at_timeout() {
+        const CHILD: &str = "PERFECT_SYNC_CROSSOVER_TIMEOUT_CHILD";
+        const TEST: &str =
+            "commands::tests::crossover_supervisor_reports_live_wrapper_and_output_at_timeout";
+
+        if std::env::var_os(CHILD).is_some() {
+            eprintln!("wrapper remained attached");
+            io::stderr().flush().unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let game_dir = temp.path().join("managed-game");
+        fs::create_dir(&game_dir).unwrap();
+        let specification = process::LaunchSpec {
+            program: std::env::current_exe().unwrap(),
+            args: vec!["--exact".into(), TEST.into(), "--nocapture".into()],
+            cwd: std::env::current_dir().unwrap(),
+            env: vec![(CHILD.into(), "1".into())],
+            error: None,
+        };
+        let launcher = launch_crossover(&specification, false).unwrap();
+
+        let started = Instant::now();
+        let error =
+            supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(1)).unwrap_err();
+        assert!(error.contains("within 1 second"));
+        assert!(error.contains("attached wrapper remained alive"));
+        assert!(error.contains("was stopped"));
+        assert!(error.contains("launch is no longer pending"));
+        assert!(error.contains("CrossOver stderr"));
+        assert!(error.contains("wrapper remained attached"));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

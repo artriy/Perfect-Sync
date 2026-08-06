@@ -40,7 +40,14 @@
   startup deadline, excluding both Perl and `winewrapper.exe` dispatchers from
   readiness checks. Slow cold bottles remain pending beyond 30 seconds; dispatcher
   failures and real timeouts clear pending state so repeat launch can retry. CrossOver
-  Epic launches use the same watchdog.
+  Epic launches use the same watchdog, retain the starter's input pipe, and submit Enter
+  after readiness or cleanup so the console helper cannot remain blocked.
+- Recognize CrossOver's default `Y:` home mapping, custom drive letters, NT Unix paths,
+  and macOS `winetemp` loader links without falling back to a global process-name match;
+  ambiguous processes must hold the selected managed executable according to `lsof`.
+- Continuously drain CrossOver output into bounded 8 KiB tails and include redacted
+  wrapper status, stdout, and stderr when startup fails instead of returning an opaque
+  five-minute timeout.
 - Turn the running-state launch control into a scoped Stop button that terminates only
   that profile's process tree, and refresh status after a rejected launch so the Stop
   action appears immediately for a late-starting process.

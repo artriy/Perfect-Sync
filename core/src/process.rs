@@ -352,15 +352,14 @@ pub fn try_is_game_dir_running(game_dir: &Path) -> io::Result<bool> {
     }
     #[cfg(not(windows))]
     {
-        Ok(!unix_game_pids(&unix_process_output()?.stdout, &executable, false).is_empty())
+        Ok(!unix_game_pids_from_system(&executable, false)?.is_empty())
     }
 }
 
 #[cfg(any(not(windows), test))]
 fn is_crossover_dispatcher(command_line: &str) -> bool {
     let normalized = command_line.replace('\\', "/").to_ascii_lowercase();
-    normalized.contains("/contents/sharedsupport/crossover/")
-        && (normalized.contains("/wine --bottle") || normalized.contains("winewrapper.exe"))
+    normalized.contains("/wine --bottle") || normalized.contains("winewrapper.exe")
 }
 
 #[cfg(any(not(windows), test))]
@@ -375,27 +374,180 @@ fn unix_process(line: &str) -> Option<(u32, &str)> {
 }
 
 #[cfg(any(not(windows), test))]
-fn unix_game_pids(output: &[u8], executable: &Path, include_dispatchers: bool) -> Vec<u32> {
-    let expected = executable.to_string_lossy();
-    let wine_path = expected
-        .strip_prefix('/')
-        .map(|path| format!(r"Z:\{}", path.replace('/', "\\")));
+fn is_argument_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || matches!(byte, b'\'' | b'"')
+}
+
+#[cfg(any(not(windows), test))]
+fn contains_exact_argument(command_line: &str, argument: &str) -> bool {
+    command_line.match_indices(argument).any(|(start, _)| {
+        (start == 0 || is_argument_boundary(command_line.as_bytes()[start - 1]))
+            && (start + argument.len() == command_line.len()
+                || is_argument_boundary(command_line.as_bytes()[start + argument.len()]))
+    })
+}
+
+#[cfg(any(not(windows), test))]
+fn command_line_matches_executable(command_line: &str, executable: &Path) -> bool {
+    let command_line = command_line.replace('\\', "/");
+    let expected = executable.to_string_lossy().replace('\\', "/");
+    if contains_exact_argument(&command_line, &expected) {
+        return true;
+    }
+    let Some(relative) = expected.strip_prefix('/') else {
+        return false;
+    };
+    for prefix in ["//?/unix/", "//??/unix/", "/??/unix/"] {
+        if contains_exact_argument(&command_line, &format!("{prefix}{relative}")) {
+            return true;
+        }
+    }
+    let drive_suffix = format!(":/{relative}");
+    command_line.match_indices(&drive_suffix).any(|(colon, _)| {
+        let Some(drive) = colon.checked_sub(1) else {
+            return false;
+        };
+        if !command_line.as_bytes()[drive].is_ascii_alphabetic() {
+            return false;
+        }
+        let drive_has_boundary = drive == 0
+            || is_argument_boundary(command_line.as_bytes()[drive - 1])
+            || command_line[..drive].ends_with("//?/")
+            || command_line[..drive].ends_with("//??/");
+        drive_has_boundary
+            && (colon + drive_suffix.len() == command_line.len()
+                || is_argument_boundary(command_line.as_bytes()[colon + drive_suffix.len()]))
+    })
+}
+
+#[cfg(any(not(windows), test))]
+fn command_line_has_game_name(command_line: &str) -> bool {
+    let command_line = command_line.replace('\\', "/").to_ascii_lowercase();
+    let game_name = GAME_EXE.to_ascii_lowercase();
+    command_line.match_indices(&game_name).any(|(start, _)| {
+        (start == 0
+            || command_line.as_bytes()[start - 1] == b'/'
+            || is_argument_boundary(command_line.as_bytes()[start - 1]))
+            && (start + game_name.len() == command_line.len()
+                || is_argument_boundary(command_line.as_bytes()[start + game_name.len()]))
+    })
+}
+
+#[cfg(any(not(windows), test))]
+fn unix_game_pids_with_exact_files(
+    output: &[u8],
+    executable: &Path,
+    include_dispatchers: bool,
+    exact_file_pids: &[u32],
+) -> Vec<u32> {
     String::from_utf8_lossy(output)
         .lines()
         .filter_map(|line| {
             let (pid, command_line) = unix_process(line)?;
-            let executable_matches = command_line.contains(expected.as_ref())
-                || wine_path
-                    .as_deref()
-                    .is_some_and(|path| command_line.contains(path));
-            if !executable_matches
-                || (!include_dispatchers && is_crossover_dispatcher(command_line))
+            let dispatcher = is_crossover_dispatcher(command_line);
+            let executable_matches = command_line_matches_executable(command_line, executable);
+            let exact_file_matches =
+                exact_file_pids.contains(&pid) && command_line_has_game_name(command_line);
+            if (!executable_matches && !exact_file_matches) || (!include_dispatchers && dispatcher)
             {
                 return None;
             }
             Some(pid)
         })
         .collect()
+}
+
+#[cfg(any(all(not(windows), not(target_os = "macos")), test))]
+fn unix_game_pids(output: &[u8], executable: &Path, include_dispatchers: bool) -> Vec<u32> {
+    unix_game_pids_with_exact_files(output, executable, include_dispatchers, &[])
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn lsof_process_ids(output: &[u8]) -> Vec<u32> {
+    let mut process_ids = Vec::new();
+    for line in String::from_utf8_lossy(output).lines() {
+        let Some(process_id) = line
+            .strip_prefix('p')
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !process_ids.contains(&process_id) {
+            process_ids.push(process_id);
+        }
+    }
+    process_ids
+}
+
+#[cfg(target_os = "macos")]
+fn macos_processes_with_exact_file(executable: &Path, candidates: &[u32]) -> io::Result<Vec<u32>> {
+    const PID_BATCH_SIZE: usize = 64;
+    let mut process_ids = Vec::new();
+    for batch in candidates.chunks(PID_BATCH_SIZE) {
+        let selected = batch
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let output = command("/usr/sbin/lsof")
+            .args(["-a", "-nP", "-Fp", "-p", &selected, "--"])
+            .arg(executable)
+            .output()?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(query_failed("lsof", &output));
+        }
+        for process_id in lsof_process_ids(&output.stdout) {
+            if !process_ids.contains(&process_id) {
+                process_ids.push(process_id);
+            }
+        }
+    }
+    Ok(process_ids)
+}
+
+#[cfg(not(windows))]
+fn unix_game_pids_from_system(
+    executable: &Path,
+    include_dispatchers: bool,
+) -> io::Result<Vec<u32>> {
+    let output = unix_process_output()?;
+    #[cfg(target_os = "macos")]
+    {
+        let direct =
+            unix_game_pids_with_exact_files(&output.stdout, executable, include_dispatchers, &[]);
+        let candidates = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(unix_process)
+            .filter(|(_, command_line)| {
+                command_line_has_game_name(command_line)
+                    && !command_line_matches_executable(command_line, executable)
+                    && (include_dispatchers || !is_crossover_dispatcher(command_line))
+            })
+            .map(|(pid, _)| pid)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(direct);
+        }
+        let exact_file_pids = match macos_processes_with_exact_file(executable, &candidates) {
+            Ok(process_ids) => process_ids,
+            Err(_) if !direct.is_empty() => return Ok(direct),
+            Err(error) => return Err(error),
+        };
+        Ok(unix_game_pids_with_exact_files(
+            &output.stdout,
+            executable,
+            include_dispatchers,
+            &exact_file_pids,
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(unix_game_pids(
+            &output.stdout,
+            executable,
+            include_dispatchers,
+        ))
+    }
 }
 
 #[cfg(not(windows))]
@@ -439,7 +591,7 @@ pub fn terminate_game_dir(game_dir: &Path) -> io::Result<bool> {
     }
     #[cfg(not(windows))]
     {
-        let processes = unix_game_pids(&unix_process_output()?.stdout, &executable, true);
+        let processes = unix_game_pids_from_system(&executable, true)?;
         if processes.is_empty() {
             return Ok(false);
         }
@@ -453,7 +605,7 @@ pub fn terminate_game_dir(game_dir: &Path) -> io::Result<bool> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut remaining;
         loop {
-            remaining = unix_game_pids(&unix_process_output()?.stdout, &executable, true);
+            remaining = unix_game_pids_from_system(&executable, true)?;
             if remaining.is_empty() {
                 return Ok(true);
             }
@@ -468,7 +620,7 @@ pub fn terminate_game_dir(game_dir: &Path) -> io::Result<bool> {
                 termination_error = Some(query_failed("kill", &output));
             }
         }
-        if !unix_game_pids(&unix_process_output()?.stdout, &executable, true).is_empty() {
+        if !unix_game_pids_from_system(&executable, true)?.is_empty() {
             return Err(termination_error
                 .unwrap_or_else(|| io::Error::other("Among Us did not stop after SIGKILL")));
         }
@@ -587,6 +739,58 @@ mod query_tests {
     }
 
     #[test]
+    fn unix_process_matching_accepts_exact_crossover_path_forms() {
+        let game = Path::new("/Users/u/Perfect Sync/Main/current/Among Us.exe");
+        let output = concat!(
+            "  201 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader y:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
+            "  202 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader z:\\users\\u\\perfect sync\\main\\current\\among us.exe\n",
+            "  203 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader \\\\?\\unix\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
+            "  204 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader \\??\\unix\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
+            "  205 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader \\\\?\\Y:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
+            "  206 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Z:\\Users\\u\\Perfect Sync\\Other\\current\\Among Us.exe\n",
+            "  207 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe.backup\n",
+            "  208 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Y:\\Perfect Sync\\Main\\current\\Among Us.exe\n",
+            "  209 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Y:\\Perfect Sync\\Other\\current\\Among Us.exe\n",
+        );
+
+        assert_eq!(
+            unix_game_pids(output.as_bytes(), game, false),
+            vec![201, 203, 204, 205]
+        );
+        assert_eq!(
+            unix_game_pids_with_exact_files(output.as_bytes(), game, false, &[202, 208]),
+            vec![201, 202, 203, 204, 205, 208]
+        );
+    }
+
+    #[test]
+    fn unix_process_matching_requires_exact_file_evidence_for_descriptive_link() {
+        let game = Path::new("/Users/u/Perfect Sync/Main/current/Among Us.exe");
+        let output = concat!(
+            "  301 S  /var/folders/a/winetemp-123/Among Us.exe Among Us.exe\n",
+            "  302 S  /var/folders/a/winetemp-123/Among Us.exe Among Us.exe\n",
+            "  303 Z  /var/folders/a/winetemp-123/Among Us.exe Among Us.exe\n",
+            "  304 S  /opt/cxoffice/bin/wine --bottle AU --wait-children -- Among Us.exe\n",
+        );
+
+        assert!(unix_game_pids(output.as_bytes(), game, false).is_empty());
+        assert_eq!(
+            unix_game_pids_with_exact_files(output.as_bytes(), game, false, &[301]),
+            vec![301]
+        );
+        assert_eq!(
+            unix_game_pids_with_exact_files(output.as_bytes(), game, true, &[301, 304]),
+            vec![301, 304]
+        );
+    }
+
+    #[test]
+    fn lsof_process_id_fields_are_bounded_to_valid_unique_pids() {
+        let output = b"p301\nfcwd\nn/Users/u/Perfect Sync/Main/current\np301\np302\npnot-a-pid\n";
+        assert_eq!(lsof_process_ids(output), vec![301, 302]);
+    }
+
+    #[test]
     fn unix_process_matching_ignores_crossover_dispatch_wrapper() {
         let game = Path::new("/Users/u/Perfect Sync/Main/current/Among Us.exe");
         let output = concat!(
@@ -596,6 +800,8 @@ mod query_tests {
             "  104 R  /usr/bin/wine64 /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
             "  105 Z  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
             "  106 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader C:\\windows\\system32\\winewrapper.exe --wait-children Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
+            "  107 S  /opt/cxoffice/bin/wine --bottle AU --wait-children -- /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
+            "  108 S  /opt/cxoffice/lib/wine/x86_64-unix/wineloader C:\\windows\\system32\\winewrapper.exe --wait-children Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
         );
 
         assert_eq!(
@@ -604,7 +810,7 @@ mod query_tests {
         );
         assert_eq!(
             unix_game_pids(output.as_bytes(), game, true),
-            vec![101, 102, 104, 106]
+            vec![101, 102, 104, 106, 107, 108]
         );
     }
 }
