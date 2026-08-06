@@ -85,6 +85,7 @@ const MAX_PROFILE_RECOVERY_JOURNAL_BYTES: u64 = 1_024;
 const MAX_RECURSIVE_COPY_FILES: usize = 200_000;
 const MAX_RECURSIVE_COPY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_ERROR_LOG_BYTES: u64 = 256 * 1024 * 1024;
+const CROSSOVER_GAME_START_TIMEOUT: Duration = Duration::from_secs(300);
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LAUNCH_PENDING: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -203,7 +204,7 @@ fn workspace_is_stopped(workspace_id: &str) -> Result<(), String> {
     match process::try_is_game_dir_running(&game_dir) {
         Ok(false) => Ok(()),
         Ok(true) => Err(
-            "This profile is running. Close its Among Us instance before changing its workspace."
+            "This profile is running. Use Stop in Perfect Sync, or close its Among Us window, before changing its workspace."
                 .into(),
         ),
         Err(error) => Err(format!(
@@ -313,20 +314,106 @@ fn spawn_launch(
     Ok(())
 }
 
-fn wait_for_game_start(game_dir: &Path, timeout: Duration) -> Result<bool, String> {
+fn wait_for_game_start(
+    game_dir: &Path,
+    timeout: Duration,
+    mut poll_launcher: impl FnMut() -> Result<(), String>,
+) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
+    let mut poll_interval = Duration::from_millis(100);
     loop {
+        poll_launcher()?;
         match process::try_is_game_dir_running(game_dir) {
             Ok(true) => return Ok(true),
-            Ok(false) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
+            Ok(false) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(poll_interval.min(deadline - now));
+                poll_interval = (poll_interval + poll_interval).min(Duration::from_secs(1));
             }
-            Ok(false) => return Ok(false),
             Err(error) => {
                 return Err(format!(
                     "Could not verify whether CrossOver started Among Us: {error}"
                 ));
             }
+        }
+    }
+}
+
+fn stop_crossover_launcher(launcher: &mut std::process::Child) -> Result<(), String> {
+    if launcher
+        .try_wait()
+        .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    launcher.kill().map_err(|error| {
+        format!("CrossOver's launcher was still running and could not be closed: {error}")
+    })?;
+    launcher
+        .wait()
+        .map_err(|error| format!("Could not finish closing CrossOver's launcher: {error}"))?;
+    Ok(())
+}
+fn supervise_crossover_launch(
+    mut launcher: std::process::Child,
+    game_dir: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let launch_result = wait_for_game_start(game_dir, timeout, || {
+        let Some(status) = launcher
+            .try_wait()
+            .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?
+        else {
+            return Ok(());
+        };
+        if status.success() {
+            Err(
+                "CrossOver's attached launch process ended before the exact managed Among Us process became ready."
+                    .into(),
+            )
+        } else {
+            Err(format!(
+                "CrossOver could not start Among Us ({status}). Verify the selected bottle and CrossOver installation, then retry."
+            ))
+        }
+    });
+
+    match launch_result {
+        Ok(true) => {
+            match launcher
+                .try_wait()
+                .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?
+            {
+                Some(status) if !status.success() => {
+                    return Err(format!(
+                        "CrossOver could not start Among Us ({status}). Verify the selected bottle and CrossOver installation, then retry."
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    std::thread::spawn(move || {
+                        let _ = launcher.wait();
+                    });
+                }
+            }
+            Ok(())
+        }
+        Ok(false) => {
+            stop_crossover_launcher(&mut launcher)?;
+            Err(
+                "Perfect Sync did not detect the exact managed Among Us process within 5 minutes. The launch is no longer pending. If this profile later appears as running, stop it in Perfect Sync before retrying."
+                    .into(),
+            )
+        }
+        Err(error) => {
+            if let Err(cleanup_error) = stop_crossover_launcher(&mut launcher) {
+                return Err(format!("{error}. {cleanup_error}"));
+            }
+            Err(error)
         }
     }
 }
@@ -7139,9 +7226,13 @@ fn launch_prepared_game(
         }
         let specification = compat::build_program_spec(&starter, game_dir, &context);
         return spawn_launch(workspace_id, || {
-            process::launch_interactive(&specification)
-                .map(|_| ())
-                .map_err(|error| launch_err_msg(&context, &error))
+            let launcher = process::launch_interactive(&specification)
+                .map_err(|error| launch_err_msg(&context, &error))?;
+            if context.runtime == Runtime::Crossover {
+                supervise_crossover_launch(launcher, game_dir, CROSSOVER_GAME_START_TIMEOUT)
+            } else {
+                Ok(())
+            }
         });
     }
     if store == Store::Msstore {
@@ -7160,45 +7251,9 @@ fn launch_prepared_game(
     let specification = compat::build_launch_spec(game_dir, &context);
     if context.runtime == Runtime::Crossover {
         return spawn_launch(workspace_id, || {
-            let mut launcher = process::launch(&specification)
+            let launcher = process::launch(&specification)
                 .map_err(|error| launch_err_msg(&context, &error))?;
-            let dispatch_deadline = Instant::now() + Duration::from_secs(15);
-            loop {
-                if let Some(status) = launcher.try_wait().map_err(|error| {
-                    format!("Could not verify CrossOver's launch result: {error}")
-                })? {
-                    if !status.success() {
-                        return Err(format!(
-                            "CrossOver could not dispatch Among Us ({status}). Open the selected bottle in CrossOver, close any remaining Wine processes, then retry."
-                        ));
-                    }
-                    break;
-                }
-                if Instant::now() >= dispatch_deadline {
-                    launcher.kill().map_err(|error| {
-                        format!("CrossOver's launcher stopped responding and could not be closed: {error}")
-                    })?;
-                    launcher.wait().map_err(|error| {
-                        format!(
-                            "Could not finish closing CrossOver's unresponsive launcher: {error}"
-                        )
-                    })?;
-                    return Err(
-                        "CrossOver did not finish dispatching Among Us within 15 seconds. Open the selected bottle in CrossOver, close any remaining Wine processes, then retry."
-                            .into(),
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-
-            if wait_for_game_start(game_dir, Duration::from_secs(30))? {
-                Ok(())
-            } else {
-                Err(
-                    "CrossOver finished dispatching, but Among Us did not start within 30 seconds. Open the selected bottle in CrossOver once, then retry."
-                        .into(),
-                )
-            }
+            supervise_crossover_launch(launcher, game_dir, CROSSOVER_GAME_START_TIMEOUT)
         });
     }
     spawn_launch(workspace_id, || {
@@ -7233,6 +7288,8 @@ pub async fn launch_profile(
             "finalizing",
             if instance.store == Store::Epic {
                 "Waiting for Epic authentication and Among Us startup. Complete sign-in in EpicGamesStarter if prompted."
+            } else if instance.runtime == Runtime::Crossover {
+                "Starting Among Us through CrossOver. Cold bottles can take up to five minutes."
             } else {
                 "Starting Among Us"
             },
@@ -7263,6 +7320,8 @@ pub async fn launch_vanilla(
             "finalizing",
             if instance.store == Store::Epic {
                 "Waiting for Epic authentication and vanilla Among Us startup. Complete sign-in in EpicGamesStarter if prompted."
+            } else if instance.runtime == Runtime::Crossover {
+                "Starting vanilla Among Us through CrossOver. Cold bottles can take up to five minutes."
             } else {
                 "Starting vanilla Among Us"
             },
@@ -9764,10 +9823,69 @@ mod tests {
     }
 
     #[test]
-    fn failed_repeat_launch_clears_pending_running_state() {
+    fn crossover_allows_five_minutes_for_cold_bottle_startup() {
+        assert_eq!(CROSSOVER_GAME_START_TIMEOUT, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn crossover_supervisor_waits_for_delayed_exact_game_process() {
+        const ROLE: &str = "PERFECT_SYNC_CROSSOVER_SUPERVISOR_ROLE";
+        const TEST: &str =
+            "commands::tests::crossover_supervisor_waits_for_delayed_exact_game_process";
+
+        if let Ok(role) = std::env::var(ROLE) {
+            match role.as_str() {
+                "launcher" | "game" => std::thread::sleep(Duration::from_secs(1)),
+                "exited" => {}
+                _ => panic!("unexpected CrossOver supervisor role"),
+            }
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let game_dir = temp.path().join("managed-game");
+        fs::create_dir(&game_dir).unwrap();
+        let game_executable = game_dir.join(process::GAME_EXE);
+        fs::copy(std::env::current_exe().unwrap(), &game_executable).unwrap();
+
+        let launcher = process::command(std::env::current_exe().unwrap())
+            .env(ROLE, "launcher")
+            .args(["--exact", TEST, "--nocapture"])
+            .spawn()
+            .unwrap();
+        let delayed_game = std::thread::spawn({
+            let game_executable = game_executable.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                process::command(game_executable)
+                    .env(ROLE, "game")
+                    .args(["--exact", TEST, "--nocapture"])
+                    .spawn()
+                    .unwrap()
+            }
+        });
+
+        supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(3)).unwrap();
+        let mut game = delayed_game.join().unwrap();
+        assert!(game.wait().unwrap().success());
+
+        let exited_launcher = process::command(std::env::current_exe().unwrap())
+            .env(ROLE, "exited")
+            .args(["--exact", TEST, "--nocapture"])
+            .spawn()
+            .unwrap();
+        let exit_started = Instant::now();
+        let error = supervise_crossover_launch(exited_launcher, &game_dir, Duration::from_secs(3))
+            .unwrap_err();
+        assert!(error.contains("ended before the exact managed Among Us process"));
+        assert!(exit_started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn crossover_failures_clear_pending_for_repeat_launch() {
         const CHILD: &str = "PERFECT_SYNC_REPEAT_LAUNCH_CHILD";
         const ROOT: &str = "PERFECT_SYNC_REPEAT_LAUNCH_ROOT";
-        const TEST: &str = "commands::tests::failed_repeat_launch_clears_pending_running_state";
+        const TEST: &str = "commands::tests::crossover_failures_clear_pending_for_repeat_launch";
 
         if std::env::var_os(CHILD).is_some() {
             settings::initialize_managed_data_dir(PathBuf::from(std::env::var_os(ROOT).unwrap()))
@@ -9775,14 +9893,38 @@ mod tests {
             let game_dir = managed_instance::workspace_game_dir("repeat-profile").unwrap();
             fs::create_dir_all(&game_dir).unwrap();
 
-            for _ in 0..2 {
-                assert_eq!(
-                    spawn_launch("repeat-profile", || Err("dispatch failed".into())).unwrap_err(),
-                    "dispatch failed"
-                );
-                assert!(!launch_pending("repeat-profile").unwrap());
-                assert!(!wait_for_game_start(&game_dir, Duration::ZERO).unwrap());
-            }
+            assert_eq!(
+                spawn_launch("repeat-profile", || {
+                    wait_for_game_start(&game_dir, Duration::from_secs(1), || {
+                        Err("dispatch failed".into())
+                    })
+                    .map(|_| ())
+                })
+                .unwrap_err(),
+                "dispatch failed"
+            );
+            assert!(!launch_pending("repeat-profile").unwrap());
+
+            assert_eq!(
+                spawn_launch("repeat-profile", || {
+                    assert!(launch_pending("repeat-profile").unwrap());
+                    if wait_for_game_start(&game_dir, Duration::ZERO, || Ok(()))? {
+                        Ok(())
+                    } else {
+                        Err("game start timed out".into())
+                    }
+                })
+                .unwrap_err(),
+                "game start timed out"
+            );
+            assert!(!launch_pending("repeat-profile").unwrap());
+
+            assert_eq!(
+                spawn_launch("repeat-profile", || Err("retry reached dispatcher".into()))
+                    .unwrap_err(),
+                "retry reached dispatcher"
+            );
+            assert!(!launch_pending("repeat-profile").unwrap());
             return;
         }
 

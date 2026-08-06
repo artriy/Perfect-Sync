@@ -475,7 +475,7 @@ fn add_crossover_runtime_args(args: &mut Vec<OsString>, inherited_override: Opti
         delimiter..delimiter,
         [
             OsString::from("--no-update"),
-            OsString::from("--no-wait"),
+            OsString::from("--wait-children"),
             OsString::from("--dll"),
             inherited_override.unwrap_or_else(|| OsString::from("winhttp=n,b")),
         ],
@@ -1010,7 +1010,7 @@ mod tests {
         let spec = build_launch_spec(game, &ctx);
         assert_eq!(
             &spec.args[..5],
-            ["--bottle", "AU", "--no-update", "--no-wait", "--dll"]
+            ["--bottle", "AU", "--no-update", "--wait-children", "--dll"]
         );
         assert_eq!(
             spec.args[5],
@@ -1032,7 +1032,7 @@ mod tests {
                 "--bottle",
                 "AU",
                 "--no-update",
-                "--no-wait",
+                "--wait-children",
                 "--dll",
                 "custom=n",
                 "--",

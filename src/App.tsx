@@ -1685,7 +1685,12 @@ export function App() {
       );
       return null;
     } catch (error) {
-      setRunningStatus({ profileId: profile.id, running: false, known: true });
+      try {
+        const running = await bridge.gameRunning(profile.id);
+        setRunningStatus({ profileId: profile.id, running, known: true });
+      } catch {
+        setRunningStatus({ profileId: profile.id, running: false, known: false });
+      }
       throw error;
     }
   };

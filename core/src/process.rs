@@ -360,8 +360,7 @@ pub fn try_is_game_dir_running(game_dir: &Path) -> io::Result<bool> {
 fn is_crossover_dispatcher(command_line: &str) -> bool {
     let normalized = command_line.replace('\\', "/").to_ascii_lowercase();
     normalized.contains("/contents/sharedsupport/crossover/")
-        && normalized.contains("/wine --bottle")
-        && !normalized.contains("/wineloader")
+        && (normalized.contains("/wine --bottle") || normalized.contains("winewrapper.exe"))
 }
 
 #[cfg(any(not(windows), test))]
@@ -591,11 +590,12 @@ mod query_tests {
     fn unix_process_matching_ignores_crossover_dispatch_wrapper() {
         let game = Path::new("/Users/u/Perfect Sync/Main/current/Among Us.exe");
         let output = concat!(
-            "  101 S  /usr/bin/perl /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine --bottle AU -- /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
+            "  101 S  /usr/bin/perl /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine --bottle AU --wait-children -- /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
             "  102 S+ /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
-            "  103 S  /usr/bin/perl /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine --bottle AU -- /Users/u/Perfect Sync/Other/current/Among Us.exe\n",
+            "  103 S  /usr/bin/perl /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine --bottle AU --wait-children -- /Users/u/Perfect Sync/Other/current/Among Us.exe\n",
             "  104 R  /usr/bin/wine64 /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
             "  105 Z  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
+            "  106 S  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader C:\\windows\\system32\\winewrapper.exe --wait-children Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
         );
 
         assert_eq!(
@@ -604,7 +604,7 @@ mod query_tests {
         );
         assert_eq!(
             unix_game_pids(output.as_bytes(), game, true),
-            vec![101, 102, 104]
+            vec![101, 102, 104, 106]
         );
     }
 }

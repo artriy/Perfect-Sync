@@ -33,15 +33,17 @@
   of the removed `cxrun` command; discover system, user, versioned, and `CX_ROOT`
   installations, preserve the selected bottle, and report a missing installation before
   attempting an unavailable command.
-- Start CrossOver with bottle updates disabled, dispatch without waiting, and pass the
-  `winhttp` override through CrossOver's supported command-line option so bottle
-  migrations cannot stall every profile launch and BepInEx receives its loader hook.
-- Reap CrossOver's short-lived dispatcher, ignore exited zombie processes when checking
-  running state, and keep launch progress open until the exact managed game process
-  appears. Early dispatcher exits and missing game startups now return an actionable
-  error instead of leaving the profile stuck as running.
+- Start CrossOver with bottle updates disabled, keep startup attached through its
+  `--wait-children` wrapper, and pass the `winhttp` override through CrossOver's
+  supported command-line option so BepInEx receives its loader hook.
+- Watch CrossOver's wrapper and exact managed game process under one five-minute
+  startup deadline, excluding both Perl and `winewrapper.exe` dispatchers from
+  readiness checks. Slow cold bottles remain pending beyond 30 seconds; dispatcher
+  failures and real timeouts clear pending state so repeat launch can retry. CrossOver
+  Epic launches use the same watchdog.
 - Turn the running-state launch control into a scoped Stop button that terminates only
-  that profile's process tree.
+  that profile's process tree, and refresh status after a rejected launch so the Stop
+  action appears immediately for a late-starting process.
 - Remove harmless macOS `.DS_Store` metadata from the managed workspace root during
   recovery; unexpected files and links now report their exact path and removal action.
 - Verify both x86 Steam and x64 Epic Town of Us workspaces against the exact release ZIP,
