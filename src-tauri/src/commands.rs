@@ -313,6 +313,24 @@ fn spawn_launch(
     Ok(())
 }
 
+fn wait_for_game_start(game_dir: &Path, timeout: Duration) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match process::try_is_game_dir_running(game_dir) {
+            Ok(true) => return Ok(true),
+            Ok(false) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(false) => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "Could not verify whether CrossOver started Among Us: {error}"
+                ));
+            }
+        }
+    }
+}
+
 fn unique_sibling(path: &Path, label: &str) -> Result<PathBuf, String> {
     let parent = path.parent().ok_or("path has no parent directory")?;
     let name = path
@@ -7140,6 +7158,49 @@ fn launch_prepared_game(
         }
     }
     let specification = compat::build_launch_spec(game_dir, &context);
+    if context.runtime == Runtime::Crossover {
+        return spawn_launch(workspace_id, || {
+            let mut launcher = process::launch(&specification)
+                .map_err(|error| launch_err_msg(&context, &error))?;
+            let dispatch_deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(status) = launcher.try_wait().map_err(|error| {
+                    format!("Could not verify CrossOver's launch result: {error}")
+                })? {
+                    if !status.success() {
+                        return Err(format!(
+                            "CrossOver could not dispatch Among Us ({status}). Open the selected bottle in CrossOver, close any remaining Wine processes, then retry."
+                        ));
+                    }
+                    break;
+                }
+                if Instant::now() >= dispatch_deadline {
+                    launcher.kill().map_err(|error| {
+                        format!("CrossOver's launcher stopped responding and could not be closed: {error}")
+                    })?;
+                    launcher.wait().map_err(|error| {
+                        format!(
+                            "Could not finish closing CrossOver's unresponsive launcher: {error}"
+                        )
+                    })?;
+                    return Err(
+                        "CrossOver did not finish dispatching Among Us within 15 seconds. Open the selected bottle in CrossOver, close any remaining Wine processes, then retry."
+                            .into(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            if wait_for_game_start(game_dir, Duration::from_secs(30))? {
+                Ok(())
+            } else {
+                Err(
+                    "CrossOver finished dispatching, but Among Us did not start within 30 seconds. Open the selected bottle in CrossOver once, then retry."
+                        .into(),
+                )
+            }
+        });
+    }
     spawn_launch(workspace_id, || {
         process::launch(&specification)
             .map(|_| ())
@@ -9701,6 +9762,45 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    #[test]
+    fn failed_repeat_launch_clears_pending_running_state() {
+        const CHILD: &str = "PERFECT_SYNC_REPEAT_LAUNCH_CHILD";
+        const ROOT: &str = "PERFECT_SYNC_REPEAT_LAUNCH_ROOT";
+        const TEST: &str = "commands::tests::failed_repeat_launch_clears_pending_running_state";
+
+        if std::env::var_os(CHILD).is_some() {
+            settings::initialize_managed_data_dir(PathBuf::from(std::env::var_os(ROOT).unwrap()))
+                .unwrap();
+            let game_dir = managed_instance::workspace_game_dir("repeat-profile").unwrap();
+            fs::create_dir_all(&game_dir).unwrap();
+
+            for _ in 0..2 {
+                assert_eq!(
+                    spawn_launch("repeat-profile", || Err("dispatch failed".into())).unwrap_err(),
+                    "dispatch failed"
+                );
+                assert!(!launch_pending("repeat-profile").unwrap());
+                assert!(!wait_for_game_start(&game_dir, Duration::ZERO).unwrap());
+            }
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let output = process::command(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .env(ROOT, root.path())
+            .args(["--exact", TEST, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn concurrent_profile_sessions_are_independent() {
         const COORDINATOR: &str = "PERFECT_SYNC_CONCURRENT_COORDINATOR";

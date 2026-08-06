@@ -365,6 +365,17 @@ fn is_crossover_dispatcher(command_line: &str) -> bool {
 }
 
 #[cfg(any(not(windows), test))]
+fn unix_process(line: &str) -> Option<(u32, &str)> {
+    let line = line.trim_start();
+    let (pid, rest) = line.split_once(char::is_whitespace)?;
+    let (state, command_line) = rest.trim_start().split_once(char::is_whitespace)?;
+    if state.starts_with('Z') {
+        return None;
+    }
+    Some((pid.parse().ok()?, command_line.trim_start()))
+}
+
+#[cfg(any(not(windows), test))]
 fn unix_game_pids(output: &[u8], executable: &Path, include_dispatchers: bool) -> Vec<u32> {
     let expected = executable.to_string_lossy();
     let wine_path = expected
@@ -373,9 +384,7 @@ fn unix_game_pids(output: &[u8], executable: &Path, include_dispatchers: bool) -
     String::from_utf8_lossy(output)
         .lines()
         .filter_map(|line| {
-            let line = line.trim_start();
-            let (pid, command_line) = line.split_once(char::is_whitespace)?;
-            let command_line = command_line.trim_start();
+            let (pid, command_line) = unix_process(line)?;
             let executable_matches = command_line.contains(expected.as_ref())
                 || wine_path
                     .as_deref()
@@ -385,7 +394,7 @@ fn unix_game_pids(output: &[u8], executable: &Path, include_dispatchers: bool) -
             {
                 return None;
             }
-            pid.parse().ok()
+            Some(pid)
         })
         .collect()
 }
@@ -393,7 +402,7 @@ fn unix_game_pids(output: &[u8], executable: &Path, include_dispatchers: bool) -
 #[cfg(not(windows))]
 fn unix_process_output() -> io::Result<Output> {
     let output = command("ps")
-        .args(["-axww", "-o", "pid=,command="])
+        .args(["-axww", "-o", "pid=,state=,command="])
         .output()?;
     if output.status.success() {
         Ok(output)
@@ -471,14 +480,22 @@ pub fn terminate_game_dir(game_dir: &Path) -> io::Result<bool> {
 /// Query whether Among Us is running. A helper failure is distinct from a
 /// successful query which found no matching process.
 pub fn try_is_running() -> io::Result<bool> {
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         interpret_tasklist(
             command("tasklist")
                 .args(["/FI", &format!("IMAGENAME eq {GAME_EXE}"), "/NH"])
                 .output(),
         )
-    } else {
-        interpret_pgrep(command("pgrep").args(["-f", GAME_EXE]).output())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(String::from_utf8_lossy(&unix_process_output()?.stdout)
+            .lines()
+            .filter_map(unix_process)
+            .any(|(_, command_line)| {
+                command_line.contains(GAME_EXE) && !is_crossover_dispatcher(command_line)
+            }))
     }
 }
 
@@ -498,21 +515,6 @@ fn interpret_tasklist(result: io::Result<Output>) -> io::Result<bool> {
     Ok(String::from_utf8_lossy(&output.stdout)
         .to_ascii_lowercase()
         .contains(&GAME_EXE.to_ascii_lowercase()))
-}
-
-fn pgrep_state(status_code: Option<i32>, has_output: bool) -> Option<bool> {
-    match status_code {
-        Some(0) => Some(has_output),
-        Some(1) => Some(false),
-        _ => None,
-    }
-}
-
-fn interpret_pgrep(result: io::Result<Output>) -> io::Result<bool> {
-    let output = result?;
-
-    pgrep_state(output.status.code(), !output.stdout.is_empty())
-        .ok_or_else(|| query_failed("pgrep", &output))
 }
 
 /// Compatibility wrapper for existing boolean callsites. Query failures are
@@ -573,21 +575,26 @@ mod query_tests {
     use super::*;
 
     #[test]
-    fn pgrep_distinguishes_absence_from_query_failure() {
-        assert_eq!(pgrep_state(Some(1), false), Some(false));
-        assert_eq!(pgrep_state(Some(0), true), Some(true));
-        assert_eq!(pgrep_state(Some(2), false), None);
-        assert_eq!(pgrep_state(None, false), None);
+    fn unix_process_matching_rejects_zombies() {
+        assert_eq!(
+            unix_process("  101 Z+ /usr/bin/wine Z:\\Games\\Among Us.exe"),
+            None
+        );
+        assert_eq!(
+            unix_process("  102 S+ /usr/bin/wine Z:\\Games\\Among Us.exe"),
+            Some((102, "/usr/bin/wine Z:\\Games\\Among Us.exe"))
+        );
     }
 
     #[test]
     fn unix_process_matching_ignores_crossover_dispatch_wrapper() {
         let game = Path::new("/Users/u/Perfect Sync/Main/current/Among Us.exe");
         let output = concat!(
-            "  101 /usr/bin/perl /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine --bottle AU -- /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
-            "  102 /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
-            "  103 /usr/bin/perl /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine --bottle AU -- /Users/u/Perfect Sync/Other/current/Among Us.exe\n",
-            "  104 /usr/bin/wine64 /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
+            "  101 S  /usr/bin/perl /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine --bottle AU -- /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
+            "  102 S+ /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
+            "  103 S  /usr/bin/perl /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine --bottle AU -- /Users/u/Perfect Sync/Other/current/Among Us.exe\n",
+            "  104 R  /usr/bin/wine64 /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
+            "  105 Z  /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
         );
 
         assert_eq!(

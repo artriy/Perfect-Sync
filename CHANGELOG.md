@@ -36,9 +36,12 @@
 - Start CrossOver with bottle updates disabled, dispatch without waiting, and pass the
   `winhttp` override through CrossOver's supported command-line option so bottle
   migrations cannot stall every profile launch and BepInEx receives its loader hook.
-- Distinguish CrossOver's short-lived launcher from the managed game process, keep the
-  workspace locked during startup, and turn the running-state launch control into a
-  scoped Stop button that terminates only that profile's process tree.
+- Reap CrossOver's short-lived dispatcher, ignore exited zombie processes when checking
+  running state, and keep launch progress open until the exact managed game process
+  appears. Early dispatcher exits and missing game startups now return an actionable
+  error instead of leaving the profile stuck as running.
+- Turn the running-state launch control into a scoped Stop button that terminates only
+  that profile's process tree.
 - Remove harmless macOS `.DS_Store` metadata from the managed workspace root during
   recovery; unexpected files and links now report their exact path and removal action.
 - Verify both x86 Steam and x64 Epic Town of Us workspaces against the exact release ZIP,
