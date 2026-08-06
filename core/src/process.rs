@@ -507,6 +507,7 @@ fn query_failed(helper: &str, output: &Output) -> io::Error {
     ))
 }
 
+#[cfg(windows)]
 fn interpret_tasklist(result: io::Result<Output>) -> io::Result<bool> {
     let output = result?;
     if !output.status.success() {
