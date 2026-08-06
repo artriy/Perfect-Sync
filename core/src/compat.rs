@@ -466,6 +466,22 @@ fn wine_environment(
     env
 }
 
+fn add_crossover_runtime_args(args: &mut Vec<OsString>, inherited_override: Option<OsString>) {
+    let delimiter = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    args.splice(
+        delimiter..delimiter,
+        [
+            OsString::from("--no-update"),
+            OsString::from("--no-wait"),
+            OsString::from("--dll"),
+            inherited_override.unwrap_or_else(|| OsString::from("winhttp=n,b")),
+        ],
+    );
+}
+
 /// Build a concrete launch invocation for an arbitrary Windows executable in a
 /// game directory. Epic's authentication helper uses this same runtime path.
 pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> LaunchSpec {
@@ -509,8 +525,12 @@ pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> L
             }
         }
         Runtime::Wine | Runtime::Crossover | Runtime::Whisky | Runtime::Bottles => {
-            let env = wine_environment(ctx, std::env::var_os("WINEDLLOVERRIDES"));
+            let inherited_override = std::env::var_os("WINEDLLOVERRIDES");
+            let env = wine_environment(ctx, inherited_override.clone());
             let mut args = ctx.launcher_args.clone();
+            if ctx.runtime == Runtime::Crossover {
+                add_crossover_runtime_args(&mut args, inherited_override);
+            }
             args.push(program.as_os_str().to_owned());
             let error = if ctx.runtime == Runtime::Crossover && ctx.launcher.is_none() {
                 Some(
@@ -988,9 +1008,36 @@ mod tests {
         ctx.prefix = Some(PathBuf::from("/CrossOver/Bottles/AU"));
         ctx.launcher_args = vec!["--bottle".into(), "AU".into(), "--".into()];
         let spec = build_launch_spec(game, &ctx);
-        assert_eq!(&spec.args[..3], ["--bottle", "AU", "--"]);
+        assert_eq!(
+            &spec.args[..5],
+            ["--bottle", "AU", "--no-update", "--no-wait", "--dll"]
+        );
+        assert_eq!(
+            spec.args[5],
+            std::env::var_os("WINEDLLOVERRIDES").unwrap_or_else(|| OsString::from("winhttp=n,b"))
+        );
+        assert_eq!(spec.args[6], "--");
+        assert_eq!(Path::new(&spec.args[7]), game.join(GAME_EXE));
         assert!(spec.program.ends_with("bin/wine"));
         assert!(spec.env.iter().any(|(k, v)| k == "CX_BOTTLE" && v == "AU"));
+    }
+
+    #[test]
+    fn crossover_runtime_args_preserve_inherited_dll_overrides() {
+        let mut args = vec!["--bottle".into(), "AU".into(), "--".into()];
+        add_crossover_runtime_args(&mut args, Some(OsString::from("custom=n")));
+        assert_eq!(
+            args,
+            [
+                "--bottle",
+                "AU",
+                "--no-update",
+                "--no-wait",
+                "--dll",
+                "custom=n",
+                "--",
+            ]
+        );
     }
 
     #[test]

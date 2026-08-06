@@ -1719,6 +1719,16 @@ export function App() {
     }
   };
 
+  const doStopProfile = async (profile: Profile) => {
+    try {
+      const stopped = await exclusive(() => bridge.stopGame(profile.id));
+      setRunningStatus({ profileId: profile.id, running: false, known: true });
+      notify(stopped ? "Among Us stopped" : "Among Us is no longer running");
+    } catch (error) {
+      if (error !== OPERATION_BUSY) notify(`Could not stop Among Us: ${messageFrom(error)}`, "error");
+    }
+  };
+
   const launchWarnInstall = async () => {
     const profile = launchWarn;
     if (!profile) return;
@@ -2163,6 +2173,7 @@ export function App() {
             onRename={(name) => void renameProfile(name)}
             onDelete={deleteActiveProfile}
             onLaunch={() => void doLaunchProfile(active)}
+          onStop={() => void doStopProfile(active)}
             onAddMod={openAddPanel}
             onReviewUpdates={() => {
               if (!busy) setUpdateReviewOpen(true);

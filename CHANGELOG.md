@@ -33,6 +33,14 @@
   of the removed `cxrun` command; discover system, user, versioned, and `CX_ROOT`
   installations, preserve the selected bottle, and report a missing installation before
   attempting an unavailable command.
+- Start CrossOver with bottle updates disabled, dispatch without waiting, and pass the
+  `winhttp` override through CrossOver's supported command-line option so bottle
+  migrations cannot stall every profile launch and BepInEx receives its loader hook.
+- Distinguish CrossOver's short-lived launcher from the managed game process, keep the
+  workspace locked during startup, and turn the running-state launch control into a
+  scoped Stop button that terminates only that profile's process tree.
+- Remove harmless macOS `.DS_Store` metadata from the managed workspace root during
+  recovery; unexpected files and links now report their exact path and removal action.
 - Verify both x86 Steam and x64 Epic Town of Us workspaces against the exact release ZIP,
   including `MiraAPI.dll`, `touhats.bundle`, and `touhats.catalog`.
 - Repair relocated Epic source metadata from durable folder evidence, expose an explicit

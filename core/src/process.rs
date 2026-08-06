@@ -10,6 +10,8 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+#[cfg(any(not(windows), test))]
+use std::time::{Duration, Instant};
 
 pub const GAME_EXE: &str = "Among Us.exe";
 
@@ -231,7 +233,12 @@ fn windows_path_key(path: &Path) -> String {
 }
 
 #[cfg(windows)]
-fn running_game_paths() -> io::Result<Vec<PathBuf>> {
+struct RunningGameProcess {
+    pid: u32,
+    path: PathBuf,
+}
+
+fn running_game_processes() -> io::Result<Vec<RunningGameProcess>> {
     use std::os::windows::ffi::OsStringExt;
 
     type Handle = *mut std::ffi::c_void;
@@ -314,7 +321,10 @@ fn running_game_paths() -> io::Result<Vec<PathBuf>> {
                     QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size)
                 };
                 if queried != 0 {
-                    paths.push(PathBuf::from(OsString::from_wide(&buffer[..size as usize])));
+                    paths.push(RunningGameProcess {
+                        pid: entry.th32ProcessID,
+                        path: PathBuf::from(OsString::from_wide(&buffer[..size as usize])),
+                    });
                 }
                 // SAFETY: `process` is a live handle returned by OpenProcess.
                 unsafe { CloseHandle(process) };
@@ -335,18 +345,125 @@ pub fn try_is_game_dir_running(game_dir: &Path) -> io::Result<bool> {
     #[cfg(windows)]
     {
         let expected = windows_path_key(&executable);
-        Ok(running_game_paths()?
+        Ok(running_game_processes()?
             .iter()
-            .any(|path| windows_path_key(path) == expected))
+            .any(|process| windows_path_key(&process.path) == expected))
     }
     #[cfg(not(windows))]
     {
-        let output = command("ps").args(["-ax", "-o", "command="]).output()?;
-        if !output.status.success() {
-            return Err(query_failed("ps", &output));
+        Ok(!unix_game_pids(&unix_process_output()?.stdout, &executable, false).is_empty())
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn is_crossover_dispatcher(command_line: &str) -> bool {
+    let normalized = command_line.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/contents/sharedsupport/crossover/")
+        && normalized.contains("/wine --bottle")
+        && !normalized.contains("/wineloader")
+}
+
+#[cfg(any(not(windows), test))]
+fn unix_game_pids(output: &[u8], executable: &Path, include_dispatchers: bool) -> Vec<u32> {
+    let expected = executable.to_string_lossy();
+    let wine_path = expected
+        .strip_prefix('/')
+        .map(|path| format!(r"Z:\{}", path.replace('/', "\\")));
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid, command_line) = line.split_once(char::is_whitespace)?;
+            let command_line = command_line.trim_start();
+            let executable_matches = command_line.contains(expected.as_ref())
+                || wine_path
+                    .as_deref()
+                    .is_some_and(|path| command_line.contains(path));
+            if !executable_matches
+                || (!include_dispatchers && is_crossover_dispatcher(command_line))
+            {
+                return None;
+            }
+            pid.parse().ok()
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn unix_process_output() -> io::Result<Output> {
+    let output = command("ps")
+        .args(["-axww", "-o", "pid=,command="])
+        .output()?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(query_failed("ps", &output))
+    }
+}
+
+pub fn terminate_game_dir(game_dir: &Path) -> io::Result<bool> {
+    let executable = game_dir.join(GAME_EXE);
+    #[cfg(windows)]
+    {
+        let expected = windows_path_key(&executable);
+        let processes = running_game_processes()?
+            .into_iter()
+            .filter(|process| windows_path_key(&process.path) == expected)
+            .collect::<Vec<_>>();
+        if processes.is_empty() {
+            return Ok(false);
         }
-        let expected = executable.to_string_lossy();
-        Ok(String::from_utf8_lossy(&output.stdout).contains(expected.as_ref()))
+        let mut termination_error = None;
+        for process in processes {
+            let output = command("taskkill")
+                .args(["/PID", &process.pid.to_string(), "/T", "/F"])
+                .output()?;
+            if !output.status.success() {
+                termination_error = Some(query_failed("taskkill", &output));
+            }
+        }
+        if try_is_game_dir_running(game_dir)? {
+            return Err(termination_error
+                .unwrap_or_else(|| io::Error::other("Among Us did not stop after taskkill")));
+        }
+        Ok(true)
+    }
+    #[cfg(not(windows))]
+    {
+        let processes = unix_game_pids(&unix_process_output()?.stdout, &executable, true);
+        if processes.is_empty() {
+            return Ok(false);
+        }
+        let mut termination_error = None;
+        for pid in processes {
+            let output = command("kill").args(["-TERM", &pid.to_string()]).output()?;
+            if !output.status.success() {
+                termination_error = Some(query_failed("kill", &output));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut remaining;
+        loop {
+            remaining = unix_game_pids(&unix_process_output()?.stdout, &executable, true);
+            if remaining.is_empty() {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        for pid in remaining {
+            let output = command("kill").args(["-KILL", &pid.to_string()]).output()?;
+            if !output.status.success() {
+                termination_error = Some(query_failed("kill", &output));
+            }
+        }
+        if !unix_game_pids(&unix_process_output()?.stdout, &executable, true).is_empty() {
+            return Err(termination_error
+                .unwrap_or_else(|| io::Error::other("Among Us did not stop after SIGKILL")));
+        }
+        Ok(true)
     }
 }
 
@@ -461,11 +578,61 @@ mod query_tests {
         assert_eq!(pgrep_state(Some(2), false), None);
         assert_eq!(pgrep_state(None, false), None);
     }
+
+    #[test]
+    fn unix_process_matching_ignores_crossover_dispatch_wrapper() {
+        let game = Path::new("/Users/u/Perfect Sync/Main/current/Among Us.exe");
+        let output = concat!(
+            "  101 /usr/bin/perl /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine --bottle AU -- /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
+            "  102 /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wineloader Z:\\Users\\u\\Perfect Sync\\Main\\current\\Among Us.exe\n",
+            "  103 /usr/bin/perl /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine --bottle AU -- /Users/u/Perfect Sync/Other/current/Among Us.exe\n",
+            "  104 /usr/bin/wine64 /Users/u/Perfect Sync/Main/current/Among Us.exe\n",
+        );
+
+        assert_eq!(
+            unix_game_pids(output.as_bytes(), game, false),
+            vec![102, 104]
+        );
+        assert_eq!(
+            unix_game_pids(output.as_bytes(), game, true),
+            vec![101, 102, 104]
+        );
+    }
 }
 
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminate_game_dir_stops_only_the_matching_game_executable() {
+        const CHILD: &str = "PERFECT_SYNC_TERMINATE_GAME_CHILD";
+        const TEST: &str =
+            "process::tests::terminate_game_dir_stops_only_the_matching_game_executable";
+
+        if std::env::var_os(CHILD).is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+
+        let game_dir = tempfile::tempdir().unwrap();
+        let game_executable = game_dir.path().join(GAME_EXE);
+        std::fs::copy(std::env::current_exe().unwrap(), &game_executable).unwrap();
+        let mut game = Command::new(&game_executable)
+            .env(CHILD, "1")
+            .args(["--exact", TEST, "--nocapture"])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !try_is_game_dir_running(game_dir.path()).unwrap() {
+            assert!(Instant::now() < deadline, "game process was not detected");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(terminate_game_dir(game_dir.path()).unwrap());
+        assert!(!try_is_game_dir_running(game_dir.path()).unwrap());
+        game.wait().unwrap();
+    }
 
     const NO_CONSOLE_CHILD: &str = "PERFECT_SYNC_NO_CONSOLE_CHILD";
     const INTERACTIVE_CONSOLE_CHILD: &str = "PERFECT_SYNC_INTERACTIVE_CONSOLE_CHILD";

@@ -2836,6 +2836,21 @@ pub async fn game_running(profile_id: String) -> Result<bool, String> {
     .await
 }
 
+#[tauri::command]
+pub async fn stop_game(profile_id: String) -> Result<bool, String> {
+    blocking(move || {
+        validate_profile_id(&profile_id)?;
+        let game_dir = managed_instance::workspace_game_dir(&profile_id)?;
+        let stopped = process::terminate_game_dir(&game_dir).map_err(|error| error.to_string())?;
+        let launching = LAUNCH_PENDING
+            .lock()
+            .map_err(|_| "launch-session lock is poisoned".to_string())?
+            .remove(&profile_id);
+        Ok(stopped || launching)
+    })
+    .await
+}
+
 // ---------- catalog ----------
 
 #[derive(Serialize, Deserialize, Clone)]

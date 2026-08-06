@@ -866,6 +866,11 @@ export async function gameRunning(profileId: string): Promise<boolean> {
   return browserRunning.has(profileId);
 }
 
+export async function stopGame(profileId: string): Promise<boolean> {
+  if (inTauri) return invoke<boolean>("stop_game", { profileId });
+  return browserRunning.delete(profileId);
+}
+
 // ------------------------------------------------------------------ profiles
 let browserProfiles = structuredClone(PROFILES);
 

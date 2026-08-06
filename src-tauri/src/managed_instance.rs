@@ -1800,13 +1800,26 @@ pub fn migrate_direct_source_storage() -> Result<(), String> {
     };
     let mut migrated_sources = Vec::new();
     for entry in entries {
-        if entry.file_name().to_string_lossy() == "current" {
+        let entry_name = entry.file_name();
+        if entry_name.to_string_lossy() == "current" {
             continue;
         }
         let workspace = entry.path();
         let metadata = fs::symlink_metadata(&workspace).map_err(|error| error.to_string())?;
+        if entry_name == ".DS_Store" && !is_reparse(&metadata) && metadata.is_file() {
+            fs::remove_file(&workspace).map_err(|error| {
+                format!(
+                    "could not remove macOS workspace metadata at {}: {error}",
+                    workspace.display()
+                )
+            })?;
+            continue;
+        }
         if is_reparse(&metadata) || !metadata.is_dir() {
-            return Err("managed workspace root contains an unsafe entry".into());
+            return Err(format!(
+                "managed workspace root contains an unsafe entry at {}. Remove that file or link, then retry.",
+                workspace.display()
+            ));
         }
         let active = workspace.join("current");
         recover_destination(&active)?;
@@ -3265,6 +3278,46 @@ mod tests {
             assert_eq!(marker_schema(&global).unwrap(), Some(5));
             assert!(bases_root().exists());
             assert!(load_instance_source_records("source-1").unwrap().is_empty());
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .env(ROOT, root.path())
+            .args(["--exact", TEST, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn workspace_root_metadata_recovers_and_unknown_files_are_actionable() {
+        const CHILD: &str = "PERFECT_SYNC_WORKSPACE_METADATA_CHILD";
+        const ROOT: &str = "PERFECT_SYNC_WORKSPACE_METADATA_ROOT";
+        const TEST: &str =
+            "managed_instance::tests::workspace_root_metadata_recovers_and_unknown_files_are_actionable";
+
+        if std::env::var_os(CHILD).is_some() {
+            settings::initialize_managed_data_dir(PathBuf::from(std::env::var_os(ROOT).unwrap()))
+                .unwrap();
+            fs::create_dir_all(workspaces_root()).unwrap();
+            let metadata = workspaces_root().join(".DS_Store");
+            fs::write(&metadata, b"Finder metadata").unwrap();
+
+            migrate_direct_source_storage().unwrap();
+            assert!(!metadata.exists());
+
+            let unexpected = workspaces_root().join("unexpected-file");
+            fs::write(&unexpected, b"unrecognized").unwrap();
+            let error = migrate_direct_source_storage().unwrap_err();
+            assert!(error.contains(&unexpected.display().to_string()));
+            assert!(error.contains("Remove that file or link"));
             return;
         }
 

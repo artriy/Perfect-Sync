@@ -33,6 +33,7 @@ interface MainPanelProps {
   onRename: (name: string) => void;
   onDelete: () => Promise<void>;
   onLaunch: () => void;
+  onStop: () => void;
   onAddMod: () => void;
   onSetup: () => void;
   onSelectGameInstance: (id: string) => void;
@@ -357,6 +358,7 @@ export function MainPanel(props: MainPanelProps) {
         running={game.running}
         busy={busy || props.launchBusy}
         onLaunch={props.onLaunch}
+      onStop={props.onStop}
         onSetup={props.onSetup}
       />
 

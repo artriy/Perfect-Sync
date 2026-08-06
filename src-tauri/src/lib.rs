@@ -92,6 +92,7 @@ pub fn run() {
             commands::move_storage,
             commands::export_error_log,
             commands::game_running,
+            commands::stop_game,
             commands::get_catalog,
             commands::refresh_catalog,
             commands::add_catalog_mod,
