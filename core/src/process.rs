@@ -239,8 +239,13 @@ struct RunningGameProcess {
 }
 
 #[cfg(windows)]
-fn running_game_processes() -> io::Result<Vec<RunningGameProcess>> {
+fn running_game_processes(executable: &Path) -> io::Result<Vec<RunningGameProcess>> {
     use std::os::windows::ffi::OsStringExt;
+
+    let Some(executable_name) = executable.file_name() else {
+        return Ok(Vec::new());
+    };
+    let executable_name = executable_name.to_string_lossy();
 
     type Handle = *mut std::ffi::c_void;
 
@@ -305,10 +310,10 @@ fn running_game_processes() -> io::Result<Vec<RunningGameProcess>> {
             .iter()
             .position(|character| *character == 0)
             .unwrap_or(entry.szExeFile.len());
-        let executable_name = OsString::from_wide(&entry.szExeFile[..name_end]);
-        if executable_name
+        let process_name = OsString::from_wide(&entry.szExeFile[..name_end]);
+        if process_name
             .to_string_lossy()
-            .eq_ignore_ascii_case(GAME_EXE)
+            .eq_ignore_ascii_case(executable_name.as_ref())
         {
             // Access-denied races are normal for processes exiting during the snapshot.
             // SAFETY: the process ID came from the live Toolhelp snapshot.
@@ -339,21 +344,25 @@ fn running_game_processes() -> io::Result<Vec<RunningGameProcess>> {
     Ok(paths)
 }
 
-/// Query whether the Among Us executable inside one concrete game directory is
-/// running. Unlike the global query, another profile or source does not match.
-pub fn try_is_game_dir_running(game_dir: &Path) -> io::Result<bool> {
-    let executable = game_dir.join(GAME_EXE);
+/// Query whether one exact executable path is running.
+pub fn try_is_executable_running(executable: &Path) -> io::Result<bool> {
     #[cfg(windows)]
     {
-        let expected = windows_path_key(&executable);
-        Ok(running_game_processes()?
+        let expected = windows_path_key(executable);
+        Ok(running_game_processes(executable)?
             .iter()
             .any(|process| windows_path_key(&process.path) == expected))
     }
     #[cfg(not(windows))]
     {
-        Ok(!unix_game_pids_from_system(&executable, false)?.is_empty())
+        Ok(!unix_game_pids_from_system(executable, false)?.is_empty())
     }
+}
+
+/// Query whether the Among Us executable inside one concrete game directory is
+/// running. Unlike the global query, another profile or source does not match.
+pub fn try_is_game_dir_running(game_dir: &Path) -> io::Result<bool> {
+    try_is_executable_running(&game_dir.join(GAME_EXE))
 }
 
 #[cfg(any(not(windows), test))]
@@ -421,16 +430,21 @@ fn command_line_matches_executable(command_line: &str, executable: &Path) -> boo
 }
 
 #[cfg(any(not(windows), test))]
-fn command_line_has_game_name(command_line: &str) -> bool {
+fn command_line_has_executable_name(command_line: &str, executable: &Path) -> bool {
+    let Some(executable_name) = executable.file_name() else {
+        return false;
+    };
     let command_line = command_line.replace('\\', "/").to_ascii_lowercase();
-    let game_name = GAME_EXE.to_ascii_lowercase();
-    command_line.match_indices(&game_name).any(|(start, _)| {
-        (start == 0
-            || command_line.as_bytes()[start - 1] == b'/'
-            || is_argument_boundary(command_line.as_bytes()[start - 1]))
-            && (start + game_name.len() == command_line.len()
-                || is_argument_boundary(command_line.as_bytes()[start + game_name.len()]))
-    })
+    let executable_name = executable_name.to_string_lossy().to_ascii_lowercase();
+    command_line
+        .match_indices(&executable_name)
+        .any(|(start, _)| {
+            (start == 0
+                || command_line.as_bytes()[start - 1] == b'/'
+                || is_argument_boundary(command_line.as_bytes()[start - 1]))
+                && (start + executable_name.len() == command_line.len()
+                    || is_argument_boundary(command_line.as_bytes()[start + executable_name.len()]))
+        })
 }
 
 #[cfg(any(not(windows), test))]
@@ -446,8 +460,8 @@ fn unix_game_pids_with_exact_files(
             let (pid, command_line) = unix_process(line)?;
             let dispatcher = is_crossover_dispatcher(command_line);
             let executable_matches = command_line_matches_executable(command_line, executable);
-            let exact_file_matches =
-                exact_file_pids.contains(&pid) && command_line_has_game_name(command_line);
+            let exact_file_matches = exact_file_pids.contains(&pid)
+                && command_line_has_executable_name(command_line, executable);
             if (!executable_matches && !exact_file_matches) || (!include_dispatchers && dispatcher)
             {
                 return None;
@@ -519,7 +533,7 @@ fn unix_game_pids_from_system(
             .lines()
             .filter_map(unix_process)
             .filter(|(_, command_line)| {
-                command_line_has_game_name(command_line)
+                command_line_has_executable_name(command_line, executable)
                     && !command_line_matches_executable(command_line, executable)
                     && (include_dispatchers || !is_crossover_dispatcher(command_line))
             })
@@ -567,7 +581,7 @@ pub fn terminate_game_dir(game_dir: &Path) -> io::Result<bool> {
     #[cfg(windows)]
     {
         let expected = windows_path_key(&executable);
-        let processes = running_game_processes()?
+        let processes = running_game_processes(&executable)?
             .into_iter()
             .filter(|process| windows_path_key(&process.path) == expected)
             .collect::<Vec<_>>();
@@ -811,6 +825,25 @@ mod query_tests {
         assert_eq!(
             unix_game_pids(output.as_bytes(), game, true),
             vec![101, 102, 104, 106, 107, 108]
+        );
+    }
+
+    #[test]
+    fn unix_process_matching_is_generic_and_exact_for_steam() {
+        let steam = Path::new(
+            "/Users/u/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steam.exe",
+        );
+        let output = concat!(
+            "  401 S  /usr/bin/wine /Users/u/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steam.exe\n",
+            "  402 S  /usr/bin/wine /Users/u/CrossOver/Bottles/Steam-Neighbor/drive_c/Program Files (x86)/Steam/steam.exe\n",
+            "  403 S  /usr/bin/wine /Users/u/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steam.exe.backup\n",
+            "  404 S  /usr/bin/wine C:\\Program Files (x86)\\Steam\\steam.exe\n",
+        );
+
+        assert_eq!(unix_game_pids(output.as_bytes(), steam, false), vec![401]);
+        assert_eq!(
+            unix_game_pids_with_exact_files(output.as_bytes(), steam, false, &[404]),
+            vec![401, 404]
         );
     }
 }

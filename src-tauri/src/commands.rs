@@ -26,6 +26,7 @@ use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -87,6 +88,9 @@ const MAX_RECURSIVE_COPY_FILES: usize = 200_000;
 const MAX_RECURSIVE_COPY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_ERROR_LOG_BYTES: u64 = 256 * 1024 * 1024;
 const CROSSOVER_GAME_START_TIMEOUT: Duration = Duration::from_secs(300);
+const CROSSOVER_GAME_STABILITY: Duration = Duration::from_secs(3);
+const CROSSOVER_STEAM_STABILITY: Duration = Duration::from_secs(10);
+const CROSSOVER_STEAM_START_TIMEOUT: Duration = Duration::from_secs(60);
 const CROSSOVER_OUTPUT_BYTES_PER_STREAM: usize = 8 * 1024;
 const CROSSOVER_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_SUPPORT_EVENT_BYTES: usize = 64 * 1024;
@@ -346,30 +350,40 @@ fn spawn_launch(
     Ok(())
 }
 
-fn wait_for_game_start(
-    game_dir: &Path,
+fn wait_for_crossover_process(
+    executable: &Path,
+    process_name: &str,
     timeout: Duration,
+    stability: Duration,
     mut poll_launcher: impl FnMut() -> Result<(), String>,
 ) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
+    let mut ready_since = None;
     let mut poll_interval = Duration::from_millis(100);
     loop {
         poll_launcher()?;
-        match process::try_is_game_dir_running(game_dir) {
-            Ok(true) => return Ok(true),
-            Ok(false) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Ok(false);
-                }
-                std::thread::sleep(poll_interval.min(deadline - now));
-                poll_interval = (poll_interval + poll_interval).min(Duration::from_secs(1));
+        let running = process::try_is_executable_running(executable).map_err(|error| {
+            format!("Could not verify whether CrossOver started {process_name}: {error}")
+        })?;
+        let now = Instant::now();
+        if running {
+            let ready = ready_since.get_or_insert(now);
+            if now.duration_since(*ready) >= stability {
+                return Ok(true);
             }
-            Err(error) => {
-                return Err(format!(
-                    "Could not verify whether CrossOver started Among Us: {error}"
-                ));
-            }
+            poll_interval = Duration::from_millis(100);
+        } else if ready_since.take().is_some() {
+            return Err(format!(
+                "{process_name} exited before remaining alive for {} during CrossOver startup.",
+                crossover_timeout_label(stability)
+            ));
+        }
+        if now >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(poll_interval.min(deadline - now));
+        if !running {
+            poll_interval = (poll_interval + poll_interval).min(Duration::from_secs(1));
         }
     }
 }
@@ -395,6 +409,13 @@ impl CrossoverOutputCapture {
         }
     }
 
+    fn snapshot(&self) -> String {
+        let mut diagnostic = String::new();
+        append_crossover_output(&mut diagnostic, "stdout", self.stdout.as_ref());
+        append_crossover_output(&mut diagnostic, "stderr", self.stderr.as_ref());
+        diagnostic
+    }
+
     fn finish(self) -> String {
         let deadline = Instant::now() + CROSSOVER_OUTPUT_DRAIN_TIMEOUT;
         while !self.is_closed() {
@@ -404,11 +425,7 @@ impl CrossoverOutputCapture {
             }
             std::thread::sleep(Duration::from_millis(5).min(deadline - now));
         }
-
-        let mut diagnostic = String::new();
-        append_crossover_output(&mut diagnostic, "stdout", self.stdout.as_ref());
-        append_crossover_output(&mut diagnostic, "stderr", self.stderr.as_ref());
-        diagnostic
+        self.snapshot()
     }
 
     fn is_closed(&self) -> bool {
@@ -622,6 +639,233 @@ fn launch_crossover(
     command.spawn()
 }
 
+fn crossover_steam_client(
+    source_game_dir: &Path,
+    context: &compat::RuntimeContext,
+) -> Result<PathBuf, String> {
+    let prefix = context
+        .prefix
+        .as_deref()
+        .ok_or("The selected CrossOver Steam source has no bottle prefix.")?;
+    let mut candidates = Vec::with_capacity(3);
+    if let Some(steamapps) = source_game_dir.ancestors().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("steamapps"))
+    }) {
+        if let Some(steam_root) = steamapps.parent() {
+            candidates.push(steam_root.join("steam.exe"));
+        }
+    }
+    candidates.extend([
+        prefix.join("drive_c/Program Files (x86)/Steam/steam.exe"),
+        prefix.join("drive_c/Program Files/Steam/steam.exe"),
+    ]);
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            "Could not find steam.exe in the selected CrossOver bottle. Repair the bottle's Steam installation, then retry."
+                .to_string()
+        })
+}
+
+fn crossover_steam_launch_spec(
+    steam_client: &Path,
+    context: &compat::RuntimeContext,
+) -> Result<process::LaunchSpec, String> {
+    let program = context.launcher.clone().ok_or(
+        "Could not find CrossOver's command-line Wine launcher. Install CrossOver in the system or user Applications folder, then retry.",
+    )?;
+    let mut args = context.launcher_args.clone();
+    let delimiter = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    args.splice(
+        delimiter..delimiter,
+        [
+            OsString::from("--no-update"),
+            OsString::from("--no-gui"),
+            OsString::from("--wait-children"),
+        ],
+    );
+    args.extend([
+        steam_client.as_os_str().to_owned(),
+        OsString::from("-silent"),
+    ]);
+    let mut env = Vec::new();
+    if let Some(bottle) = context
+        .prefix
+        .as_deref()
+        .and_then(Path::file_name)
+        .map(OsString::from)
+    {
+        env.push((OsString::from("CX_BOTTLE"), bottle));
+    }
+    Ok(process::LaunchSpec {
+        program,
+        args,
+        cwd: steam_client
+            .parent()
+            .ok_or("CrossOver's Steam executable has no parent folder.")?
+            .to_path_buf(),
+        env,
+        error: None,
+    })
+}
+
+fn poll_crossover_steam_wrapper(
+    launcher: &mut std::process::Child,
+    wrapper_exit: &mut Option<std::process::ExitStatus>,
+) -> Result<(), String> {
+    if let Some(status) = wrapper_exit.as_ref() {
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "CrossOver's Steam wrapper exited with {status} before Steam became ready."
+            ))
+        };
+    }
+    *wrapper_exit = launcher
+        .try_wait()
+        .map_err(|error| format!("Could not verify CrossOver's Steam startup: {error}"))?;
+    match wrapper_exit.as_ref() {
+        Some(status) if !status.success() => Err(format!(
+            "CrossOver's Steam wrapper exited with {status} before Steam became ready."
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn ensure_crossover_steam_ready(
+    source_game_dir: &Path,
+    context: &compat::RuntimeContext,
+) -> Result<(), String> {
+    let steam_client = crossover_steam_client(source_game_dir, context)?;
+    if process::try_is_executable_running(&steam_client)
+        .map_err(|error| format!("Could not check CrossOver's Steam client: {error}"))?
+    {
+        log::info!(
+            target: "perfect_sync::support",
+            "CrossOver Steam client already running"
+        );
+        return Ok(());
+    }
+
+    let specification = crossover_steam_launch_spec(&steam_client, context)?;
+    let mut launcher = launch_crossover(&specification, false).map_err(|error| {
+        format!("Could not start Steam in the selected CrossOver bottle: {error}")
+    })?;
+    let wrapper_pid = launcher.id();
+    log::info!(
+        target: "perfect_sync::support",
+        "CrossOver Steam startup started; wrapper_pid={wrapper_pid}; timeout_ms={}",
+        CROSSOVER_STEAM_START_TIMEOUT.as_millis()
+    );
+    let output = CrossoverOutputCapture::new(&mut launcher);
+    let mut wrapper_exit = None;
+    let ready = wait_for_crossover_process(
+        &steam_client,
+        "Steam",
+        CROSSOVER_STEAM_START_TIMEOUT,
+        CROSSOVER_STEAM_STABILITY,
+        || poll_crossover_steam_wrapper(&mut launcher, &mut wrapper_exit),
+    );
+
+    match ready {
+        Ok(true) => {
+            let startup_diagnostic = output.snapshot();
+            if !startup_diagnostic.is_empty() {
+                log::debug!(
+                    target: "perfect_sync::support",
+                    "CrossOver Steam startup output: {}",
+                    redact_crossover_text(support_log_message(startup_diagnostic))
+                );
+            }
+            let observed_exit = match wrapper_exit.take() {
+                Some(status) => Some(status),
+                None => launcher.try_wait().map_err(|error| {
+                    format!("Could not verify CrossOver's Steam startup: {error}")
+                })?,
+            };
+            match observed_exit {
+                Some(status) if !status.success() => Err(with_crossover_output(
+                    format!(
+                        "CrossOver's Steam wrapper exited with {status} after Steam readiness."
+                    ),
+                    output.finish(),
+                )),
+                Some(status) => {
+                    let diagnostic = output.finish();
+                    log::info!(
+                        target: "perfect_sync::support",
+                        "CrossOver Steam client ready; wrapper_pid={wrapper_pid}; status={status}"
+                    );
+                    if !diagnostic.is_empty() {
+                        log::debug!(
+                            target: "perfect_sync::support",
+                            "CrossOver Steam final output: {}",
+                            redact_crossover_text(support_log_message(diagnostic))
+                        );
+                    }
+                    Ok(())
+                }
+                None => {
+                    std::thread::spawn(move || {
+                        match launcher.wait() {
+                            Ok(status) => log::info!(
+                                target: "perfect_sync::support",
+                                "CrossOver Steam wrapper exited; wrapper_pid={wrapper_pid}; status={status}"
+                            ),
+                            Err(error) => log::warn!(
+                                target: "perfect_sync::support",
+                                "Could not reap CrossOver's Steam wrapper; wrapper_pid={wrapper_pid}; error={error}"
+                            ),
+                        }
+                        let diagnostic = output.finish();
+                        if !diagnostic.is_empty() {
+                            log::debug!(
+                                target: "perfect_sync::support",
+                                "CrossOver Steam final output: {}",
+                                redact_crossover_text(support_log_message(diagnostic))
+                            );
+                        }
+                    });
+                    log::info!(
+                        target: "perfect_sync::support",
+                        "CrossOver Steam client ready; wrapper_pid={wrapper_pid}"
+                    );
+                    Ok(())
+                }
+            }
+        }
+        Ok(false) => {
+            let wrapper_evidence = wrapper_exit
+                .as_ref()
+                .map(|status| format!(" CrossOver's Steam wrapper exited with {status}."))
+                .unwrap_or_default();
+            let cleanup_result = stop_crossover_launcher(&mut launcher);
+            let message = with_crossover_output(
+                format!(
+                    "Steam did not become ready in the selected CrossOver bottle within {}.{wrapper_evidence}",
+                    crossover_timeout_label(CROSSOVER_STEAM_START_TIMEOUT)
+                ),
+                output.finish(),
+            );
+            cleanup_result.map_err(|error| format!("{message} {error}"))?;
+            Err(message)
+        }
+        Err(error) => {
+            let cleanup_result = stop_crossover_launcher(&mut launcher);
+            let message = with_crossover_output(error, output.finish());
+            cleanup_result.map_err(|cleanup_error| format!("{message} {cleanup_error}"))?;
+            Err(message)
+        }
+    }
+}
+
 fn submit_crossover_enter(launcher: &mut std::process::Child) -> Result<(), String> {
     let Some(mut input) = launcher.stdin.take() else {
         return Ok(());
@@ -687,17 +931,23 @@ fn supervise_crossover_launch(
     let output = CrossoverOutputCapture::new(&mut launcher);
     let mut wrapper_exit = None;
     let mut wrapper_observed_alive = false;
-    let launch_result = wait_for_game_start(game_dir, timeout, || {
-        wrapper_exit = launcher
-            .try_wait()
-            .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?;
-        if wrapper_exit.is_some() {
-            Err("CrossOver's attached wrapper exited during startup.".into())
-        } else {
-            wrapper_observed_alive = true;
-            Ok(())
-        }
-    });
+    let launch_result = wait_for_crossover_process(
+        &game_dir.join(process::GAME_EXE),
+        "Among Us",
+        timeout,
+        CROSSOVER_GAME_STABILITY,
+        || {
+            wrapper_exit = launcher
+                .try_wait()
+                .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?;
+            if wrapper_exit.is_some() {
+                Err("CrossOver's attached wrapper exited during startup.".into())
+            } else {
+                wrapper_observed_alive = true;
+                Ok(())
+            }
+        },
+    );
 
     match launch_result {
         Ok(true) => {
@@ -712,20 +962,21 @@ fn supervise_crossover_launch(
                     None => message,
                 });
             }
-            let diagnostic = output.finish();
-            if !diagnostic.is_empty() {
+            let startup_diagnostic = output.snapshot();
+            if !startup_diagnostic.is_empty() {
                 log::debug!(
                     target: "perfect_sync::support",
                     "CrossOver startup output: {}",
-                    support_log_message(diagnostic.clone())
+                    redact_crossover_text(support_log_message(startup_diagnostic))
                 );
             }
+            let wrapper_pid = launcher.id();
             match launcher
                 .try_wait()
                 .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?
             {
                 Some(status) if !status.success() => {
-                    let error = crossover_exit_error(status, diagnostic);
+                    let error = crossover_exit_error(status, output.finish());
                     log::error!(
                         target: "perfect_sync::support",
                         "CrossOver supervision failed after readiness: {}",
@@ -733,13 +984,38 @@ fn supervise_crossover_launch(
                     );
                     return Err(error);
                 }
-                Some(_) => {}
+                Some(status) => {
+                    let diagnostic = output.finish();
+                    log::info!(
+                        target: "perfect_sync::support",
+                        "CrossOver wrapper exited after readiness; wrapper_pid={wrapper_pid}; status={status}"
+                    );
+                    if !diagnostic.is_empty() {
+                        log::debug!(
+                            target: "perfect_sync::support",
+                            "CrossOver final output: {}",
+                            redact_crossover_text(support_log_message(diagnostic))
+                        );
+                    }
+                }
                 None => {
                     std::thread::spawn(move || {
-                        if let Err(error) = launcher.wait() {
-                            log::warn!(
+                        match launcher.wait() {
+                            Ok(status) => log::info!(
                                 target: "perfect_sync::support",
-                                "Could not reap CrossOver's attached wrapper: {error}"
+                                "CrossOver wrapper exited; wrapper_pid={wrapper_pid}; status={status}"
+                            ),
+                            Err(error) => log::warn!(
+                                target: "perfect_sync::support",
+                                "Could not reap CrossOver's attached wrapper; wrapper_pid={wrapper_pid}; error={error}"
+                            ),
+                        }
+                        let diagnostic = output.finish();
+                        if !diagnostic.is_empty() {
+                            log::debug!(
+                                target: "perfect_sync::support",
+                                "CrossOver final output: {}",
+                                redact_crossover_text(support_log_message(diagnostic))
                             );
                         }
                     });
@@ -7672,6 +7948,9 @@ fn launch_prepared_game(
     let specification = compat::build_launch_spec(game_dir, &context);
     if context.runtime == Runtime::Crossover {
         return spawn_launch(workspace_id, || {
+            if store == Store::Steam && context.host == compat::HostPlatform::Macos {
+                ensure_crossover_steam_ready(Path::new(&instance.path), &context)?;
+            }
             let launcher = launch_crossover(&specification, false)
                 .map_err(|error| launch_err_msg(&context, &error))?;
             supervise_crossover_launch(launcher, game_dir, CROSSOVER_GAME_START_TIMEOUT)
@@ -7709,6 +7988,11 @@ pub async fn launch_profile(
             "finalizing",
             if instance.store == Store::Epic {
                 "Waiting for Epic authentication and Among Us startup. Complete sign-in in EpicGamesStarter if prompted."
+            } else if cfg!(target_os = "macos")
+                && instance.runtime == Runtime::Crossover
+                && instance.store == Store::Steam
+            {
+                "Starting Steam and Among Us through CrossOver. Sign in to Steam if prompted."
             } else if instance.runtime == Runtime::Crossover {
                 "Starting Among Us through CrossOver. Cold bottles can take up to five minutes."
             } else {
@@ -7741,6 +8025,11 @@ pub async fn launch_vanilla(
             "finalizing",
             if instance.store == Store::Epic {
                 "Waiting for Epic authentication and vanilla Among Us startup. Complete sign-in in EpicGamesStarter if prompted."
+            } else if cfg!(target_os = "macos")
+                && instance.runtime == Runtime::Crossover
+                && instance.store == Store::Steam
+            {
+                "Starting Steam and vanilla Among Us through CrossOver. Sign in to Steam if prompted."
             } else if instance.runtime == Runtime::Crossover {
                 "Starting vanilla Among Us through CrossOver. Cold bottles can take up to five minutes."
             } else {
@@ -8491,6 +8780,85 @@ mod tests {
         assert!(message.starts_with("Couldn't run CrossOver's Wine launcher"));
         assert!(message.contains("selected bottle and CrossOver installation"));
         assert!(!message.contains("cxrun"));
+    }
+
+    #[test]
+    fn crossover_steam_preflight_uses_the_same_bottle_without_applaunch() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("CrossOver/Bottles/AU");
+        let steam_root = prefix.join("drive_c/Program Files (x86)/Steam");
+        let source_game_dir = steam_root.join("steamapps/common/Among Us");
+        fs::create_dir_all(&source_game_dir).unwrap();
+        let steam_client = steam_root.join("steam.exe");
+        fs::write(&steam_client, b"steam").unwrap();
+        let context = compat::RuntimeContext {
+            host: compat::HostPlatform::Macos,
+            runtime: Runtime::Crossover,
+            prefix: Some(prefix),
+            launcher: Some(PathBuf::from(
+                "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine",
+            )),
+            launcher_args: vec!["--bottle".into(), "AU".into(), "--".into()],
+        };
+
+        assert_eq!(
+            crossover_steam_client(&source_game_dir, &context).unwrap(),
+            steam_client
+        );
+        let specification = crossover_steam_launch_spec(&steam_client, &context).unwrap();
+        assert_eq!(
+            &specification.args[..6],
+            [
+                "--bottle",
+                "AU",
+                "--no-update",
+                "--no-gui",
+                "--wait-children",
+                "--",
+            ]
+        );
+        assert_eq!(Path::new(&specification.args[6]), steam_client);
+        assert_eq!(specification.args[7], "-silent");
+        assert!(!specification
+            .args
+            .iter()
+            .any(|argument| argument == "-applaunch" || argument == "--dll"));
+        assert!(specification
+            .env
+            .iter()
+            .any(|(key, value)| key == "CX_BOTTLE" && value == "AU"));
+    }
+
+    #[test]
+    fn successful_crossover_steam_wrapper_exit_remains_valid_during_handoff() {
+        const CHILD: &str = "PERFECT_SYNC_CROSSOVER_STEAM_HANDOFF_CHILD";
+        const TEST: &str =
+            "commands::tests::successful_crossover_steam_wrapper_exit_remains_valid_during_handoff";
+
+        if std::env::var_os(CHILD).is_some() {
+            return;
+        }
+
+        let mut launcher = process::command(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .args(["--exact", TEST, "--nocapture"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut wrapper_exit = None;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while wrapper_exit.is_none() {
+            poll_crossover_steam_wrapper(&mut launcher, &mut wrapper_exit).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "successful wrapper exit was not observed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(wrapper_exit.as_ref().unwrap().success());
+        poll_crossover_steam_wrapper(&mut launcher, &mut wrapper_exit).unwrap();
     }
 
     #[test]
@@ -10459,7 +10827,7 @@ mod tests {
         if let Ok(role) = std::env::var(ROLE) {
             match role.as_str() {
                 "launcher" => std::thread::sleep(Duration::from_secs(5)),
-                "game" => std::thread::sleep(Duration::from_secs(3)),
+                "game" => std::thread::sleep(Duration::from_secs(5)),
                 _ => panic!("unexpected CrossOver supervisor role"),
             }
             return;
@@ -10494,6 +10862,50 @@ mod tests {
     }
 
     #[test]
+    fn crossover_supervisor_rejects_a_transient_exact_game_process() {
+        const ROLE: &str = "PERFECT_SYNC_CROSSOVER_TRANSIENT_ROLE";
+        const TEST: &str =
+            "commands::tests::crossover_supervisor_rejects_a_transient_exact_game_process";
+
+        if let Ok(role) = std::env::var(ROLE) {
+            match role.as_str() {
+                "launcher" => std::thread::sleep(Duration::from_secs(5)),
+                "game" => std::thread::sleep(Duration::from_secs(1)),
+                _ => panic!("unexpected transient CrossOver role"),
+            }
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let game_dir = temp.path().join("managed-game");
+        fs::create_dir(&game_dir).unwrap();
+        let game_executable = game_dir.join(process::GAME_EXE);
+        fs::copy(std::env::current_exe().unwrap(), &game_executable).unwrap();
+        let launcher = process::command(std::env::current_exe().unwrap())
+            .env(ROLE, "launcher")
+            .args(["--exact", TEST, "--nocapture"])
+            .spawn()
+            .unwrap();
+        let delayed_game = std::thread::spawn({
+            let game_executable = game_executable.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                process::command(game_executable)
+                    .env(ROLE, "game")
+                    .args(["--exact", TEST, "--nocapture"])
+                    .spawn()
+                    .unwrap()
+            }
+        });
+
+        let error =
+            supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(5)).unwrap_err();
+        assert!(error.contains("Among Us exited before remaining alive for 3 seconds"));
+        let mut game = delayed_game.join().unwrap();
+        assert!(game.wait().unwrap().success());
+    }
+
+    #[test]
     fn crossover_supervisor_releases_interactive_helper_after_readiness() {
         const ROLE: &str = "PERFECT_SYNC_CROSSOVER_INTERACTIVE_ROLE";
         const MARKER: &str = "PERFECT_SYNC_CROSSOVER_INTERACTIVE_MARKER";
@@ -10508,7 +10920,7 @@ mod tests {
                     assert_eq!(input, "\n");
                     fs::write(std::env::var_os(MARKER).unwrap(), b"released").unwrap();
                 }
-                "game" => std::thread::sleep(Duration::from_secs(3)),
+                "game" => std::thread::sleep(Duration::from_secs(5)),
                 _ => panic!("unexpected CrossOver interactive role"),
             }
             return;
@@ -10645,9 +11057,13 @@ mod tests {
 
             assert_eq!(
                 spawn_launch("repeat-profile", || {
-                    wait_for_game_start(&game_dir, Duration::from_secs(1), || {
-                        Err("dispatch failed".into())
-                    })
+                    wait_for_crossover_process(
+                        &game_dir.join(process::GAME_EXE),
+                        "Among Us",
+                        Duration::from_secs(1),
+                        Duration::ZERO,
+                        || Err("dispatch failed".into()),
+                    )
                     .map(|_| ())
                 })
                 .unwrap_err(),
@@ -10658,7 +11074,13 @@ mod tests {
             assert_eq!(
                 spawn_launch("repeat-profile", || {
                     assert!(launch_pending("repeat-profile").unwrap());
-                    if wait_for_game_start(&game_dir, Duration::ZERO, || Ok(()))? {
+                    if wait_for_crossover_process(
+                        &game_dir.join(process::GAME_EXE),
+                        "Among Us",
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        || Ok(()),
+                    )? {
                         Ok(())
                     } else {
                         Err("game start timed out".into())

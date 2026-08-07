@@ -37,17 +37,21 @@
   `--wait-children` wrapper, and pass the `winhttp` override through CrossOver's
   supported command-line option so BepInEx receives its loader hook.
 - Watch CrossOver's wrapper and exact managed game process under one five-minute
-  startup deadline, excluding both Perl and `winewrapper.exe` dispatchers from
-  readiness checks. Slow cold bottles remain pending beyond 30 seconds; dispatcher
-  failures and real timeouts clear pending state so repeat launch can retry. CrossOver
-  Epic launches use the same watchdog, retain the starter's input pipe, and submit Enter
-  after readiness or cleanup so the console helper cannot remain blocked.
+  startup deadline, requiring the game to remain alive for three seconds before
+  reporting success. Slow cold bottles remain pending beyond 30 seconds; dispatcher,
+  transient-process, and real-timeout failures clear pending state so repeat launch
+  can retry. CrossOver Epic launches use the same watchdog, retain the starter's input
+  pipe, and submit Enter after stable readiness or cleanup.
+- Before direct Steam launches on macOS, start `steam.exe -silent` in the same bottle
+  when its exact process is absent, require ten seconds of continuous Steam readiness,
+  retain the managed `steam_appid.txt`, and never redirect to the original with
+  `-applaunch`.
 - Recognize CrossOver's default `Y:` home mapping, custom drive letters, NT Unix paths,
   and macOS `winetemp` loader links without falling back to a global process-name match;
   ambiguous processes must hold the selected managed executable according to `lsof`.
-- Continuously drain CrossOver output into bounded 8 KiB tails and include redacted
-  wrapper status, stdout, and stderr when startup fails instead of returning an opaque
-  five-minute timeout.
+- Continuously drain CrossOver output into bounded 8 KiB tails. Keep each capture
+  through its wrapper's lifetime, record the final exit status, and include redacted
+  wrapper status, stdout, and stderr when stable startup fails.
 - Add opt-in diagnostic logging in Settings. When enabled, persist frontend command
   lifecycles, backend operation and launch stages, bounded CrossOver output, failures,
   runtime details, and process readiness while excluding command arguments and redacting
