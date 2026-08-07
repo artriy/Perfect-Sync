@@ -25,6 +25,7 @@ import {
 } from "../lib/bridge";
 import { useModalFocus } from "../lib/useModalFocus";
 import { TrustBadge } from "./TrustBadge";
+import { Toggle } from "./Toggle";
 import { ReleasePicker } from "./ReleasePicker";
 import type { GameInstall, GameInstance, GithubTokenAction, Settings, Store, Trust } from "../lib/types";
 import { displayPath } from "../lib/displayPath";
@@ -40,6 +41,7 @@ interface SettingsModalProps {
   onRunSetup: () => void;
   onMoveStorage: (storagePath?: string) => Promise<void>;
   onSaveErrorLog: () => Promise<void>;
+  onOpenSupportLogs: () => Promise<void>;
   trustOf: (repo: string) => Trust;
 }
 
@@ -92,6 +94,7 @@ export function SettingsModal({
   onRunSetup,
   onMoveStorage,
   onSaveErrorLog,
+  onOpenSupportLogs,
   trustOf,
 }: SettingsModalProps) {
   const reduce = useReducedMotion();
@@ -102,6 +105,7 @@ export function SettingsModal({
   const [instances, setInstances] = useState<GameInstance[]>(settings.gameInstances ?? []);
   const [personalMods, setPersonalMods] = useState(settings.personalMods ?? []);
   const [personalLocalMods, setPersonalLocalMods] = useState(settings.personalLocalMods ?? []);
+  const [supportLogging, setSupportLogging] = useState(!!settings.supportLogging);
   const [personalPicker, setPersonalPicker] = useState<{
     repo: string;
     name: string;
@@ -171,6 +175,7 @@ export function SettingsModal({
       setInstances(next);
       setPersonalMods(opening.settings.personalMods ?? []);
       setPersonalLocalMods(opening.settings.personalLocalMods ?? []);
+      setSupportLogging(!!opening.settings.supportLogging);
       setPersonalPicker(null);
       setSelectedId(
         next.some((instance) => instance.id === opening.profileGameInstanceId)
@@ -548,6 +553,7 @@ export function SettingsModal({
           gameInstances: instances.map((instance) => ({ ...instance, name: instance.name.trim() })),
           personalMods,
           personalLocalMods,
+          supportLogging,
         },
         tokenAction,
       );
@@ -572,8 +578,13 @@ export function SettingsModal({
   const hasPersonalDrafts = JSON.stringify(personalMods) !== JSON.stringify(settings.personalMods ?? []);
   const hasPersonalLocalDrafts =
     JSON.stringify(personalLocalMods) !== JSON.stringify(settings.personalLocalMods ?? []);
+  const hasSupportLoggingDraft = supportLogging !== !!settings.supportLogging;
   const hasDraftChanges =
-    hasInstanceDrafts || hasPersonalDrafts || hasPersonalLocalDrafts || tokenIntent !== "unchanged";
+    hasInstanceDrafts ||
+    hasPersonalDrafts ||
+    hasPersonalLocalDrafts ||
+    hasSupportLoggingDraft ||
+    tokenIntent !== "unchanged";
   const visibleLoaderView: LoaderView =
     !selected
       ? { kind: "idle" }
@@ -1211,7 +1222,44 @@ export function SettingsModal({
               <span className="mt-5 mb-2 block text-[11px] font-medium tracking-[0.14em] text-ink-faint uppercase">
                 Support
               </span>
-              <div className="glass flex items-center justify-between gap-3 rounded-xl px-3.5 py-3 max-[480px]:items-start">
+              <div className="glass flex items-center justify-between gap-3 rounded-xl px-3.5 py-3 max-[560px]:items-start">
+                <div className="min-w-0">
+                  <p className="text-[12.5px] text-ink">Diagnostic logging</p>
+                  <p className="mt-0.5 text-[11px] leading-relaxed text-ink-faint">
+                    Enable and save, reproduce the problem, then open this folder and send its
+                    contents. It records app commands, launch stages, bounded CrossOver output,
+                    diagnostics, and the selected profile&apos;s BepInEx log.
+                  </p>
+                  <p className="mt-1 text-[10.5px] leading-relaxed text-ink-faint">
+                    GitHub credentials are excluded. App events redact user paths and token-shaped
+                    strings. Current and previous app logs are limited to 5 MiB each.
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2 max-[560px]:flex-col max-[560px]:items-end">
+                  <Toggle
+                    on={supportLogging}
+                    onChange={() => setSupportLogging((current) => !current)}
+                    disabled={hasPendingWork}
+                    label={`${supportLogging ? "Disable" : "Enable"} diagnostic logging`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void onOpenSupportLogs()}
+                    disabled={hasPendingWork || hasSupportLoggingDraft}
+                    title={
+                      hasSupportLoggingDraft
+                        ? "Save changes before reproducing the problem"
+                        : "Refresh diagnostics and open the support logs folder"
+                    }
+                    className="ring-focus glass-2 flex items-center gap-1.5 rounded-lg px-3 py-2 text-[12px] font-semibold whitespace-nowrap text-ink-dim hover:text-ink disabled:opacity-50"
+                  >
+                    <FolderOpen size={15} />
+                    Open logs
+                  </button>
+                </div>
+              </div>
+
+              <div className="glass mt-2 flex items-center justify-between gap-3 rounded-xl px-3.5 py-3 max-[480px]:items-start">
                 <div>
                   <p className="text-[12.5px] text-ink">BepInEx error log</p>
                   <p className="mt-0.5 text-[11px] leading-relaxed text-ink-faint">

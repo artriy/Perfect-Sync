@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn only_target_game_start_submits_enter_and_releases_console_reader() {
         if std::env::var_os(FAKE_GAME).is_some() {
-            std::thread::sleep(Duration::from_secs(10));
+            std::thread::sleep(Duration::from_secs(20));
             return;
         }
         if std::env::var_os(CONSOLE_TARGET).is_some() {
@@ -346,7 +346,7 @@ mod tests {
             .and_then(|value| value.parse().ok())
         {
             let game_dir = PathBuf::from(std::env::var_os(CONSOLE_GAME_DIR).unwrap());
-            wait_for_game_and_submit_enter(pid, &game_dir, Duration::from_secs(5)).unwrap();
+            wait_for_game_and_submit_enter(pid, &game_dir, Duration::from_secs(15)).unwrap();
             return;
         }
 

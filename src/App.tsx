@@ -57,6 +57,7 @@ const EMPTY_SETTINGS: Settings = {
   gameInstances: [],
   personalMods: [],
   setupComplete: false,
+  supportLogging: false,
   hasGithubToken: false,
   freshSourceSetupComplete: false,
   activeStoragePath: "",
@@ -1914,6 +1915,10 @@ export function App() {
     const destination = await exclusive(() => bridge.exportErrorLog(active.id));
     if (destination) notify("BepInEx error log saved", "success");
   };
+  const openSupportLogs = async (): Promise<void> => {
+    const directory = await exclusive(() => bridge.openSupportLogs(active.id));
+    if (directory) notify("Opened diagnostic logs folder", "success");
+  };
 
 
 
@@ -2295,6 +2300,7 @@ export function App() {
         onSave={saveSettings}
         onMoveStorage={moveStorage}
         onSaveErrorLog={saveErrorLog}
+        onOpenSupportLogs={openSupportLogs}
         onRunSetup={() => {
           setSettingsOpen(false);
           setSetupOpen(true);

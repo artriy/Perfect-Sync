@@ -33,7 +33,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::ipc::Channel;
+use tauri::{ipc::Channel, AppHandle, Manager};
 
 const BUNDLED_CATALOG: &str = include_str!("../../catalog/catalog.json");
 
@@ -89,9 +89,14 @@ const MAX_ERROR_LOG_BYTES: u64 = 256 * 1024 * 1024;
 const CROSSOVER_GAME_START_TIMEOUT: Duration = Duration::from_secs(300);
 const CROSSOVER_OUTPUT_BYTES_PER_STREAM: usize = 8 * 1024;
 const CROSSOVER_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_SUPPORT_EVENT_BYTES: usize = 64 * 1024;
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LAUNCH_PENDING: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static SUPPORT_TOKEN_PATTERN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})\b")
+        .expect("static token regex")
+});
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static INSPECTED_GAMES: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -293,21 +298,45 @@ fn spawn_launch(
             return Err("This profile is already launching.".into());
         }
     }
+    log::info!(
+        target: "perfect_sync::support",
+        "launch attempt started; profile={workspace_id}"
+    );
     if let Err(error) = operation() {
         if let Ok(mut pending) = LAUNCH_PENDING.lock() {
             pending.remove(workspace_id);
         }
+        log::error!(
+            target: "perfect_sync::support",
+            "launch attempt failed; profile={workspace_id}; error={}",
+            redact_crossover_text(support_log_message(error.clone()))
+        );
         return Err(error);
     }
+    log::info!(
+        target: "perfect_sync::support",
+        "launch dispatch completed; profile={workspace_id}"
+    );
     let workspace_id = workspace_id.to_string();
     std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if matches!(process::try_is_game_dir_running(&game_dir), Ok(true))
-                || Instant::now() >= deadline
-            {
+            let ready = matches!(process::try_is_game_dir_running(&game_dir), Ok(true));
+            let timed_out = Instant::now() >= deadline;
+            if ready || timed_out {
                 if let Ok(mut pending) = LAUNCH_PENDING.lock() {
                     pending.remove(&workspace_id);
+                }
+                if ready {
+                    log::info!(
+                        target: "perfect_sync::support",
+                        "launch process confirmed; profile={workspace_id}"
+                    );
+                } else {
+                    log::warn!(
+                        target: "perfect_sync::support",
+                        "launch process was not confirmed within the post-dispatch window; profile={workspace_id}"
+                    );
                 }
                 break;
             }
@@ -443,10 +472,9 @@ fn redact_user_paths_and_tokens(mut text: String) -> String {
             text = text.replace(&path.to_string_lossy().to_string(), "<redacted-user-path>");
         }
     }
-    let token =
-        regex::Regex::new(r"(?i)\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})\b")
-            .expect("static token regex");
-    token.replace_all(&text, "<redacted-token>").into_owned()
+    SUPPORT_TOKEN_PATTERN
+        .replace_all(&text, "<redacted-token>")
+        .into_owned()
 }
 
 fn redact_crossover_text(text: String) -> String {
@@ -456,6 +484,41 @@ fn redact_crossover_text(text: String) -> String {
         }
     }
     redact_user_paths_and_tokens(text)
+}
+fn support_log_message(mut message: String) -> String {
+    message = message.replace('\0', "\u{fffd}");
+    if message.len() > MAX_SUPPORT_EVENT_BYTES {
+        let mut boundary = MAX_SUPPORT_EVENT_BYTES;
+        while !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        message.truncate(boundary);
+        message.push_str("\n[message truncated at 64 KiB]");
+    }
+    redact_user_paths_and_tokens(message)
+}
+
+#[tauri::command]
+pub fn record_support_event(level: String, message: String) -> Result<(), String> {
+    if !settings::support_logging_enabled() {
+        return Ok(());
+    }
+    let level = match level.as_str() {
+        "debug" => log::Level::Debug,
+        "info" => log::Level::Info,
+        "warn" => log::Level::Warn,
+        "error" => log::Level::Error,
+        _ => return Err("Unsupported support log level.".into()),
+    };
+    let message = if matches!(level, log::Level::Warn | log::Level::Error) {
+        redact_crossover_text(support_log_message(message))
+    } else {
+        support_log_message(message)
+    };
+    if !message.trim().is_empty() {
+        log::log!(target: "perfect_sync::support", level, "{message}");
+    }
+    Ok(())
 }
 
 fn append_crossover_output(
@@ -614,6 +677,13 @@ fn supervise_crossover_launch(
     game_dir: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
+    let started = Instant::now();
+    log::info!(
+        target: "perfect_sync::support",
+        "CrossOver supervision started; wrapper_pid={}; timeout_ms={}",
+        launcher.id(),
+        timeout.as_millis()
+    );
     let output = CrossoverOutputCapture::new(&mut launcher);
     let mut wrapper_exit = None;
     let mut wrapper_observed_alive = false;
@@ -642,20 +712,44 @@ fn supervise_crossover_launch(
                     None => message,
                 });
             }
+            let diagnostic = output.finish();
+            if !diagnostic.is_empty() {
+                log::debug!(
+                    target: "perfect_sync::support",
+                    "CrossOver startup output: {}",
+                    support_log_message(diagnostic.clone())
+                );
+            }
             match launcher
                 .try_wait()
                 .map_err(|error| format!("Could not verify CrossOver's launch result: {error}"))?
             {
                 Some(status) if !status.success() => {
-                    return Err(crossover_exit_error(status, output.finish()));
+                    let error = crossover_exit_error(status, diagnostic);
+                    log::error!(
+                        target: "perfect_sync::support",
+                        "CrossOver supervision failed after readiness: {}",
+                        redact_crossover_text(support_log_message(error.clone()))
+                    );
+                    return Err(error);
                 }
                 Some(_) => {}
                 None => {
                     std::thread::spawn(move || {
-                        let _ = launcher.wait();
+                        if let Err(error) = launcher.wait() {
+                            log::warn!(
+                                target: "perfect_sync::support",
+                                "Could not reap CrossOver's attached wrapper: {error}"
+                            );
+                        }
                     });
                 }
             }
+            log::info!(
+                target: "perfect_sync::support",
+                "CrossOver process confirmed after {} ms",
+                started.elapsed().as_millis()
+            );
             Ok(())
         }
         Ok(false) => {
@@ -2967,7 +3061,27 @@ pub async fn save_settings(
             }
             settings.active_profile = Some(active);
         }
-        settings::apply_transaction(&settings, &token_action).map_err(|error| error.to_string())
+        let was_logging = settings::support_logging_enabled();
+        let logging_enabled = settings.support_logging;
+        let view = settings::apply_transaction(&settings, &token_action)
+            .map_err(|error| error.to_string())?;
+        if was_logging && !logging_enabled {
+            log::info!(
+                target: "perfect_sync::support",
+                "Diagnostic logging disabled by the user"
+            );
+        }
+        settings::set_support_logging_enabled(logging_enabled);
+        if !was_logging && logging_enabled {
+            log::info!(
+                target: "perfect_sync::support",
+                "Diagnostic logging enabled; app_version={} os={} arch={}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            );
+        }
+        Ok(view)
     })
     .await
 }
@@ -3141,14 +3255,11 @@ fn copy_error_log(source: &Path, destination: &Path, expected: u64) -> Result<()
         .map_err(|error| format!("Could not open the BepInEx error log: {error}"))?;
     AtomicFile::new(destination, AllowOverwrite)
         .write(|output| {
-            let copied = io::copy(
-                &mut Read::by_ref(&mut input).take(MAX_ERROR_LOG_BYTES + 1),
-                output,
-            )?;
+            let copied = io::copy(&mut Read::by_ref(&mut input).take(expected), output)?;
             if copied != expected {
                 return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "BepInEx error log changed while it was being exported",
+                    io::ErrorKind::UnexpectedEof,
+                    "BepInEx error log was truncated while it was being exported",
                 ));
             }
             output.flush()?;
@@ -3905,9 +4016,15 @@ impl ProgressReporter {
     }
 
     fn stage(&self, phase: &str, message: impl Into<String>) {
+        let message = message.into();
+        log::info!(
+            target: "perfect_sync::support",
+            "operation phase={phase}: {}",
+            support_log_message(message.clone())
+        );
         let _ = self.channel.send(OperationProgress {
             phase: phase.to_string(),
-            message: message.into(),
+            message,
             bytes_received: None,
             bytes_total: None,
         });
@@ -7496,6 +7613,21 @@ fn launch_prepared_game(
     validate_managed_launch_target(game_dir, workspace_id)?;
     let store = instance.store;
     let context = compat::resolve_with_hint(Path::new(&instance.path), Some(instance.runtime));
+    let launcher = context
+        .launcher
+        .as_deref()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or("unresolved");
+    log::info!(
+        target: "perfect_sync::support",
+        "launch target resolved; profile={workspace_id}; store={:?}; runtime={:?}; arch={:?}; host={:?}; launcher={launcher}; prefix={}",
+        instance.store,
+        context.runtime,
+        instance.arch,
+        context.host,
+        context.prefix.is_some(),
+    );
     if store == Store::Epic {
         let starter = ensure_epic_starter(&http()?, game_dir, workspace_id)?;
         prepare_epic_auth_stores(game_dir, &context)?;
@@ -8087,6 +8219,186 @@ pub async fn collect_diagnostics(profile_id: Option<String>) -> Result<Diagnosti
     blocking(move || diagnostics_report_impl(profile_id.as_deref())).await
 }
 
+fn remove_regular_file_if_present(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if is_reparse(&metadata) || !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    fs::remove_file(path).map_err(|error| error.to_string())
+}
+
+fn refresh_bepinex_support_log(log_dir: &Path, profile_id: Option<&str>) -> Result<(), String> {
+    let destination = log_dir.join("bepinex.log");
+    let status_path = log_dir.join("bepinex-status.txt");
+    let source = match profile_id {
+        Some(profile_id) => {
+            validate_profile_id(profile_id)?;
+            managed_instance::workspace_game_dir(profile_id)?
+                .join("BepInEx")
+                .join("LogOutput.log")
+        }
+        None => {
+            remove_regular_file_if_present(&destination)?;
+            return atomic_write(
+                &status_path,
+                b"No profile was selected when this support snapshot was created.\n",
+            );
+        }
+    };
+    let metadata = match fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            remove_regular_file_if_present(&destination)?;
+            return atomic_write(
+                &status_path,
+                b"BepInEx LogOutput.log is not available yet. Launch the profile before collecting logs.\n",
+            );
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if is_reparse(&metadata) || !metadata.is_file() || metadata.len() == 0 {
+        remove_regular_file_if_present(&destination)?;
+        return atomic_write(
+            &status_path,
+            b"BepInEx LogOutput.log is not a usable regular file.\n",
+        );
+    }
+    if metadata.len() > MAX_ERROR_LOG_BYTES {
+        remove_regular_file_if_present(&destination)?;
+        return atomic_write(
+            &status_path,
+            b"BepInEx LogOutput.log exceeds the 256 MiB support-log limit.\n",
+        );
+    }
+    copy_error_log(&source, &destination, metadata.len())?;
+    remove_regular_file_if_present(&status_path)
+}
+
+fn redacted_settings_value(saved: &Settings) -> Result<serde_json::Value, String> {
+    let mut redacted = serde_json::to_value(saved).map_err(|error| error.to_string())?;
+    if let Some(instances) = redacted
+        .get_mut("gameInstances")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for instance in instances {
+            if let Some(object) = instance.as_object_mut() {
+                object.insert(
+                    "path".to_string(),
+                    serde_json::Value::String("<redacted-game-path>".to_string()),
+                );
+            }
+        }
+    }
+    if let Some(locals) = redacted
+        .get_mut("personalLocalMods")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for local in locals {
+            if let Some(object) = local.as_object_mut() {
+                object.insert(
+                    "path".to_string(),
+                    serde_json::Value::String("<redacted-local-mod-path>".to_string()),
+                );
+            }
+        }
+    }
+    if redacted
+        .get("storagePath")
+        .is_some_and(|value| !value.is_null())
+    {
+        redacted["storagePath"] = serde_json::Value::String("<redacted-storage-path>".to_string());
+    }
+    Ok(redacted)
+}
+
+fn refresh_support_artifacts(log_dir: &Path, profile_id: Option<&str>) -> Result<(), String> {
+    fs::create_dir_all(log_dir).map_err(|error| error.to_string())?;
+    let metadata = fs::symlink_metadata(log_dir).map_err(|error| error.to_string())?;
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err("The support log location is not a regular directory.".into());
+    }
+    let diagnostics = match diagnostics_report_impl(profile_id) {
+        Ok(report) => serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+        Err(error) => serde_json::to_vec_pretty(&serde_json::json!({
+            "generatedAt": unix_millis()?,
+            "appVersion": env!("CARGO_PKG_VERSION"),
+            "error": redact_crossover_text(support_log_message(error)),
+        }))
+        .map_err(|error| error.to_string())?,
+    };
+    atomic_write(&log_dir.join("diagnostics.json"), &diagnostics)?;
+    let saved = settings::load().map_err(|error| error.to_string())?;
+    let redacted_settings = serde_json::to_vec_pretty(&redacted_settings_value(&saved)?)
+        .map_err(|error| error.to_string())?;
+    atomic_write(&log_dir.join("settings-redacted.json"), &redacted_settings)?;
+    let profile_path = log_dir.join("profile.json");
+    match profile_id {
+        Some(profile_id) => {
+            validate_profile_id(profile_id)?;
+            match recovered_profile_store(&settings::profiles_root())?
+                .load(profile_id)
+                .map_err(|error| error.to_string())?
+            {
+                Some(profile) => atomic_write(
+                    &profile_path,
+                    &serde_json::to_vec_pretty(&profile).map_err(|error| error.to_string())?,
+                )?,
+                None => remove_regular_file_if_present(&profile_path)?,
+            }
+        }
+        None => remove_regular_file_if_present(&profile_path)?,
+    }
+    refresh_bepinex_support_log(log_dir, profile_id)
+}
+
+fn open_directory(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut command = process::command("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = process::command("/usr/bin/open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = process::command("xdg-open");
+    command.arg(path);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not open the support logs folder: {error}"))?;
+    std::thread::spawn(move || {
+        if let Err(error) = child.wait() {
+            log::warn!(
+                target: "perfect_sync::support",
+                "Could not reap the support-folder opener: {error}"
+            );
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn open_support_logs(
+    app: AppHandle,
+    profile_id: Option<String>,
+) -> Result<String, String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("Could not locate the support logs folder: {error}"))?;
+    blocking(move || {
+        refresh_support_artifacts(&log_dir, profile_id.as_deref())?;
+        log::info!(
+            target: "perfect_sync::support",
+            "Support snapshot refreshed; profile={}",
+            profile_id.as_deref().unwrap_or("none")
+        );
+        open_directory(&log_dir)?;
+        Ok(log_dir.to_string_lossy().into_owned())
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn export_support_bundle(
     destination: String,
@@ -8104,34 +8416,7 @@ pub async fn export_support_bundle(
         }
         let report = diagnostics_report_impl(profile_id.as_deref())?;
         let saved = settings::load().map_err(|error| error.to_string())?;
-        let mut redacted_settings =
-            serde_json::to_value(&saved).map_err(|error| error.to_string())?;
-        if let Some(instances) = redacted_settings
-            .get_mut("gameInstances")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            for instance in instances {
-                if let Some(object) = instance.as_object_mut() {
-                    object.insert(
-                        "path".to_string(),
-                        serde_json::Value::String("<redacted-game-path>".to_string()),
-                    );
-                }
-            }
-        }
-        if let Some(locals) = redacted_settings
-            .get_mut("personalLocalMods")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            for local in locals {
-                if let Some(object) = local.as_object_mut() {
-                    object.insert(
-                        "path".to_string(),
-                        serde_json::Value::String("<redacted-local-mod-path>".to_string()),
-                    );
-                }
-            }
-        }
+        let redacted_settings = redacted_settings_value(&saved)?;
         let profile = match profile_id.as_deref() {
             Some(profile_id) => recovered_profile_store(&settings::profiles_root())?
                 .load(profile_id)
@@ -8207,6 +8492,63 @@ mod tests {
         assert!(message.contains("selected bottle and CrossOver installation"));
         assert!(!message.contains("cxrun"));
     }
+
+    #[test]
+    fn support_log_messages_are_bounded_and_redacted() {
+        let token = "github_pat_abcdefghijklmnopqrstuvwxyz123456";
+        let home = ["USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA"]
+            .into_iter()
+            .find_map(std::env::var_os)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let message = format!("{home}/Among Us\0 token={token}\n{}", "é".repeat(40_000));
+        let sanitized = support_log_message(message);
+
+        assert!(!sanitized.contains(token));
+        assert!(!home.is_empty() && !sanitized.contains(&home));
+        assert!(!sanitized.contains('\0'));
+        assert!(sanitized.ends_with("[message truncated at 64 KiB]"));
+        assert!(sanitized.len() <= MAX_SUPPORT_EVENT_BYTES + 40);
+    }
+
+    #[test]
+    fn support_snapshot_explains_missing_profile_log() {
+        let temp = tempfile::tempdir().unwrap();
+
+        refresh_bepinex_support_log(temp.path(), None).unwrap();
+
+        assert!(!temp.path().join("bepinex.log").exists());
+        assert!(fs::read_to_string(temp.path().join("bepinex-status.txt"))
+            .unwrap()
+            .contains("No profile was selected"));
+    }
+
+    #[test]
+    fn support_log_copy_is_a_stable_point_in_time_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.log");
+        let destination = temp.path().join("copied.log");
+        fs::write(&source, b"before-after").unwrap();
+
+        copy_error_log(&source, &destination, 6).unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), b"before");
+    }
+
+    #[test]
+    fn support_settings_snapshot_redacts_storage_location() {
+        let settings = Settings {
+            storage_path: Some("C:/Users/private/Perfect Sync".into()),
+            support_logging: true,
+            ..Settings::default()
+        };
+
+        let redacted = redacted_settings_value(&settings).unwrap();
+
+        assert_eq!(redacted["storagePath"], "<redacted-storage-path>");
+        assert_eq!(redacted["supportLogging"], true);
+    }
+
     #[test]
     fn ambiguous_storage_save_uses_only_the_reread_pointer() {
         let current = PathBuf::from("C:/old");
@@ -10116,7 +10458,8 @@ mod tests {
 
         if let Ok(role) = std::env::var(ROLE) {
             match role.as_str() {
-                "launcher" | "game" => std::thread::sleep(Duration::from_secs(1)),
+                "launcher" => std::thread::sleep(Duration::from_secs(5)),
+                "game" => std::thread::sleep(Duration::from_secs(3)),
                 _ => panic!("unexpected CrossOver supervisor role"),
             }
             return;
@@ -10145,7 +10488,7 @@ mod tests {
             }
         });
 
-        supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(3)).unwrap();
+        supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(10)).unwrap();
         let mut game = delayed_game.join().unwrap();
         assert!(game.wait().unwrap().success());
     }
@@ -10165,7 +10508,7 @@ mod tests {
                     assert_eq!(input, "\n");
                     fs::write(std::env::var_os(MARKER).unwrap(), b"released").unwrap();
                 }
-                "game" => std::thread::sleep(Duration::from_secs(1)),
+                "game" => std::thread::sleep(Duration::from_secs(3)),
                 _ => panic!("unexpected CrossOver interactive role"),
             }
             return;
@@ -10200,7 +10543,7 @@ mod tests {
             }
         });
 
-        supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(3)).unwrap();
+        supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(10)).unwrap();
         let marker_deadline = Instant::now() + Duration::from_secs(2);
         while !marker.exists() && Instant::now() < marker_deadline {
             std::thread::sleep(Duration::from_millis(20));

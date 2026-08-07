@@ -7,6 +7,10 @@ mod storage;
 use tauri::Manager;
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 
+fn is_support_log_target(target: &str) -> bool {
+    target.starts_with("app_lib") || target.starts_with("perfect_sync")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -21,12 +25,10 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }
     let log_builder = tauri_plugin_log::Builder::new()
-        .level(if cfg!(debug_assertions) {
-            log::LevelFilter::Debug
-        } else {
-            log::LevelFilter::Info
+        .level(log::LevelFilter::Debug)
+        .filter(|metadata| {
+            settings::support_logging_enabled() && is_support_log_target(metadata.target())
         })
-        .filter(|metadata| metadata.target().starts_with("app_lib"))
         .max_file_size(5 * 1024 * 1024)
         .rotation_strategy(RotationStrategy::KeepOne)
         .clear_targets()
@@ -46,6 +48,17 @@ pub fn run() {
             let managed_data_dir = app.path().local_data_dir()?.join("Perfect-Sync");
             settings::initialize_managed_data_dir(managed_data_dir)?;
             let saved = settings::load()?;
+            settings::set_support_logging_enabled(saved.support_logging);
+            if saved.support_logging {
+                log::info!(
+                    target: "perfect_sync::support",
+                    "Perfect Sync {} started; os={} arch={} debug={}",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    cfg!(debug_assertions),
+                );
+            }
             if let Some(storage_path) = saved.storage_path.as_deref() {
                 let game_sources = saved
                     .game_instances
@@ -107,6 +120,8 @@ pub fn run() {
             commands::loader_status,
             commands::collect_diagnostics,
             commands::export_support_bundle,
+            commands::record_support_event,
+            commands::open_support_logs,
             commands::backup_save_data,
             commands::list_save_backups,
             commands::restore_save_data,
@@ -138,4 +153,18 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_support_log_target;
+
+    #[test]
+    fn diagnostic_logger_excludes_dependency_noise() {
+        assert!(is_support_log_target("app_lib::commands"));
+        assert!(is_support_log_target("perfect_sync::support"));
+        assert!(is_support_log_target("perfect_sync::performance"));
+        assert!(!is_support_log_target("tao::platform_impl"));
+        assert!(!is_support_log_target("hyper_util::client"));
+    }
 }

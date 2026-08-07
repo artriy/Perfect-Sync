@@ -6,6 +6,17 @@ import "@fontsource-variable/jetbrains-mono";
 import "./index.css";
 import { App } from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { formatSupportError, recordSupportEvent } from "./lib/supportLog";
+
+window.addEventListener("error", (event) => {
+  recordSupportEvent(
+    "error",
+    `uncaught webview error; message=${event.message}; source=${event.filename}:${event.lineno}:${event.colno}; error=${formatSupportError(event.error)}`,
+  );
+});
+window.addEventListener("unhandledrejection", (event) => {
+  recordSupportEvent("error", `unhandled webview rejection; error=${formatSupportError(event.reason)}`);
+});
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

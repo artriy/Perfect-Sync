@@ -1,4 +1,5 @@
 import { Component, createRef, type ReactNode } from "react";
+import { formatSupportError, recordSupportEvent } from "../lib/supportLog";
 
 interface State {
   hasError: boolean;
@@ -34,6 +35,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
   }
 
   componentDidCatch(error: unknown) {
+    recordSupportEvent("error", `React render failure; error=${formatSupportError(error)}`);
     console.error("UI crash:", error);
     this.recoveryRef.current?.focus();
   }

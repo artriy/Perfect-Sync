@@ -26,6 +26,11 @@ import type {
 } from "./types";
 
 import { CATALOG, PROFILES } from "../data/mock";
+import {
+  configureSupportLogging,
+  formatSupportError,
+  recordSupportEvent,
+} from "./supportLog";
 
 const TOWN_OF_US_ID = "au-avengers/tou-mira";
 const TOWN_OF_US_BUNDLED_IDS: Record<string, true> = {
@@ -38,10 +43,21 @@ const TOWN_OF_US_BUNDLED_IDS: Record<string, true> = {
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const started = performance.now();
+  recordSupportEvent("debug", `command started; name=${cmd}`);
   try {
-    return await tauriInvoke<T>(cmd, args);
+    const value = await tauriInvoke<T>(cmd, args);
+    recordSupportEvent(
+      "debug",
+      `command completed; name=${cmd}; durationMs=${Math.round(performance.now() - started)}`,
+    );
+    return value;
   } catch (reason: unknown) {
     const message = reason instanceof Error ? reason.message : String(reason);
+    recordSupportEvent(
+      "error",
+      `command failed; name=${cmd}; durationMs=${Math.round(performance.now() - started)}; error=${formatSupportError(reason)}`,
+    );
     if (/^HTTP status 403$/i.test(message.trim())) {
       throw "HTTP 403: GitHub's API limit is exhausted. Add a GitHub token in Settings, or retry after the rate-limit reset.";
     }
@@ -632,6 +648,7 @@ export async function detectGames(): Promise<GameInstall[]> {
 
 let browserSettings: Settings = {
   setupComplete: true,
+  supportLogging: false,
   freshSourceSetupComplete: true,
   gameInstances: [
     {
@@ -691,7 +708,11 @@ function normalizeBrowserSettings(settings: Settings): Settings {
 }
 
 export async function getSettings(): Promise<Settings> {
-  if (inTauri) return invoke<Settings>("get_settings");
+  if (inTauri) {
+    const loaded = await invoke<Settings>("get_settings");
+    configureSupportLogging(!!loaded.supportLogging);
+    return loaded;
+  }
   return structuredClone(browserSettings);
 }
 
@@ -700,10 +721,12 @@ export async function saveSettings(
   tokenAction: GithubTokenAction = { kind: "unchanged" },
 ): Promise<Settings> {
   if (inTauri) {
-    return invoke<Settings>("save_settings", {
+    const saved = await invoke<Settings>("save_settings", {
       settings: settingsPayload(settings),
       tokenAction,
     });
+    configureSupportLogging(!!saved.supportLogging);
+    return saved;
   }
   if (tokenAction.kind === "set" && !tokenAction.token.trim()) {
     throw new Error("GitHub token cannot be blank.");
@@ -843,6 +866,11 @@ export async function collectDiagnostics(profileId?: string): Promise<Diagnostic
     gameRunning: profileId ? browserRunning.has(profileId) : browserRunning.size > 0,
     warnings: [],
   };
+}
+
+export async function openSupportLogs(profileId?: string): Promise<string> {
+  if (!inTauri) return "Perfect Sync Logs";
+  return invoke<string>("open_support_logs", { profileId });
 }
 
 export async function exportSupportBundle(profileId?: string): Promise<string | null> {

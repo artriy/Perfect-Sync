@@ -9,6 +9,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
 const KEYRING_SERVICE: &str = "com.artriy.perfectsync";
@@ -20,6 +21,7 @@ static APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 static DEFAULT_MANAGED_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 static MANAGED_DATA_DIR: OnceLock<RwLock<PathBuf>> = OnceLock::new();
 static SETTINGS_IO: Mutex<()> = Mutex::new(());
+static SUPPORT_LOGGING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// A mod the user always wants merged into any lobby code they apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +94,8 @@ pub struct Settings {
     /// `None` keeps the platform-local default.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub storage_path: Option<String>,
+    #[serde(default)]
+    pub support_logging: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -323,6 +327,14 @@ pub fn catalog_cache_path() -> PathBuf {
 
 pub fn user_catalog_path() -> PathBuf {
     app_data_dir().join("user_catalog.json")
+}
+
+pub fn support_logging_enabled() -> bool {
+    SUPPORT_LOGGING_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_support_logging_enabled(enabled: bool) {
+    SUPPORT_LOGGING_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 pub fn app_data_dir() -> PathBuf {
@@ -953,6 +965,18 @@ pub fn github_token() -> Result<Option<SecretString>, SettingsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_logging_is_opt_in_and_persisted() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!missing.support_logging);
+
+        let enabled: Settings = serde_json::from_str(r#"{"supportLogging":true}"#).unwrap();
+        assert!(enabled.support_logging);
+        assert_eq!(
+            serde_json::to_value(enabled).unwrap()["supportLogging"],
+            serde_json::Value::Bool(true)
+        );
+    }
 
     #[test]
     fn v016_profile_reset_is_complete_and_idempotent() {
@@ -1006,6 +1030,7 @@ mod tests {
             skip_launch_warning: true,
             active_profile: Some("old-profile".into()),
             storage_path: Some(custom_data.to_string_lossy().into_owned()),
+            support_logging: false,
         };
         write_settings_at(&app_data.join("settings.json"), &saved, |_| Ok(())).unwrap();
 

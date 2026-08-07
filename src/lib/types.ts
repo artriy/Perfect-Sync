@@ -190,6 +190,7 @@ export interface Settings {
   activeProfile?: string;
   /** custom root for direct profile instances and package caches; omitted for the platform default */
   storagePath?: string;
+  supportLogging?: boolean;
   /** whether a GitHub token is stored in the native credential store */
   hasGithubToken: boolean;
   /** warning returned after malformed settings were quarantined */

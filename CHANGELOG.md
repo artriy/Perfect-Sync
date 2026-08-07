@@ -48,6 +48,13 @@
 - Continuously drain CrossOver output into bounded 8 KiB tails and include redacted
   wrapper status, stdout, and stderr when startup fails instead of returning an opaque
   five-minute timeout.
+- Add opt-in diagnostic logging in Settings. When enabled, persist frontend command
+  lifecycles, backend operation and launch stages, bounded CrossOver output, failures,
+  runtime details, and process readiness while excluding command arguments and redacting
+  user paths and token-shaped strings from app events.
+- Add an Open logs action that refreshes `diagnostics.json`, redacted settings, the
+  selected profile definition, and its BepInEx `LogOutput.log`, then opens the native log
+  directory. Keep only the current and previous 5 MiB app logs; logging is off by default.
 - Turn the running-state launch control into a scoped Stop button that terminates only
   that profile's process tree, and refresh status after a rejected launch so the Stop
   action appears immediately for a late-starting process.
