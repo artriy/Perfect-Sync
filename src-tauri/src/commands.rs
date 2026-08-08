@@ -7904,6 +7904,10 @@ fn launch_prepared_game(
         context.host,
         context.prefix.is_some(),
     );
+    if context.runtime == Runtime::Crossover && context.host == compat::HostPlatform::Macos {
+        loader::disable_splash_screen(game_dir)
+            .map_err(|error| format!("couldn't disable the CrossOver splash screen: {error}"))?;
+    }
     if store == Store::Epic {
         let starter = ensure_epic_starter(&http()?, game_dir, workspace_id)?;
         prepare_epic_auth_stores(game_dir, &context)?;
@@ -10826,7 +10830,7 @@ mod tests {
 
         if let Ok(role) = std::env::var(ROLE) {
             match role.as_str() {
-                "launcher" => std::thread::sleep(Duration::from_secs(5)),
+                "launcher" => std::thread::sleep(Duration::from_secs(8)),
                 "game" => std::thread::sleep(Duration::from_secs(5)),
                 _ => panic!("unexpected CrossOver supervisor role"),
             }

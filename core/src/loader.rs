@@ -62,6 +62,7 @@ const SPLASH_SCREEN_ORIGINAL: &str =
     "BepInEx/patchers/BepInEx.SplashScreen/BepInEx.SplashScreen.GUI.exe";
 const SPLASH_SCREEN_RUNTIME_NAME: &str =
     "BepInEx/patchers/BepInEx.SplashScreen/Among Us.SplashScreen.GUI.exe";
+const SPLASH_SCREEN_CONFIG: &str = "BepInEx.SplashScreen.cfg";
 const MAX_MANAGED_LEVELIMPOSTER_MAPS: usize = 4_096;
 const MAX_MANAGED_LEVELIMPOSTER_MAP_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANAGED_LEVELIMPOSTER_MAP_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
@@ -1101,6 +1102,97 @@ pub fn write_console_off(game_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(&cfg_dir)?;
     let cfg = "[Logging.Console]\nEnabled = false\n\n[Logging.Disk]\nEnabled = true\nWriteUnityLog = false\n";
     atomic_write(&cfg_dir.join("BepInEx.cfg"), cfg.as_bytes())
+}
+
+fn configured_splash_config(bytes: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let source = std::str::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BepInEx splash configuration is not UTF-8",
+        )
+    })?;
+    let (bom, body) = source
+        .strip_prefix('\u{feff}')
+        .map_or(("", source), |body| ("\u{feff}", body));
+    let newline = if body.contains("\r\n") { "\r\n" } else { "\n" };
+    let had_trailing_newline = body.ends_with('\n') || body.ends_with('\r');
+    let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
+    let mut general_header = None;
+    let mut in_general = false;
+    let mut enabled_found = false;
+    let mut changed = false;
+
+    for (index, line) in lines.iter_mut().enumerate() {
+        let trimmed = line.trim();
+        if let Some(section) = trimmed
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        {
+            in_general = section.trim() == "General";
+            if in_general && general_header.is_none() {
+                general_header = Some(index);
+            }
+            continue;
+        }
+        if in_general
+            && !trimmed.starts_with('#')
+            && !trimmed.starts_with(';')
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "Enabled")
+        {
+            enabled_found = true;
+            let disabled = trimmed
+                .split_once('=')
+                .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("false"));
+            if !disabled {
+                *line = "Enabled = false".to_string();
+                changed = true;
+            }
+        }
+    }
+
+    if !enabled_found {
+        if let Some(header) = general_header {
+            lines.insert(header + 1, "Enabled = false".to_string());
+        } else {
+            if !lines.is_empty() && lines.last().is_some_and(|line| !line.is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push("[General]".to_string());
+            lines.push(String::new());
+            lines.push("Enabled = false".to_string());
+        }
+        changed = true;
+    }
+    if !changed {
+        return Ok(None);
+    }
+
+    let mut configured = String::with_capacity(source.len() + 32);
+    configured.push_str(bom);
+    configured.push_str(&lines.join(newline));
+    if had_trailing_newline {
+        configured.push_str(newline);
+    }
+    Ok(Some(configured.into_bytes()))
+}
+
+pub fn disable_splash_screen(game_dir: &Path) -> io::Result<()> {
+    let cfg_dir = game_dir.join("BepInEx").join("config");
+    let path = cfg_dir.join(SPLASH_SCREEN_CONFIG);
+    crate::profile::reject_reparse(&game_dir.join("BepInEx"))?;
+    crate::profile::reject_reparse(&cfg_dir)?;
+    crate::profile::reject_reparse(&path)?;
+    let existing = match fs::read(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if let Some(configured) = configured_splash_config(&existing)? {
+        atomic_write(&path, &configured)?;
+    }
+    Ok(())
 }
 
 /// Write `steam_appid.txt` next to the exe so a direct launch passes Steam auth.
@@ -3594,6 +3686,53 @@ mod tests {
         .unwrap();
         assert!(cfg.contains("[Logging.Console]"));
         assert!(cfg.contains("Enabled = false"));
+    }
+
+    #[test]
+    fn disables_splash_without_replacing_other_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("BepInEx").join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join(SPLASH_SCREEN_CONFIG);
+        let original = b"\xef\xbb\xbf[General]\r\n\r\n# Display splash\r\nEnabled = true\r\n\r\nOnlyNoConsole = true\r\nRenameExe = true\r\n";
+        fs::write(&path, original).unwrap();
+
+        disable_splash_screen(tmp.path()).unwrap();
+        let configured = fs::read(&path).unwrap();
+        assert_eq!(
+            configured,
+            b"\xef\xbb\xbf[General]\r\n\r\n# Display splash\r\nEnabled = false\r\n\r\nOnlyNoConsole = true\r\nRenameExe = true\r\n"
+        );
+
+        disable_splash_screen(tmp.path()).unwrap();
+        assert_eq!(fs::read(path).unwrap(), configured);
+    }
+
+    #[test]
+    fn writes_case_sensitive_splash_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("BepInEx").join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join(SPLASH_SCREEN_CONFIG);
+        fs::write(&path, b"[general]\nenabled = false\n").unwrap();
+
+        disable_splash_screen(tmp.path()).unwrap();
+        assert_eq!(
+            fs::read(path).unwrap(),
+            b"[general]\nenabled = false\n\n[General]\n\nEnabled = false\n"
+        );
+    }
+
+    #[test]
+    fn absent_splash_config_is_not_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        disable_splash_screen(tmp.path()).unwrap();
+        assert!(!tmp
+            .path()
+            .join("BepInEx")
+            .join("config")
+            .join(SPLASH_SCREEN_CONFIG)
+            .exists());
     }
 
     #[test]
