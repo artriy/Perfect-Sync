@@ -467,6 +467,7 @@ fn wine_environment(
 }
 
 const CROSSOVER_BUILTIN_GRAPHICS_OVERRIDE: &str = "d3d11,dxgi=b";
+const CROSSOVER_WINED3D_ENV: &str = "CX_GRAPHICS_BACKEND=wined3d";
 
 fn crossover_dll_overrides(
     inherited_override: Option<OsString>,
@@ -485,21 +486,27 @@ fn crossover_dll_overrides(
 fn add_crossover_runtime_args(
     args: &mut Vec<OsString>,
     inherited_override: Option<OsString>,
-    force_builtin_graphics: bool,
+    use_graphics_compatibility: bool,
 ) {
     let delimiter = args
         .iter()
         .position(|argument| argument == "--")
         .unwrap_or(args.len());
-    args.splice(
-        delimiter..delimiter,
-        [
-            OsString::from("--no-update"),
-            OsString::from("--wait-children"),
-            OsString::from("--dll"),
-            crossover_dll_overrides(inherited_override, force_builtin_graphics),
-        ],
-    );
+    let mut runtime_args = vec![
+        OsString::from("--no-update"),
+        OsString::from("--wait-children"),
+    ];
+    if use_graphics_compatibility {
+        runtime_args.extend([
+            OsString::from("--env"),
+            OsString::from(CROSSOVER_WINED3D_ENV),
+        ]);
+    }
+    runtime_args.extend([
+        OsString::from("--dll"),
+        crossover_dll_overrides(inherited_override, use_graphics_compatibility),
+    ]);
+    args.splice(delimiter..delimiter, runtime_args);
 }
 
 fn build_program_spec_with_crossover_graphics(
@@ -1050,16 +1057,24 @@ mod tests {
         ctx.host = HostPlatform::Macos;
         let spec = build_launch_spec(game, &ctx);
         assert_eq!(
-            &spec.args[..5],
-            ["--bottle", "AU", "--no-update", "--wait-children", "--dll"]
+            &spec.args[..7],
+            [
+                "--bottle",
+                "AU",
+                "--no-update",
+                "--wait-children",
+                "--env",
+                CROSSOVER_WINED3D_ENV,
+                "--dll",
+            ]
         );
         assert_eq!(
-            spec.args[5],
+            spec.args[7],
             crossover_dll_overrides(std::env::var_os("WINEDLLOVERRIDES"), true)
         );
-        assert_eq!(spec.args[6], "--");
-        assert_eq!(Path::new(&spec.args[7]), game.join(GAME_EXE));
-        assert_eq!(spec.args[8], "-force-d3d11-bitblt-model");
+        assert_eq!(spec.args[8], "--");
+        assert_eq!(Path::new(&spec.args[9]), game.join(GAME_EXE));
+        assert_eq!(spec.args[10], "-force-d3d11-bitblt-model");
         assert!(spec.program.ends_with("bin/wine"));
         assert!(spec.env.iter().any(|(k, v)| k == "CX_BOTTLE" && v == "AU"));
     }
@@ -1079,6 +1094,10 @@ mod tests {
             .args
             .iter()
             .any(|argument| argument == "-force-d3d11-bitblt-model"));
+        assert!(!game_spec
+            .args
+            .iter()
+            .any(|argument| argument == CROSSOVER_WINED3D_ENV));
         assert_eq!(
             game_spec.args[5],
             crossover_dll_overrides(std::env::var_os("WINEDLLOVERRIDES"), false)
@@ -1090,6 +1109,10 @@ mod tests {
             .args
             .iter()
             .any(|argument| argument == "-force-d3d11-bitblt-model"));
+        assert!(!helper_spec
+            .args
+            .iter()
+            .any(|argument| argument == CROSSOVER_WINED3D_ENV));
         assert_eq!(
             helper_spec.args[5],
             crossover_dll_overrides(std::env::var_os("WINEDLLOVERRIDES"), false)
@@ -1115,10 +1138,23 @@ mod tests {
     }
 
     #[test]
-    fn crossover_runtime_args_append_builtin_graphics_after_inherited_overrides() {
+    fn crossover_runtime_args_force_wined3d_after_inherited_overrides() {
         let mut args = vec!["--bottle".into(), "AU".into(), "--".into()];
         add_crossover_runtime_args(&mut args, Some(OsString::from("custom=n;d3d11=n")), true);
-        assert_eq!(args[5], "custom=n;d3d11=n;d3d11,dxgi=b");
+        assert_eq!(
+            args,
+            [
+                "--bottle",
+                "AU",
+                "--no-update",
+                "--wait-children",
+                "--env",
+                CROSSOVER_WINED3D_ENV,
+                "--dll",
+                "custom=n;d3d11=n;d3d11,dxgi=b",
+                "--",
+            ]
+        );
         assert_eq!(
             crossover_dll_overrides(None, true),
             "winhttp=n,b;d3d11,dxgi=b"

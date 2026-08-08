@@ -49,10 +49,10 @@
 - Disable the Town of Us BepInEx splash process before macOS CrossOver launches,
   including launches from cached workspaces. Preserve its other settings and leave
   native Windows behavior unchanged.
-- For managed Among Us executables launched directly through macOS CrossOver, use
-  Wine's built-in D3D11/DXGI implementation and Unity's BitBlt presentation model.
-  This bypasses the failing Metal compute pipeline and unsupported flip-model swapchain
-  without changing bottle settings; CrossOver Epic helper launches remain unchanged.
+- For managed Among Us executables launched directly through macOS CrossOver, select
+  WineD3D, use Wine's built-in D3D11/DXGI modules, and use Unity's BitBlt presentation
+  model. This bypasses the failing DXMT Metal compute pipeline and unsupported
+  flip-model swapchain without changing bottle settings; Epic helpers remain unchanged.
 - Recognize CrossOver's default `Y:` home mapping, custom drive letters, NT Unix paths,
   and macOS `winetemp` loader links without falling back to a global process-name match;
   ambiguous processes must hold the selected managed executable according to `lsof`.
