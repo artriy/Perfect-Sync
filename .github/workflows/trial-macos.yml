@@ -71,8 +71,12 @@ jobs:
           stage="$RUNNER_TEMP/perfect-sync-macos-${{ matrix.arch }}"
           mkdir -p "$stage"
           for file in "${dmgs[@]}" "${archives[@]}" "${signatures[@]}"; do
-            cp "$file" "$stage/"
-            shasum -a 256 "$file" >> "$stage/SHA256SUMS.txt"
+            name="$(basename "$file")"
+            cp "$file" "$stage/$name"
+            (
+              cd "$stage"
+              shasum -a 256 "$name" >> SHA256SUMS.txt
+            )
           done
 
       - name: Upload trial artifact
