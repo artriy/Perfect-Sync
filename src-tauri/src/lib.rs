@@ -4,8 +4,22 @@ mod managed_instance;
 mod settings;
 mod storage;
 
+use std::fs;
+use std::io;
+use std::path::Path;
 use tauri::Manager;
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
+
+pub(crate) const SUPPORT_LOG_FILE_NAME: &str = "perfect-sync.log";
+
+pub(crate) fn reset_support_log(log_dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(log_dir)?;
+    fs::File::create(log_dir.join(SUPPORT_LOG_FILE_NAME)).map(|_| ())
+}
+
+pub(crate) fn support_logging_changed(previous: bool, current: bool) -> bool {
+    previous != current
+}
 
 fn is_support_log_target(target: &str) -> bool {
     target.starts_with("app_lib") || target.starts_with("perfect_sync")
@@ -33,7 +47,7 @@ pub fn run() {
         .rotation_strategy(RotationStrategy::KeepOne)
         .clear_targets()
         .target(Target::new(TargetKind::LogDir {
-            file_name: Some("perfect-sync".to_string()),
+            file_name: Some(SUPPORT_LOG_FILE_NAME.to_string()),
         }));
     #[cfg(debug_assertions)]
     let log_builder = log_builder.target(Target::new(TargetKind::Stdout));
@@ -43,6 +57,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
+            let support_log_dir = app.path().app_log_dir()?;
+            reset_support_log(&support_log_dir)?;
             let data_dir = app.path().data_dir()?.join("Perfect-Sync");
             settings::initialize_app_data_dir(data_dir)?;
             let managed_data_dir = app.path().local_data_dir()?.join("Perfect-Sync");
@@ -157,7 +173,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_support_log_target;
+    use super::{
+        is_support_log_target, reset_support_log, support_logging_changed, SUPPORT_LOG_FILE_NAME,
+    };
+    use std::fs;
 
     #[test]
     fn diagnostic_logger_excludes_dependency_noise() {
@@ -166,5 +185,33 @@ mod tests {
         assert!(is_support_log_target("perfect_sync::performance"));
         assert!(!is_support_log_target("tao::platform_impl"));
         assert!(!is_support_log_target("hyper_util::client"));
+    }
+
+    #[test]
+    fn support_log_reset_replaces_stale_bytes_with_an_active_writer() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join(SUPPORT_LOG_FILE_NAME);
+        let mut active_log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        active_log.write_all(b"stale diagnostic session").unwrap();
+
+        reset_support_log(temp.path()).unwrap();
+        active_log.write_all(b"fresh diagnostic session").unwrap();
+        active_log.flush().unwrap();
+
+        assert_eq!(fs::read(log_path).unwrap(), b"fresh diagnostic session");
+    }
+
+    #[test]
+    fn unchanged_support_logging_state_does_not_require_reset() {
+        assert!(!support_logging_changed(false, false));
+        assert!(!support_logging_changed(true, true));
+        assert!(support_logging_changed(false, true));
+        assert!(support_logging_changed(true, false));
     }
 }

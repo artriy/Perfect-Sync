@@ -359,6 +359,110 @@ pub fn try_is_executable_running(executable: &Path) -> io::Result<bool> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+struct WindowMetadata {
+    owner_pid: u32,
+    layer: i32,
+    alpha: f64,
+    width: f64,
+    height: f64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_usable_window(managed_pids: &[u32], window: &WindowMetadata) -> bool {
+    managed_pids.contains(&window.owner_pid)
+        && window.layer == 0
+        && window.alpha > 0.0
+        && window.width.is_finite()
+        && window.width > 0.0
+        && window.height.is_finite()
+        && window.height > 0.0
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dictionary_value(
+    dictionary: &core_foundation::dictionary::CFDictionary,
+    key: core_foundation::string::CFStringRef,
+) -> Option<core_foundation::base::CFType> {
+    use core_foundation::base::TCFType;
+
+    let value = dictionary.find(key.cast::<std::ffi::c_void>())?;
+    Some(unsafe { core_foundation::base::CFType::wrap_under_get_rule((*value).cast()) })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_metadata(
+    dictionary: &core_foundation::dictionary::CFDictionary,
+) -> Option<WindowMetadata> {
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_graphics::geometry::CGRect;
+    use core_graphics::window::{
+        kCGWindowAlpha, kCGWindowBounds, kCGWindowLayer, kCGWindowOwnerPID,
+    };
+
+    let owner_pid = macos_dictionary_value(dictionary, unsafe { kCGWindowOwnerPID })?
+        .downcast_into::<CFNumber>()?
+        .to_i64()
+        .and_then(|pid| u32::try_from(pid).ok())?;
+    let layer = macos_dictionary_value(dictionary, unsafe { kCGWindowLayer })?
+        .downcast_into::<CFNumber>()?
+        .to_i32()?;
+    let alpha = macos_dictionary_value(dictionary, unsafe { kCGWindowAlpha })?
+        .downcast_into::<CFNumber>()?
+        .to_f64()?;
+    let bounds = macos_dictionary_value(dictionary, unsafe { kCGWindowBounds })?
+        .downcast_into::<CFDictionary>()?;
+    let bounds = CGRect::from_dict_representation(&bounds)?;
+
+    Some(WindowMetadata {
+        owner_pid,
+        layer,
+        alpha,
+        width: bounds.size.width,
+        height: bounds.size.height,
+    })
+}
+
+pub fn try_has_usable_window(executable: &Path) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        use core_foundation::base::{CFType, TCFType};
+        use core_foundation::dictionary::CFDictionary;
+        use core_graphics::window::{
+            copy_window_info, kCGNullWindowID, kCGWindowListExcludeDesktopElements,
+            kCGWindowListOptionOnScreenOnly,
+        };
+
+        let managed_pids = unix_game_pids_from_system(executable, false)?;
+        if managed_pids.is_empty() {
+            return Ok(false);
+        }
+        let windows = copy_window_info(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID,
+        )
+        .ok_or_else(|| io::Error::other("unable to enumerate on-screen windows"))?;
+        for window in &windows {
+            let window = unsafe { CFType::wrap_under_get_rule((*window).cast()) };
+            let Some(dictionary) = window.downcast_into::<CFDictionary>() else {
+                continue;
+            };
+            let Some(metadata) = macos_window_metadata(&dictionary) else {
+                continue;
+            };
+            if is_usable_window(&managed_pids, &metadata) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        try_is_executable_running(executable)
+    }
+}
+
 /// Query whether the Among Us executable inside one concrete game directory is
 /// running. Unlike the global query, another profile or source does not match.
 pub fn try_is_game_dir_running(game_dir: &Path) -> io::Result<bool> {
@@ -740,6 +844,68 @@ pub fn launch_interactive(spec: &LaunchSpec) -> io::Result<Child> {
 mod query_tests {
     use super::*;
 
+    #[test]
+    fn usable_window_accepts_exact_managed_pid() {
+        let window = WindowMetadata {
+            owner_pid: 401,
+            layer: 0,
+            alpha: 1.0,
+            width: 1280.0,
+            height: 720.0,
+        };
+
+        assert!(is_usable_window(&[401], &window));
+    }
+
+    #[test]
+    fn usable_window_rejects_unmanaged_steam_pid() {
+        let steam_window = WindowMetadata {
+            owner_pid: 402,
+            layer: 0,
+            alpha: 1.0,
+            width: 1280.0,
+            height: 720.0,
+        };
+
+        assert!(!is_usable_window(&[401], &steam_window));
+    }
+
+    #[test]
+    fn usable_window_rejects_invalid_layer_alpha_and_geometry() {
+        let metadata = |layer, alpha, width, height| WindowMetadata {
+            owner_pid: 401,
+            layer,
+            alpha,
+            width,
+            height,
+        };
+        let invalid = [
+            metadata(1, 1.0, 1280.0, 720.0),
+            metadata(0, 0.0, 1280.0, 720.0),
+            metadata(0, -1.0, 1280.0, 720.0),
+            metadata(0, 1.0, 0.0, 720.0),
+            metadata(0, 1.0, 1280.0, 0.0),
+            metadata(0, 1.0, f64::NAN, 720.0),
+            metadata(0, 1.0, 1280.0, f64::INFINITY),
+        ];
+
+        assert!(invalid
+            .iter()
+            .all(|window| !is_usable_window(&[401], window)));
+    }
+
+    #[test]
+    fn usable_window_accepts_any_exact_managed_pid() {
+        let window = WindowMetadata {
+            owner_pid: 403,
+            layer: 0,
+            alpha: 1.0,
+            width: 1280.0,
+            height: 720.0,
+        };
+
+        assert!(is_usable_window(&[401, 403], &window));
+    }
     #[test]
     fn unix_process_matching_rejects_zombies() {
         assert_eq!(

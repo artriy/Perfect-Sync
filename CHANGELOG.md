@@ -37,22 +37,26 @@
   `--wait-children` wrapper, and pass the `winhttp` override through CrossOver's
   supported command-line option so BepInEx receives its loader hook.
 - Watch CrossOver's wrapper and exact managed game process under one five-minute
-  startup deadline, requiring the game to remain alive for three seconds before
-  reporting success. Slow cold bottles remain pending beyond 30 seconds; dispatcher,
-  transient-process, and real-timeout failures clear pending state so repeat launch
-  can retry. CrossOver Epic launches use the same watchdog, retain the starter's input
-  pipe, and submit Enter after stable readiness or cleanup.
+  startup deadline, then require a visible, nonzero game window owned by that exact
+  process to remain present for three seconds before reporting success. Headless,
+  transient-process, dispatcher, and real-timeout failures clear pending state and
+  stop the managed attempt so repeat launch can retry. CrossOver Epic launches use
+  the same watchdog, retain the starter's input pipe, and submit Enter after stable
+  readiness or cleanup.
 - Before direct Steam launches on macOS, start `steam.exe -silent` in the same bottle
   when its exact process is absent, require ten seconds of continuous Steam readiness,
   retain the managed `steam_appid.txt`, and never redirect to the original with
   `-applaunch`.
-- Disable the Town of Us BepInEx splash process before macOS CrossOver launches,
-  including launches from cached workspaces. Preserve its other settings and leave
-  native Windows behavior unchanged.
+- Disable the BepInEx splash helper before macOS CrossOver launches, including the
+  first launch before its config exists and launches from cached workspaces. Preserve
+  unrelated splash settings, do not create splash artifacts when the helper is absent,
+  and leave native Windows behavior unchanged.
 - For managed Among Us executables launched directly through macOS CrossOver, select
-  WineD3D, use Wine's built-in D3D11/DXGI modules, and use Unity's BitBlt presentation
-  model. This bypasses the failing DXMT Metal compute pipeline and unsupported
-  flip-model swapchain without changing bottle settings; Epic helpers remain unchanged.
+  WineD3D with current and legacy CrossOver controls, clear a preselected D3DMetal DLL
+  path, use Wine's built-in D3D11/DXGI modules, and explicitly select Unity D3D11 with
+  its BitBlt presentation model. This bypasses the failing DXMT Metal compute pipeline
+  and unsupported flip-model swapchain without changing bottle settings; Epic helpers
+  remain unchanged.
 - Recognize CrossOver's default `Y:` home mapping, custom drive letters, NT Unix paths,
   and macOS `winetemp` loader links without falling back to a global process-name match;
   ambiguous processes must hold the selected managed executable according to `lsof`.
@@ -62,10 +66,11 @@
 - Add opt-in diagnostic logging in Settings. When enabled, persist frontend command
   lifecycles, backend operation and launch stages, bounded CrossOver output, failures,
   runtime details, and process readiness while excluding command arguments and redacting
-  user paths and token-shaped strings from app events.
+  user paths and token-shaped strings from app events. Start a fresh `perfect-sync.log`
+  on every app start and whenever diagnostic logging is enabled or disabled.
 - Add an Open logs action that refreshes `diagnostics.json`, redacted settings, the
   selected profile definition, and its BepInEx `LogOutput.log`, then opens the native log
-  directory. Keep only the current and previous 5 MiB app logs; logging is off by default.
+  directory. Limit the active app log to 5 MiB; logging is off by default.
 - Turn the running-state launch control into a scoped Stop button that terminates only
   that profile's process tree, and refresh status after a rejected launch so the Stop
   action appears immediately for a late-starting process.

@@ -467,7 +467,8 @@ fn wine_environment(
 }
 
 const CROSSOVER_BUILTIN_GRAPHICS_OVERRIDE: &str = "d3d11,dxgi=b";
-const CROSSOVER_WINED3D_ENV: &str = "CX_GRAPHICS_BACKEND=wined3d";
+const CROSSOVER_WINED3D_ENV: &str =
+    "CX_GRAPHICS_BACKEND=wined3d WINED3DMETAL=0 WINEDLLPATH_PREPEND=";
 
 fn crossover_dll_overrides(
     inherited_override: Option<OsString>,
@@ -601,7 +602,10 @@ pub fn build_launch_spec(game_dir: &Path, ctx: &RuntimeContext) -> LaunchSpec {
         use_crossover_graphics_compatibility,
     );
     if use_crossover_graphics_compatibility {
-        spec.args.push("-force-d3d11-bitblt-model".into());
+        spec.args.extend([
+            OsString::from("-force-d3d11"),
+            OsString::from("-force-d3d11-bitblt-model"),
+        ]);
     }
     spec
 }
@@ -1064,23 +1068,54 @@ mod tests {
                 "--no-update",
                 "--wait-children",
                 "--env",
-                CROSSOVER_WINED3D_ENV,
+                "CX_GRAPHICS_BACKEND=wined3d WINED3DMETAL=0 WINEDLLPATH_PREPEND=",
                 "--dll",
             ]
+        );
+        assert_eq!(
+            spec.args
+                .iter()
+                .filter(|argument| *argument == "--env")
+                .count(),
+            1
         );
         assert_eq!(
             spec.args[7],
             crossover_dll_overrides(std::env::var_os("WINEDLLOVERRIDES"), true)
         );
-        assert_eq!(spec.args[8], "--");
-        assert_eq!(Path::new(&spec.args[9]), game.join(GAME_EXE));
-        assert_eq!(spec.args[10], "-force-d3d11-bitblt-model");
+        let delimiter_position = spec
+            .args
+            .iter()
+            .position(|argument| argument == "--")
+            .unwrap();
+        let managed_executable = game.join(GAME_EXE);
+        let executable_position = spec
+            .args
+            .iter()
+            .position(|argument| Path::new(argument) == managed_executable)
+            .unwrap();
+        let force_d3d11_position = spec
+            .args
+            .iter()
+            .position(|argument| argument == "-force-d3d11")
+            .unwrap();
+        let bitblt_position = spec
+            .args
+            .iter()
+            .position(|argument| argument == "-force-d3d11-bitblt-model")
+            .unwrap();
+        assert!(delimiter_position < executable_position);
+        assert!(delimiter_position < force_d3d11_position);
+        assert!(delimiter_position < bitblt_position);
+        assert!(executable_position < force_d3d11_position);
+        assert!(executable_position < bitblt_position);
+        assert_eq!(force_d3d11_position + 1, bitblt_position);
         assert!(spec.program.ends_with("bin/wine"));
         assert!(spec.env.iter().any(|(k, v)| k == "CX_BOTTLE" && v == "AU"));
     }
 
     #[test]
-    fn crossover_bitblt_override_is_limited_to_macos_game_launches() {
+    fn crossover_unity_d3d11_overrides_are_limited_to_macos_game_launches() {
         let game = Path::new("/CrossOver/Bottles/AU/drive_c/Games/Among Us");
         let mut ctx = context(
             Runtime::Crossover,
@@ -1090,10 +1125,9 @@ mod tests {
         ctx.launcher_args = vec!["--bottle".into(), "AU".into(), "--".into()];
 
         let game_spec = build_launch_spec(game, &ctx);
-        assert!(!game_spec
-            .args
-            .iter()
-            .any(|argument| argument == "-force-d3d11-bitblt-model"));
+        for unity_flag in ["-force-d3d11", "-force-d3d11-bitblt-model"] {
+            assert!(!game_spec.args.iter().any(|argument| argument == unity_flag));
+        }
         assert!(!game_spec
             .args
             .iter()
@@ -1105,10 +1139,12 @@ mod tests {
 
         ctx.host = HostPlatform::Macos;
         let helper_spec = build_program_spec(&game.join("helper.exe"), game, &ctx);
-        assert!(!helper_spec
-            .args
-            .iter()
-            .any(|argument| argument == "-force-d3d11-bitblt-model"));
+        for unity_flag in ["-force-d3d11", "-force-d3d11-bitblt-model"] {
+            assert!(!helper_spec
+                .args
+                .iter()
+                .any(|argument| argument == unity_flag));
+        }
         assert!(!helper_spec
             .args
             .iter()
@@ -1149,11 +1185,15 @@ mod tests {
                 "--no-update",
                 "--wait-children",
                 "--env",
-                CROSSOVER_WINED3D_ENV,
+                "CX_GRAPHICS_BACKEND=wined3d WINED3DMETAL=0 WINEDLLPATH_PREPEND=",
                 "--dll",
                 "custom=n;d3d11=n;d3d11,dxgi=b",
                 "--",
             ]
+        );
+        assert_eq!(
+            args.iter().filter(|argument| *argument == "--env").count(),
+            1
         );
         assert_eq!(
             crossover_dll_overrides(None, true),

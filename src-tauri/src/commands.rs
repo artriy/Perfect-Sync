@@ -5,9 +5,9 @@
 //! Network/disk-heavy commands are `async` and run their blocking body on a
 //! worker thread via `spawn_blocking`, so the UI thread never freezes.
 
-use crate::managed_instance;
 use crate::settings::{self, Settings, SettingsView, TokenAction};
 use crate::storage;
+use crate::{managed_instance, reset_support_log, support_logging_changed};
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use perfect_sync_core::catalog::{parse, AssetArchRule, AssetRules, Catalog};
@@ -355,6 +355,7 @@ fn wait_for_crossover_process(
     process_name: &str,
     timeout: Duration,
     stability: Duration,
+    mut readiness: impl FnMut(&Path) -> std::io::Result<bool>,
     mut poll_launcher: impl FnMut() -> Result<(), String>,
 ) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
@@ -362,19 +363,19 @@ fn wait_for_crossover_process(
     let mut poll_interval = Duration::from_millis(100);
     loop {
         poll_launcher()?;
-        let running = process::try_is_executable_running(executable).map_err(|error| {
+        let ready_now = readiness(executable).map_err(|error| {
             format!("Could not verify whether CrossOver started {process_name}: {error}")
         })?;
         let now = Instant::now();
-        if running {
-            let ready = ready_since.get_or_insert(now);
-            if now.duration_since(*ready) >= stability {
+        if ready_now {
+            let stable_since = ready_since.get_or_insert(now);
+            if now.duration_since(*stable_since) >= stability {
                 return Ok(true);
             }
             poll_interval = Duration::from_millis(100);
         } else if ready_since.take().is_some() {
             return Err(format!(
-                "{process_name} exited before remaining alive for {} during CrossOver startup.",
+                "{process_name} stopped meeting launch readiness before remaining ready for {} during CrossOver startup.",
                 crossover_timeout_label(stability)
             ));
         }
@@ -382,7 +383,7 @@ fn wait_for_crossover_process(
             return Ok(false);
         }
         std::thread::sleep(poll_interval.min(deadline - now));
-        if !running {
+        if !ready_now {
             poll_interval = (poll_interval + poll_interval).min(Duration::from_secs(1));
         }
     }
@@ -584,10 +585,10 @@ fn with_crossover_output(mut message: String, diagnostic: String) -> String {
 
 fn crossover_exit_error(status: std::process::ExitStatus, diagnostic: String) -> String {
     let message = if status.success() {
-        "CrossOver's attached wrapper exited successfully before the exact managed Among Us process became ready. Verify the selected bottle and CrossOver installation, then retry.".to_string()
+        "CrossOver's attached wrapper exited successfully before the exact managed Among Us process presented a usable game window. Verify the selected bottle and CrossOver installation, then retry.".to_string()
     } else {
         format!(
-            "CrossOver's attached wrapper exited with {status} before the exact managed Among Us process became ready. Verify the selected bottle and CrossOver installation, then retry."
+            "CrossOver's attached wrapper exited with {status} before the exact managed Among Us process presented a usable game window. Verify the selected bottle and CrossOver installation, then retry."
         )
     };
     with_crossover_output(message, diagnostic)
@@ -771,6 +772,7 @@ fn ensure_crossover_steam_ready(
         "Steam",
         CROSSOVER_STEAM_START_TIMEOUT,
         CROSSOVER_STEAM_STABILITY,
+        process::try_is_executable_running,
         || poll_crossover_steam_wrapper(&mut launcher, &mut wrapper_exit),
     );
 
@@ -936,6 +938,7 @@ fn supervise_crossover_launch(
         "Among Us",
         timeout,
         CROSSOVER_GAME_STABILITY,
+        process::try_has_usable_window,
         || {
             wrapper_exit = launcher
                 .try_wait()
@@ -1023,7 +1026,7 @@ fn supervise_crossover_launch(
             }
             log::info!(
                 target: "perfect_sync::support",
-                "CrossOver process confirmed after {} ms",
+                "CrossOver usable game window confirmed after {} ms",
                 started.elapsed().as_millis()
             );
             Ok(())
@@ -1046,7 +1049,7 @@ fn supervise_crossover_launch(
             };
             let message = with_crossover_output(
                 format!(
-                    "Perfect Sync did not detect the exact managed Among Us process within {}. CrossOver's attached wrapper remained alive until the readiness timeout and was stopped. {scoped_result} The launch is no longer pending; retry it once.",
+                    "Perfect Sync did not detect a usable window owned by the exact managed Among Us process within {}. CrossOver's attached wrapper remained alive until the readiness timeout and was stopped. {scoped_result} The launch is no longer pending; retry it once.",
                     crossover_timeout_label(timeout)
                 ),
                 output.finish(),
@@ -3161,6 +3164,7 @@ pub async fn select_active_profile(profile_id: String) -> Result<(), String> {
 pub async fn save_settings(
     mut settings: Settings,
     mut token_action: TokenAction,
+    app: AppHandle,
 ) -> Result<SettingsView, String> {
     blocking(move || {
         let _guard = lock_mutations()?;
@@ -3337,8 +3341,16 @@ pub async fn save_settings(
             }
             settings.active_profile = Some(active);
         }
-        let was_logging = settings::support_logging_enabled();
+        let was_logging = previous_settings.support_logging;
         let logging_enabled = settings.support_logging;
+        if support_logging_changed(was_logging, logging_enabled) {
+            let log_dir = app
+                .path()
+                .app_log_dir()
+                .map_err(|error| format!("Could not locate the support logs folder: {error}"))?;
+            reset_support_log(&log_dir)
+                .map_err(|error| format!("Could not reset the support log: {error}"))?;
+        }
         let view = settings::apply_transaction(&settings, &token_action)
             .map_err(|error| error.to_string())?;
         if was_logging && !logging_enabled {
@@ -10904,7 +10916,9 @@ mod tests {
 
         let error =
             supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(5)).unwrap_err();
-        assert!(error.contains("Among Us exited before remaining alive for 3 seconds"));
+        assert!(error.contains(
+            "Among Us stopped meeting launch readiness before remaining ready for 3 seconds"
+        ));
         let mut game = delayed_game.join().unwrap();
         assert!(game.wait().unwrap().success());
     }
@@ -11001,7 +11015,8 @@ mod tests {
             supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(3)).unwrap_err();
         assert!(error.contains("attached wrapper exited with"));
         assert!(error.contains("23"));
-        assert!(error.contains("before the exact managed Among Us process became ready"));
+        assert!(error
+            .contains("before the exact managed Among Us process presented a usable game window"));
         assert!(error.contains("CrossOver stdout"));
         assert!(error.contains("wrapper dispatch detail"));
         assert!(error.contains("CrossOver stderr"));
@@ -11066,6 +11081,7 @@ mod tests {
                         "Among Us",
                         Duration::from_secs(1),
                         Duration::ZERO,
+                        process::try_is_executable_running,
                         || Err("dispatch failed".into()),
                     )
                     .map(|_| ())
@@ -11083,6 +11099,7 @@ mod tests {
                         "Among Us",
                         Duration::ZERO,
                         Duration::ZERO,
+                        process::try_is_executable_running,
                         || Ok(()),
                     )? {
                         Ok(())

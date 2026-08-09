@@ -1186,7 +1186,16 @@ pub fn disable_splash_screen(game_dir: &Path) -> io::Result<()> {
     crate::profile::reject_reparse(&path)?;
     let existing = match fs::read(&path) {
         Ok(existing) => existing,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !game_dir.join(SPLASH_SCREEN_ORIGINAL).is_file()
+                && !game_dir.join(SPLASH_SCREEN_RUNTIME_NAME).is_file()
+            {
+                return Ok(());
+            }
+            fs::create_dir_all(&cfg_dir)?;
+            atomic_write(&path, b"[General]\n\nEnabled = false\n")?;
+            return Ok(());
+        }
         Err(error) => return Err(error),
     };
     if let Some(configured) = configured_splash_config(&existing)? {
@@ -3724,15 +3733,37 @@ mod tests {
     }
 
     #[test]
-    fn absent_splash_config_is_not_created() {
+    fn absent_splash_config_without_helper_is_not_created() {
         let tmp = tempfile::tempdir().unwrap();
-        disable_splash_screen(tmp.path()).unwrap();
-        assert!(!tmp
+        let path = tmp
             .path()
             .join("BepInEx")
             .join("config")
-            .join(SPLASH_SCREEN_CONFIG)
-            .exists());
+            .join(SPLASH_SCREEN_CONFIG);
+
+        disable_splash_screen(tmp.path()).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn absent_splash_config_with_helper_is_created_disabled() {
+        for helper_name in [SPLASH_SCREEN_ORIGINAL, SPLASH_SCREEN_RUNTIME_NAME] {
+            let tmp = tempfile::tempdir().unwrap();
+            let helper = tmp.path().join(helper_name);
+            fs::create_dir_all(helper.parent().unwrap()).unwrap();
+            fs::write(helper, b"splash").unwrap();
+            let path = tmp
+                .path()
+                .join("BepInEx")
+                .join("config")
+                .join(SPLASH_SCREEN_CONFIG);
+
+            disable_splash_screen(tmp.path()).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"[General]\n\nEnabled = false\n");
+
+            disable_splash_screen(tmp.path()).unwrap();
+            assert_eq!(fs::read(path).unwrap(), b"[General]\n\nEnabled = false\n");
+        }
     }
 
     #[test]

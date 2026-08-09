@@ -23,5 +23,9 @@ semver = "1"
 percent-encoding = "2"
 sha2 = "0.10"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = "0.25"
+
 [dev-dependencies]
 tempfile = "3"
