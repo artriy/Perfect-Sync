@@ -75,7 +75,7 @@ jobs:
             cp "$file" "$stage/$name"
             (
               cd "$stage"
-              shasum -a 256 "$name" >> SHA256SUMS.txt
+              shasum -a 256 -b "$name" >> SHA256SUMS.txt
             )
           done
 
