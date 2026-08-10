@@ -369,14 +369,24 @@ struct WindowMetadata {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn is_usable_window(managed_pids: &[u32], window: &WindowMetadata) -> bool {
-    managed_pids.contains(&window.owner_pid)
-        && window.layer == 0
+fn has_usable_geometry(window: &WindowMetadata) -> bool {
+    window.layer == 0
         && window.alpha > 0.0
         && window.width.is_finite()
         && window.width > 0.0
         && window.height.is_finite()
         && window.height > 0.0
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_usable_window(
+    managed_pids: &[u32],
+    exact_file_owner_pids: &[u32],
+    window: &WindowMetadata,
+) -> bool {
+    has_usable_geometry(window)
+        && (managed_pids.contains(&window.owner_pid)
+            || exact_file_owner_pids.contains(&window.owner_pid))
 }
 
 #[cfg(target_os = "macos")]
@@ -435,14 +445,12 @@ pub fn try_has_usable_window(executable: &Path) -> io::Result<bool> {
         };
 
         let managed_pids = unix_game_pids_from_system(executable, false)?;
-        if managed_pids.is_empty() {
-            return Ok(false);
-        }
         let windows = copy_window_info(
             kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
             kCGNullWindowID,
         )
         .ok_or_else(|| io::Error::other("unable to enumerate on-screen windows"))?;
+        let mut qualifying_windows = Vec::new();
         for window in &windows {
             let window = unsafe { CFType::wrap_under_get_rule((*window).cast()) };
             let Some(dictionary) = window.downcast_into::<CFDictionary>() else {
@@ -451,11 +459,29 @@ pub fn try_has_usable_window(executable: &Path) -> io::Result<bool> {
             let Some(metadata) = macos_window_metadata(&dictionary) else {
                 continue;
             };
-            if is_usable_window(&managed_pids, &metadata) {
+            if !has_usable_geometry(&metadata) {
+                continue;
+            }
+            if is_usable_window(&managed_pids, &[], &metadata) {
                 return Ok(true);
             }
+            qualifying_windows.push(metadata);
         }
-        Ok(false)
+        let mut owner_candidates = Vec::new();
+        for window in &qualifying_windows {
+            if !managed_pids.contains(&window.owner_pid)
+                && !owner_candidates.contains(&window.owner_pid)
+            {
+                owner_candidates.push(window.owner_pid);
+            }
+        }
+        if owner_candidates.is_empty() {
+            return Ok(false);
+        }
+        let exact_file_owner_pids = macos_processes_with_exact_file(executable, &owner_candidates)?;
+        Ok(qualifying_windows
+            .iter()
+            .any(|window| is_usable_window(&managed_pids, &exact_file_owner_pids, window)))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -854,7 +880,7 @@ mod query_tests {
             height: 720.0,
         };
 
-        assert!(is_usable_window(&[401], &window));
+        assert!(is_usable_window(&[401], &[], &window));
     }
 
     #[test]
@@ -867,7 +893,7 @@ mod query_tests {
             height: 720.0,
         };
 
-        assert!(!is_usable_window(&[401], &steam_window));
+        assert!(!is_usable_window(&[401], &[], &steam_window));
     }
 
     #[test]
@@ -891,7 +917,7 @@ mod query_tests {
 
         assert!(invalid
             .iter()
-            .all(|window| !is_usable_window(&[401], window)));
+            .all(|window| !is_usable_window(&[401], &[], window)));
     }
 
     #[test]
@@ -904,7 +930,34 @@ mod query_tests {
             height: 720.0,
         };
 
-        assert!(is_usable_window(&[401, 403], &window));
+        assert!(is_usable_window(&[401, 403], &[], &window));
+    }
+
+    #[test]
+    fn usable_window_accepts_opaque_owner_with_exact_file_evidence() {
+        let window = WindowMetadata {
+            owner_pid: 404,
+            layer: 0,
+            alpha: 1.0,
+            width: 1280.0,
+            height: 720.0,
+        };
+
+        assert!(!is_usable_window(&[401], &[], &window));
+        assert!(is_usable_window(&[401], &[404], &window));
+    }
+
+    #[test]
+    fn usable_window_rejects_unrelated_visible_owner() {
+        let unrelated_window = WindowMetadata {
+            owner_pid: 405,
+            layer: 0,
+            alpha: 1.0,
+            width: 1280.0,
+            height: 720.0,
+        };
+
+        assert!(!is_usable_window(&[401], &[404], &unrelated_window));
     }
     #[test]
     fn unix_process_matching_rejects_zombies() {

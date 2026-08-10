@@ -33,9 +33,9 @@
   of the removed `cxrun` command; discover system, user, versioned, and `CX_ROOT`
   installations, preserve the selected bottle, and report a missing installation before
   attempting an unavailable command.
-- Start CrossOver with bottle updates disabled, keep startup attached through its
-  `--wait-children` wrapper, and pass the `winhttp` override through CrossOver's
-  supported command-line option so BepInEx receives its loader hook.
+- Launch managed CrossOver games and Epic helpers through the bundled `wine` command
+  with the selected bottle in the child environment. Preserve the `winhttp` loader hook
+  without proprietary wait, update, environment-list, renderer, or DLL wrapper arguments.
 - Watch CrossOver's wrapper and exact managed game process under one five-minute
   startup deadline, then require a visible, nonzero game window owned by that exact
   process to remain present for three seconds before reporting success. Headless,
@@ -51,15 +51,14 @@
   first launch before its config exists and launches from cached workspaces. Preserve
   unrelated splash settings, do not create splash artifacts when the helper is absent,
   and leave native Windows behavior unchanged.
-- For managed Among Us executables launched directly through macOS CrossOver, select
-  WineD3D with current and legacy CrossOver controls, clear a preselected D3DMetal DLL
-  path, use Wine's built-in D3D11/DXGI modules, and explicitly select Unity D3D11 with
-  its BitBlt presentation model. This bypasses the failing DXMT Metal compute pipeline
-  and unsupported flip-model swapchain without changing bottle settings; Epic helpers
-  remain unchanged.
+- Let CrossOver select the complete graphics backend from its bottle and per-game
+  settings. Do not combine that selection with an empty DLL search path, legacy
+  D3DMetal toggles, forced D3D DLLs, or Unity renderer arguments that can disrupt
+  CrossOver's Rosetta and graphics setup.
 - Recognize CrossOver's default `Y:` home mapping, custom drive letters, NT Unix paths,
-  and macOS `winetemp` loader links without falling back to a global process-name match;
-  ambiguous processes must hold the selected managed executable according to `lsof`.
+  and macOS `winetemp` loader links without falling back to a global process-name match.
+  Ambiguous processes and opaque Cocoa window owners must hold the selected managed
+  executable according to `lsof`.
 - Continuously drain CrossOver output into bounded 8 KiB tails. Keep each capture
   through its wrapper's lifetime, record the final exit status, and include redacted
   wrapper status, stdout, and stderr when stable startup fails.

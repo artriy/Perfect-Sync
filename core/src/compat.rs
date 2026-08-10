@@ -466,56 +466,9 @@ fn wine_environment(
     env
 }
 
-const CROSSOVER_BUILTIN_GRAPHICS_OVERRIDE: &str = "d3d11,dxgi=b";
-const CROSSOVER_WINED3D_ENV: &str =
-    "CX_GRAPHICS_BACKEND=wined3d WINED3DMETAL=0 WINEDLLPATH_PREPEND=";
-
-fn crossover_dll_overrides(
-    inherited_override: Option<OsString>,
-    force_builtin_graphics: bool,
-) -> OsString {
-    let mut overrides = inherited_override.unwrap_or_else(|| OsString::from("winhttp=n,b"));
-    if force_builtin_graphics {
-        if !overrides.is_empty() && !overrides.as_encoded_bytes().ends_with(b";") {
-            overrides.push(";");
-        }
-        overrides.push(CROSSOVER_BUILTIN_GRAPHICS_OVERRIDE);
-    }
-    overrides
-}
-
-fn add_crossover_runtime_args(
-    args: &mut Vec<OsString>,
-    inherited_override: Option<OsString>,
-    use_graphics_compatibility: bool,
-) {
-    let delimiter = args
-        .iter()
-        .position(|argument| argument == "--")
-        .unwrap_or(args.len());
-    let mut runtime_args = vec![
-        OsString::from("--no-update"),
-        OsString::from("--wait-children"),
-    ];
-    if use_graphics_compatibility {
-        runtime_args.extend([
-            OsString::from("--env"),
-            OsString::from(CROSSOVER_WINED3D_ENV),
-        ]);
-    }
-    runtime_args.extend([
-        OsString::from("--dll"),
-        crossover_dll_overrides(inherited_override, use_graphics_compatibility),
-    ]);
-    args.splice(delimiter..delimiter, runtime_args);
-}
-
-fn build_program_spec_with_crossover_graphics(
-    program: &Path,
-    cwd: &Path,
-    ctx: &RuntimeContext,
-    force_builtin_graphics: bool,
-) -> LaunchSpec {
+/// Build a concrete launch invocation for an arbitrary Windows executable in a
+/// game directory. Epic's authentication helper uses this same runtime path.
+pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> LaunchSpec {
     match ctx.runtime {
         Runtime::Native => LaunchSpec {
             program: program.to_path_buf(),
@@ -556,12 +509,8 @@ fn build_program_spec_with_crossover_graphics(
             }
         }
         Runtime::Wine | Runtime::Crossover | Runtime::Whisky | Runtime::Bottles => {
-            let inherited_override = std::env::var_os("WINEDLLOVERRIDES");
-            let env = wine_environment(ctx, inherited_override.clone());
+            let env = wine_environment(ctx, std::env::var_os("WINEDLLOVERRIDES"));
             let mut args = ctx.launcher_args.clone();
-            if ctx.runtime == Runtime::Crossover {
-                add_crossover_runtime_args(&mut args, inherited_override, force_builtin_graphics);
-            }
             args.push(program.as_os_str().to_owned());
             let error = if ctx.runtime == Runtime::Crossover && ctx.launcher.is_none() {
                 Some(
@@ -585,29 +534,9 @@ fn build_program_spec_with_crossover_graphics(
     }
 }
 
-/// Build a concrete launch invocation for an arbitrary Windows executable in a
-/// game directory. Epic's authentication helper uses this same runtime path.
-pub fn build_program_spec(program: &Path, cwd: &Path, ctx: &RuntimeContext) -> LaunchSpec {
-    build_program_spec_with_crossover_graphics(program, cwd, ctx, false)
-}
-
 /// Build the concrete launch invocation for Among Us.
 pub fn build_launch_spec(game_dir: &Path, ctx: &RuntimeContext) -> LaunchSpec {
-    let use_crossover_graphics_compatibility =
-        ctx.host == HostPlatform::Macos && ctx.runtime == Runtime::Crossover;
-    let mut spec = build_program_spec_with_crossover_graphics(
-        &game_dir.join(GAME_EXE),
-        game_dir,
-        ctx,
-        use_crossover_graphics_compatibility,
-    );
-    if use_crossover_graphics_compatibility {
-        spec.args.extend([
-            OsString::from("-force-d3d11"),
-            OsString::from("-force-d3d11-bitblt-model"),
-        ]);
-    }
-    spec
+    build_program_spec(&game_dir.join(GAME_EXE), game_dir, ctx)
 }
 
 const OVERRIDE_LINE: &str = "\"winhttp\"=\"native,builtin\"";
@@ -1050,8 +979,8 @@ mod tests {
     }
 
     #[test]
-    fn crossover_spec_uses_wine_and_selects_bottle() {
-        let game = Path::new("/CrossOver/Bottles/AU/drive_c/Games/Among Us");
+    fn crossover_game_and_helper_specs_use_direct_wine_argv() {
+        let game = Path::new("/managed/workspace/current");
         let mut ctx = context(
             Runtime::Crossover,
             "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine",
@@ -1059,146 +988,74 @@ mod tests {
         ctx.prefix = Some(PathBuf::from("/CrossOver/Bottles/AU"));
         ctx.launcher_args = vec!["--bottle".into(), "AU".into(), "--".into()];
         ctx.host = HostPlatform::Macos;
-        let spec = build_launch_spec(game, &ctx);
+
+        let managed_executable = game.join(GAME_EXE);
+        let game_spec = build_launch_spec(game, &ctx);
         assert_eq!(
-            &spec.args[..7],
-            [
-                "--bottle",
-                "AU",
-                "--no-update",
-                "--wait-children",
-                "--env",
-                "CX_GRAPHICS_BACKEND=wined3d WINED3DMETAL=0 WINEDLLPATH_PREPEND=",
-                "--dll",
+            game_spec.program,
+            PathBuf::from("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine")
+        );
+        assert_eq!(
+            game_spec.args,
+            vec![
+                OsString::from("--bottle"),
+                OsString::from("AU"),
+                OsString::from("--"),
+                managed_executable.as_os_str().to_owned(),
             ]
         );
-        assert_eq!(
-            spec.args
-                .iter()
-                .filter(|argument| *argument == "--env")
-                .count(),
-            1
-        );
-        assert_eq!(
-            spec.args[7],
-            crossover_dll_overrides(std::env::var_os("WINEDLLOVERRIDES"), true)
-        );
-        let delimiter_position = spec
-            .args
-            .iter()
-            .position(|argument| argument == "--")
-            .unwrap();
-        let managed_executable = game.join(GAME_EXE);
-        let executable_position = spec
-            .args
-            .iter()
-            .position(|argument| Path::new(argument) == managed_executable)
-            .unwrap();
-        let force_d3d11_position = spec
-            .args
-            .iter()
-            .position(|argument| argument == "-force-d3d11")
-            .unwrap();
-        let bitblt_position = spec
-            .args
-            .iter()
-            .position(|argument| argument == "-force-d3d11-bitblt-model")
-            .unwrap();
-        assert!(delimiter_position < executable_position);
-        assert!(delimiter_position < force_d3d11_position);
-        assert!(delimiter_position < bitblt_position);
-        assert!(executable_position < force_d3d11_position);
-        assert!(executable_position < bitblt_position);
-        assert_eq!(force_d3d11_position + 1, bitblt_position);
-        assert!(spec.program.ends_with("bin/wine"));
-        assert!(spec.env.iter().any(|(k, v)| k == "CX_BOTTLE" && v == "AU"));
-    }
-
-    #[test]
-    fn crossover_unity_d3d11_overrides_are_limited_to_macos_game_launches() {
-        let game = Path::new("/CrossOver/Bottles/AU/drive_c/Games/Among Us");
-        let mut ctx = context(
-            Runtime::Crossover,
-            "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine",
-        );
-        ctx.prefix = Some(PathBuf::from("/CrossOver/Bottles/AU"));
-        ctx.launcher_args = vec!["--bottle".into(), "AU".into(), "--".into()];
-
-        let game_spec = build_launch_spec(game, &ctx);
-        for unity_flag in ["-force-d3d11", "-force-d3d11-bitblt-model"] {
-            assert!(!game_spec.args.iter().any(|argument| argument == unity_flag));
-        }
-        assert!(!game_spec
-            .args
-            .iter()
-            .any(|argument| argument == CROSSOVER_WINED3D_ENV));
-        assert_eq!(
-            game_spec.args[5],
-            crossover_dll_overrides(std::env::var_os("WINEDLLOVERRIDES"), false)
-        );
-
-        ctx.host = HostPlatform::Macos;
-        let helper_spec = build_program_spec(&game.join("helper.exe"), game, &ctx);
-        for unity_flag in ["-force-d3d11", "-force-d3d11-bitblt-model"] {
-            assert!(!helper_spec
+        for removed_argument in [
+            "--no-update",
+            "--wait-children",
+            "--env",
+            "--dll",
+            "CX_GRAPHICS_BACKEND",
+            "WINED3DMETAL",
+            "WINEDLLPATH_PREPEND",
+            "d3d11,dxgi=b",
+            "-force-d3d11",
+            "-force-d3d11-bitblt-model",
+        ] {
+            assert!(!game_spec
                 .args
                 .iter()
-                .any(|argument| argument == unity_flag));
+                .any(|argument| argument.to_string_lossy().contains(removed_argument)));
         }
-        assert!(!helper_spec
-            .args
+        assert_eq!(game_spec.cwd, game);
+        assert!(game_spec
+            .env
             .iter()
-            .any(|argument| argument == CROSSOVER_WINED3D_ENV));
-        assert_eq!(
-            helper_spec.args[5],
-            crossover_dll_overrides(std::env::var_os("WINEDLLOVERRIDES"), false)
-        );
-    }
+            .any(|(key, value)| key == "CX_BOTTLE" && value == "AU"));
+        assert!(!game_spec.env.iter().any(|(key, _)| key == "WINEPREFIX"));
+        for variable in ["CX_GRAPHICS_BACKEND", "WINED3DMETAL", "WINEDLLPATH_PREPEND"] {
+            assert!(!game_spec.env.iter().any(|(key, _)| key == variable));
+        }
 
-    #[test]
-    fn crossover_runtime_args_preserve_inherited_dll_overrides() {
-        let mut args = vec!["--bottle".into(), "AU".into(), "--".into()];
-        add_crossover_runtime_args(&mut args, Some(OsString::from("custom=n")), false);
         assert_eq!(
-            args,
-            [
-                "--bottle",
-                "AU",
-                "--no-update",
-                "--wait-children",
-                "--dll",
-                "custom=n",
-                "--",
+            wine_environment(&ctx, None),
+            vec![
+                (
+                    OsString::from("WINEDLLOVERRIDES"),
+                    OsString::from("winhttp=n,b")
+                ),
+                (OsString::from("CX_BOTTLE"), OsString::from("AU")),
             ]
         );
-    }
 
-    #[test]
-    fn crossover_runtime_args_force_wined3d_after_inherited_overrides() {
-        let mut args = vec!["--bottle".into(), "AU".into(), "--".into()];
-        add_crossover_runtime_args(&mut args, Some(OsString::from("custom=n;d3d11=n")), true);
+        let helper = game.join("helper.exe");
+        let helper_spec = build_program_spec(&helper, game, &ctx);
         assert_eq!(
-            args,
-            [
-                "--bottle",
-                "AU",
-                "--no-update",
-                "--wait-children",
-                "--env",
-                "CX_GRAPHICS_BACKEND=wined3d WINED3DMETAL=0 WINEDLLPATH_PREPEND=",
-                "--dll",
-                "custom=n;d3d11=n;d3d11,dxgi=b",
-                "--",
+            helper_spec.args,
+            vec![
+                OsString::from("--bottle"),
+                OsString::from("AU"),
+                OsString::from("--"),
+                helper.as_os_str().to_owned(),
             ]
         );
-        assert_eq!(
-            args.iter().filter(|argument| *argument == "--env").count(),
-            1
-        );
-        assert_eq!(
-            crossover_dll_overrides(None, true),
-            "winhttp=n,b;d3d11,dxgi=b"
-        );
+        assert_eq!(helper_spec.program, game_spec.program);
+        assert_eq!(helper_spec.cwd, game_spec.cwd);
+        assert_eq!(helper_spec.env, game_spec.env);
     }
 
     #[test]
