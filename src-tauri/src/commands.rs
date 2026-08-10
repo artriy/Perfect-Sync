@@ -919,9 +919,23 @@ fn stop_crossover_attempt(
 }
 
 fn supervise_crossover_launch(
+    launcher: std::process::Child,
+    game_dir: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    supervise_crossover_launch_with_readiness(
+        launcher,
+        game_dir,
+        timeout,
+        process::try_has_usable_window,
+    )
+}
+
+fn supervise_crossover_launch_with_readiness(
     mut launcher: std::process::Child,
     game_dir: &Path,
     timeout: Duration,
+    readiness: impl FnMut(&Path) -> io::Result<bool>,
 ) -> Result<(), String> {
     let started = Instant::now();
     log::info!(
@@ -938,7 +952,7 @@ fn supervise_crossover_launch(
         "Among Us",
         timeout,
         CROSSOVER_GAME_STABILITY,
-        process::try_has_usable_window,
+        readiness,
         || {
             wrapper_exit = launcher
                 .try_wait()
@@ -10872,7 +10886,13 @@ mod tests {
             }
         });
 
-        supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(10)).unwrap();
+        supervise_crossover_launch_with_readiness(
+            launcher,
+            &game_dir,
+            Duration::from_secs(10),
+            process::try_is_executable_running,
+        )
+        .unwrap();
         let mut game = delayed_game.join().unwrap();
         assert!(game.wait().unwrap().success());
     }
@@ -10914,8 +10934,13 @@ mod tests {
             }
         });
 
-        let error =
-            supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(5)).unwrap_err();
+        let error = supervise_crossover_launch_with_readiness(
+            launcher,
+            &game_dir,
+            Duration::from_secs(5),
+            process::try_is_executable_running,
+        )
+        .unwrap_err();
         assert!(error.contains(
             "Among Us stopped meeting launch readiness before remaining ready for 3 seconds"
         ));
@@ -10973,7 +10998,13 @@ mod tests {
             }
         });
 
-        supervise_crossover_launch(launcher, &game_dir, Duration::from_secs(10)).unwrap();
+        supervise_crossover_launch_with_readiness(
+            launcher,
+            &game_dir,
+            Duration::from_secs(10),
+            process::try_is_executable_running,
+        )
+        .unwrap();
         let marker_deadline = Instant::now() + Duration::from_secs(2);
         while !marker.exists() && Instant::now() < marker_deadline {
             std::thread::sleep(Duration::from_millis(20));
